@@ -173,6 +173,28 @@ check([s.name for s in st2.scenes] == ["ホーム", "振り返る", "改札"] an
 st2.remove_scene(st2.scenes[0])
 check(st2.scenes[0].link == story.CUT, "6: 先頭を外したら、次のシーンが先頭 (シーンチェンジ) になる")
 
+# 7. 候補の好きなコマから次のシーンを始める
+fs = story.Story.create(str(TMP / "コマから"), "コマから")
+f1 = fs.scenes[0]
+fs.set_source_file(f1, str(src))
+n = fs.start_next_from_frame(f1, str(v1), 1)
+check(len(fs.scenes) == 2 and fs.scenes[1] is n and f1.adopted == str(v1),
+      "7: 次のシーンがなければ足し、候補を採用する")
+check(n.link == story.CUT and n.source_kind == story.SOURCE_FRAME and n.source_from == str(v1)
+      and near(color_at(Path(n.source)), (0, 255, 0)), "7: 途中のコマ (2 コマ目 = 緑) はシーンチェンジ (前のシーンのコマ)")
+check((fs.adopted_dir() / "01_scene.mp4").is_file(), "7: 採用のフォルダも揃える")
+fs.adopt(f1, str(v1b))
+check(near(color_at(Path(n.source)), (0, 255, 0)), "7: あとで採用を変えても、選んだコマのまま")
+check(not fs.next_source_taken(f1, str(v1)), "7: 同じ動画のコマなら、置き換えるときに確かめない")
+check(fs.next_source_taken(f1, str(v1b)), "7: ほかの動画のコマが入っていたら、置き換える前に確かめる")
+n2 = fs.start_next_from_frame(f1, str(v1b), 1, last=True)
+check(n2 is n and n.link == story.CONT and n.source_kind == story.SOURCE_LAST and f1.adopted == str(v1b)
+      and near(color_at(Path(n.source)), (255, 255, 0)), "7: 最後のコマを選んだら「続き」(次のシーンはそのまま使う)")
+check(not fs.next_source_taken(f1, str(v1)), "7: 続きの最後のコマは確かめずに置き換える")
+fs.set_source_file(n, str(src))
+check(fs.next_source_taken(f1, str(v1b)), "7: 手元の画像が入っていたら確かめる")
+check(not fs.next_source_taken(n, str(v1b)), "7: 次のシーンがなければ確かめない")
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("失敗: " + ", ".join(failures) if failures else "すべて OK")

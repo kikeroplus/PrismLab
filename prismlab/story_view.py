@@ -21,11 +21,12 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDia
 
 from gencommon import comfy, enhancer, inserts, reader, store
 
-from . import engine, kinds, recipes, recycle, story, theme
+from . import engine, kinds, recipes, recycle, story, theme, translate
 from .dialogs import ask_text
 from .thumbs import ThumbCache
 from .widgets import AddButton
 
+ENGLISH = "英語に直し"  # LLM の仕事の名前 (「英語に直し中…」「英語に直しに失敗しました」)
 CONT_COLOR = "#f0a04b"  # 続き (動画の色)
 CUT_COLOR = "#8c99ff"  # シーンチェンジ
 OK_COLOR = "#66bb6a"  # 採用
@@ -142,9 +143,9 @@ class LinkButton(QToolButton):
 # 前のシーンのコマを選ぶ
 # ----------------------------------------------------------------------
 class FrameDialog(QDialog):
-    def __init__(self, video: str, parent=None):
+    def __init__(self, video: str, parent=None, title: str = "前のシーンのコマを選ぶ"):
         super().__init__(parent)
-        self.setWindowTitle("前のシーンのコマを選ぶ")
+        self.setWindowTitle(title)
         self.video = video
         box = QVBoxLayout(self)
         self.view = QLabel()
@@ -179,24 +180,73 @@ class FrameDialog(QDialog):
     def frame(self) -> int:
         return self.slider.value()
 
+    @property
+    def is_last(self) -> bool:
+        return self.slider.value() >= self.slider.maximum()
+
 
 # ----------------------------------------------------------------------
 # 通して再生
 # ----------------------------------------------------------------------
-class PlayDialog(QDialog):
-    """採用した動画を間をあけずに順番に再生する。"""
+class _Deck:
+    """通して再生のプレーヤー 1 つ分 (プレーヤー・音・画面と、読み込んだクリップの番号)。"""
 
-    def __init__(self, playlist: list[tuple[str, str]], parent=None):
-        super().__init__(parent)
+    def __init__(self, parent):
         from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
         from PySide6.QtMultimediaWidgets import QVideoWidget
+        self.player = QMediaPlayer(parent)
+        self.audio = QAudioOutput(parent)
+        self.widget = QVideoWidget()
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.widget)
+        self.index = -1  # 読み込んだクリップ (-1 = なし)
+        self.start_ms = 0  # 再生を始める位置 (続きのシーンは 2 コマ目から)
+        self.frame_ms = 42  # 1 コマの長さ
+        self.ready = False  # 読み込んで、始める位置で止まっている
+
+
+def _frame_ms(path: str) -> int:
+    """1 コマの長さ (ミリ秒)。分からなければ 24 fps とみなす。"""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(path))
+        fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 0
+        cap.release()
+    except Exception:  # noqa: BLE001 - 分からなくても再生はできる
+        fps = 0
+    return int(round(1000 / fps)) if fps and fps > 1 else 42
+
+
+class PlayDialog(QDialog):
+    """採用した動画を間をあけずに順番に再生する。
+
+    切れ目が目立たないように、プレーヤーを 2 つ用意して交互に使う: 再生しているあいだに次のクリップを
+    裏で読み込み、始める位置で止めておく (その絵がもう出ている)。
+    「終わり」の合図は最後のコマから 100 ms ほど遅れ、そのあいだに空のコマ (黒) も出るので待たない:
+    最後のコマが出たら次のプレーヤーを動かし始め (最初のコマまで 1 コマ分ほどかかる)、1 コマ分たったら
+    (または前のほうが空のコマを出した・次のほうが動き出したら) 画面を切り替える。
+    「続き」のシーン (playlist の 3 つ目が True) は 1 コマ目が前のクリップの最後のコマと同じ絵なので、
+    2 コマ目から再生する (同じ絵が 2 コマ続いて止まって見えないように)。
+    """
+
+    def __init__(self, playlist: list, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QStackedWidget
         self.setWindowTitle("通して再生")
         self.resize(960, 620)
-        self.playlist = playlist  # (見出し, パス)
+        # (見出し, パス) または (見出し, パス, 前のクリップの続きか)
+        self.playlist = [(e[0], e[1], bool(e[2]) if len(e) > 2 else False) for e in playlist]
         self.index = 0
         box = QVBoxLayout(self)
-        self.video = QVideoWidget()
-        box.addWidget(self.video, 1)
+        self.stack = QStackedWidget()
+        self.decks = [_Deck(self), _Deck(self)]
+        for n, deck in enumerate(self.decks):
+            self.stack.addWidget(deck.widget)
+            deck.player.mediaStatusChanged.connect(lambda status, n=n: self._status(n, status))
+            deck.widget.videoSink().videoFrameChanged.connect(lambda frame, n=n: self._frame(n, frame))
+        self.active = 0
+        self._incoming: Optional[int] = None  # 動かし始めた次のプレーヤー (画面を切り替える前)
+        box.addWidget(self.stack, 1)
         row = QHBoxLayout()
         self.title = QLabel()
         self.title.setStyleSheet("font-weight: bold;")
@@ -208,29 +258,110 @@ class PlayDialog(QDialog):
         for b in (again, prev_b, next_b):
             row.addWidget(b)
         box.addLayout(row)
-        self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video)
-        self.player.mediaStatusChanged.connect(self._status)
         self._go(0)
 
+    @property
+    def player(self):
+        """いま見せているプレーヤー。"""
+        return self.decks[self.active].player
+
+    def _load(self, deck: _Deck, index: int, play: bool) -> None:
+        """deck にクリップを読み込む。play でなければ、始める位置で止めて待つ (次のクリップの用意)。"""
+        _title, path, cont = self.playlist[index]
+        deck.index, deck.ready = index, False
+        deck.frame_ms = _frame_ms(path)
+        # 「◀ 前」「最初から」で選んだときは、続きでも 1 コマ目から見せる
+        deck.start_ms = deck.frame_ms if cont and not play else 0
+        deck.player.setSource(QUrl.fromLocalFile(path))
+        if play:
+            deck.player.play()
+        else:
+            deck.player.pause()  # 読み込んで最初のコマで止まる
+
+    def _show(self, n: int) -> None:
+        self.active = n
+        self.stack.setCurrentWidget(self.decks[n].widget)
+        index = self.decks[n].index
+        self.title.setText(f"{index + 1} / {len(self.playlist)}   {self.playlist[index][0]}")
+
+    def _preload_next(self) -> None:
+        nxt = self.index + 1
+        other = self.decks[1 - self.active]
+        if nxt < len(self.playlist) and other.index != nxt:
+            self._load(other, nxt, play=False)
+
     def _go(self, index: int) -> None:
+        """選んだクリップから再生する (ボタン)。次のクリップを裏で用意する。"""
         if not 0 <= index < len(self.playlist):
             return
         self.index = index
-        title, path = self.playlist[index]
-        self.title.setText(f"{index + 1} / {len(self.playlist)}   {title}")
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
+        self._incoming = None
+        for deck in self.decks:
+            deck.player.stop()
+            deck.index = -1
+        self._load(self.decks[self.active], index, play=True)
+        self._show(self.active)
+        self._preload_next()
 
-    def _status(self, status) -> None:
+    def _advance(self) -> None:
+        """次のクリップのプレーヤーを動かし始める (画面はまだ前のクリップの最後のコマ)。"""
+        if self._incoming is not None or self.index + 1 >= len(self.playlist):
+            return
+        self.index += 1
+        n = 1 - self.active
+        other = self.decks[n]
+        if other.index != self.index:  # 用意が間に合わなかった (すぐ読み込んで再生)
+            self._load(other, self.index, play=True)
+        else:
+            other.player.play()
+        self._incoming = n
+        QTimer.singleShot(self.decks[self.active].frame_ms, self._switch)  # 最後のコマを 1 コマ分見せてから
+
+    def _switch(self) -> None:
+        """画面を次のプレーヤーに切り替える (止めて出していた最初のコマから続く)。"""
+        n = self._incoming
+        if n is None:
+            return
+        self._incoming = None
+        old = self.decks[self.active]
+        self._show(n)
+        old.index = -1
+        QTimer.singleShot(0, self._preload_next)  # 終わったほうに、次の次を読み込む
+
+    def _frame(self, n: int, frame) -> None:
+        """画面に出たコマ: 最後のコマが出たら次を動かし始める。"""
+        if n == self.active:
+            deck = self.decks[n]
+            if not frame.isValid():  # 終わって空のコマ (黒) になった: すぐ切り替える
+                self._switch()
+                return
+            if self._incoming is None and deck.index == self.index:
+                duration = deck.player.duration()
+                # 最後のコマ (このコマの終わりが、長さの半コマ手前より後) が出たら
+                if duration > 0 and frame.startTime() // 1000 + deck.frame_ms >= duration - deck.frame_ms // 2:
+                    self._advance()
+        elif n == self._incoming and frame.isValid() and \
+                frame.startTime() // 1000 > self.decks[n].start_ms + self.decks[n].frame_ms // 2:
+            self._switch()  # 次のほうが、止めていたコマの次へ進んだ
+
+    def _status(self, n: int, status) -> None:
         from PySide6.QtMultimedia import QMediaPlayer
-        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.index + 1 < len(self.playlist):
-            self._go(self.index + 1)
+        deck = self.decks[n]
+        if n != self.active:  # 裏で用意しているほう: 読めたら始める位置へ
+            if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia) \
+                    and not deck.ready and n != self._incoming:
+                if deck.start_ms:
+                    deck.player.setPosition(deck.start_ms)
+                deck.ready = True
+            return
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:  # 最後のコマを見逃したとき
+            if self._incoming is None:
+                self._advance()
+            self._switch()
 
     def done(self, result: int) -> None:
-        self.player.stop()
+        for deck in self.decks:
+            deck.player.stop()
         super().done(result)
 
 
@@ -597,11 +728,17 @@ class StoryView(QWidget):
         self.add_original_b = QPushButton("↓ 元の文を足す")
         self.add_original_b.setToolTip("元のプロンプトを、下の送るプロンプトに入れます (空なら入れる、文があれば改行して足す)。")
         self.add_original_b.clicked.connect(self._add_original)
+        self.to_english = QCheckBox("英語に")
+        self.to_english.setToolTip("チェックすると、元のプロンプトを LLM で英語に直してから足します "
+                                   "(接続先とモデルは「エンハンサーの設定」と同じ)。")
+        self.to_english.setChecked(translate.remembered())
+        self.to_english.toggled.connect(translate.remember)
         head2 = QLabel("盛ったあとのプロンプト = 送る文 (読み取る・差し込み・盛るの結果。候補を作るで送るのはこちら。"
                        "空なら元のプロンプトを送る)")
         head2.setWordWrap(True)
         head2.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 11px; background: transparent;")
         mid.addWidget(self.add_original_b)
+        mid.addWidget(self.to_english)
         mid.addWidget(head2, 1)
         box.addLayout(mid)
         self.prompt = QPlainTextEdit()
@@ -715,7 +852,12 @@ class StoryView(QWidget):
         self.adopt_b.clicked.connect(lambda: self._adopt(go_next=True))
         self.adopt_only = QPushButton("採用だけ")
         self.adopt_only.clicked.connect(lambda: self._adopt(go_next=False))
+        self.frame_next_b = QPushButton("コマを選んで次へ...")
+        self.frame_next_b.setToolTip("選んだ候補の好きなコマから、次のシーンを始めます (候補は採用します)。\n"
+                                     "最後のコマなら「続き」、ほかのコマなら「シーンチェンジ」(前のシーンのコマ) になります。")
+        self.frame_next_b.clicked.connect(self._frame_next)
         r4.addWidget(self.adopt_b)
+        r4.addWidget(self.frame_next_b)
         r4.addWidget(self.adopt_only)
         r4.addStretch(1)
         box.addLayout(r4)
@@ -996,6 +1138,10 @@ class StoryView(QWidget):
     def _add_original(self) -> None:
         if self.scene is None or not self.scene.original.strip():
             return
+        if self.to_english.isChecked():  # LLM で英語に直してから足す (_on_llm_done で足す)
+            snap, text = translate.snapshot(), self.scene.original.strip()
+            self._run_llm(ENGLISH, lambda: translate.to_english(snap, text))
+            return
         self.scene.record("元の文を足す前の文", self.prompt.toPlainText(), before=True)
         self._set_prompt(inserts.join(self.prompt.toPlainText(), self.scene.original))
 
@@ -1040,6 +1186,18 @@ class StoryView(QWidget):
         before = self._before.pop(scene_id, "")
         if error or scene is None:
             self.status.emit(f"{what}に失敗しました: {error}" if error else "")
+        elif what == ENGLISH:  # 英語に直した元の文を、送るプロンプトに足す (置き換えない)
+            scene.record("元の文を足す前の文", before, before=True)
+            current = self.prompt.toPlainText() if scene is self.scene else scene.prompt
+            joined = inserts.join(current, text.strip())
+            if scene is self.scene:
+                self.prompt.setReadOnly(False)
+                self._set_prompt(joined)  # Ctrl+Z で戻せるように
+            else:
+                scene.prompt = joined
+            scene.record("英語にした元の文", text.strip())
+            self._save_timer.start()
+            self.status.emit("元の文を英語に直して足しました (元に戻す / Ctrl+Z で前の文に)。")
         else:
             label = "読み取り" if what == "読み取り" else "盛る"
             scene.record(f"{label}の前の文", before, before=True)
@@ -1261,6 +1419,7 @@ class StoryView(QWidget):
             self.preview.setText("候補を選ぶと、ここに出します (動画はダブルクリックで再生)" if not path else "")
         self.adopt_b.setEnabled(bool(path))
         self.adopt_only.setEnabled(bool(path))
+        self.frame_next_b.setEnabled(bool(path) and _is_video(path) and Path(path).is_file())
         if path and self.scene is not None:
             self.adopt_only.setText("採用をやめる" if self.scene.adopted == path else "採用だけ")
 
@@ -1288,6 +1447,9 @@ class StoryView(QWidget):
         back = menu.addAction("このときのプロンプトに戻す")
         back.setToolTip("この候補を作ったときの 元のプロンプト と 盛ったあとのプロンプト を欄に戻します (Ctrl+Z で戻せます)。")
         back.setEnabled(cand is not None and bool(cand.prompt or cand.original))
+        from_frame = menu.addAction("このコマから次へ...")
+        from_frame.setToolTip("この候補の好きなコマから、次のシーンを始めます (候補は採用します)。")
+        from_frame.setEnabled(count == 1 and _is_video(path) and Path(path).is_file())
         menu.setToolTipsVisible(True)
         drop = menu.addAction("候補から外す (ファイルは残す)")
         delete = menu.addAction(f"削除 (ごみ箱へ){f' ― {count} 個' if count > 1 else ''}\tDel")
@@ -1297,6 +1459,9 @@ class StoryView(QWidget):
             return
         if chosen is back and cand is not None:
             self._back_to_candidate(cand)
+            return
+        if chosen is from_frame:
+            self._frame_next()
             return
         if chosen is play:
             self._play_candidate(item)
@@ -1411,6 +1576,44 @@ class StoryView(QWidget):
             return
         self.refresh(rebuild=True)
 
+    def _frame_next(self) -> None:
+        """候補の好きなコマから次のシーンを始める (候補を採用し、次のシーンの元画像をそのコマに)。"""
+        item = self.cands.currentItem()
+        if item is None or self.scene is None:
+            return
+        path = str(item.data(Qt.ItemDataRole.UserRole))
+        if not _is_video(path) or not Path(path).is_file():
+            return
+        scene = self.scene
+        i = self.story.index_of(scene)
+        nxt = self.story.scenes[i + 1] if i + 1 < len(self.story.scenes) else None
+        if nxt is not None and self._busy_here(nxt):
+            return
+        try:
+            dialog = FrameDialog(path, self, "コマを選んで次へ")
+        except story.StoryError as exc:
+            QMessageBox.warning(self, "コマを選んで次へ", str(exc))
+            return
+        if not dialog.exec():
+            return
+        if nxt is not None and self.story.next_source_taken(scene, path):
+            if QMessageBox.question(self, "コマを選んで次へ",
+                                    f"次のシーン「{nxt.label(i + 1)}」には、もう元画像が入っています。\n"
+                                    "選んだコマに置き換えますか? (候補はそのまま残ります)",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            nxt = self.story.start_next_from_frame(scene, path, dialog.frame, last=dialog.is_last)
+        except story.StoryError as exc:
+            QMessageBox.warning(self, "コマを選んで次へ", str(exc))
+            return
+        self._save()
+        self.scene = nxt
+        self.thumbs.forget(nxt.source)
+        self.status.emit(f"{Path(path).name} の {dialog.frame + 1} コマ目から、シーン「{nxt.label(i + 1)}」を始めます。")
+        self.refresh(rebuild=True, load=True)
+
     # ------------------------------------------------------------------
     # 上の行
     # ------------------------------------------------------------------
@@ -1418,8 +1621,15 @@ class StoryView(QWidget):
         if self.story is None:
             return
         start = self.story.index_of(self.scene) if self.scene else 0
-        playlist = [(s.label(i), s.adopted) for i, s in enumerate(self.story.scenes)
-                    if i >= start and s.adopted and Path(s.adopted).is_file() and _is_video(s.adopted)]
+        playlist, prev_ok = [], False
+        for i, s in enumerate(self.story.scenes):
+            ok = bool(s.adopted) and Path(s.adopted).is_file() and _is_video(s.adopted)
+            if i >= start and ok:
+                # 続きのシーンで、前のシーンのクリップを直前に流すときは、同じ絵の 1 コマ目を飛ばす
+                cont = s.link == story.CONT and prev_ok and bool(playlist) and \
+                    s.source_from == self.story.scenes[i - 1].adopted
+                playlist.append((s.label(i), s.adopted, cont))
+            prev_ok = ok
         if not playlist:
             QMessageBox.information(self, "通して再生", "選んでいるシーンから先に、採用した動画がありません。")
             return
@@ -1561,6 +1771,7 @@ class StoryView(QWidget):
             b.setEnabled(not llm)
         self.undo_b.setEnabled(not llm and (self.prompt.document().isUndoAvailable() or s.undo_target() is not None))
         self.add_original_b.setEnabled(not llm and bool(s.original.strip()))
+        self.to_english.setEnabled(not llm)
         self.history_b.setEnabled(not llm)
         self.prompt.setReadOnly(llm)
 

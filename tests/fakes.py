@@ -105,7 +105,8 @@ class FakeComfy:
 
 
 class FakeLLM:
-    """/chat/completions に、画像があれば「a photo N」、なければ「(元の文) + enhanced」を返す。"""
+    """/chat/completions に、画像があれば「a photo N」、英語に直す指示なら「(元の文) in English」、
+    ほかは「(元の文) + enhanced」を返す。"""
 
     def __init__(self):
         self.calls = []
@@ -118,8 +119,11 @@ class FakeLLM:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
                 user = body["messages"][-1]["content"]
+                system = body["messages"][0]["content"] if len(body["messages"]) > 1 else ""
                 if isinstance(user, list):
                     text = f"a photo {len(owner.calls)}"
+                elif "英語に翻訳" in system:
+                    text = user.strip() + " in English"
                 else:
                     text = user.strip().splitlines()[-1] + " enhanced"
                 owner.calls.append(body)

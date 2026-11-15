@@ -154,6 +154,26 @@ pump(0.2)
 assert sv.prompt.toPlainText() == first
 sv._restore(before, "戻しました")
 pump(0.2)
+# 「英語に」: 元の文を LLM で英語に直してから足す。チェックは覚えておく
+from prismlab import translate  # noqa: E402
+assert not sv.to_english.isChecked() and not translate.remembered()
+sv.to_english.setChecked(True)
+assert translate.remembered(), "「英語に」のチェックを覚える"
+sv.add_original_b.click()
+assert sv.llm_state.text() == "英語に直し中…" and sv.prompt.isReadOnly(), sv.llm_state.text()
+end = time.time() + 20
+while time.time() < end and sv._llm_busy:
+    pump(0.2)
+pump(0.3)
+assert sv.prompt.toPlainText() == before + "\n" + ORIGINAL + " in English", sv.prompt.toPlainText()
+assert "英語に翻訳" in llm.calls[-1]["messages"][0]["content"], "英語に直す指示で頼む"
+assert s1.history[-1]["label"] == "英語にした元の文" and s1.original == ORIGINAL
+sv.prompt.setFocus()
+QApplication.sendEvent(sv.prompt, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier))
+pump(0.2)
+assert sv.prompt.toPlainText() == before, "Ctrl+Z で足す前の文に"
+sv.to_english.setChecked(False)
+assert not translate.remembered()
 sv.count_box.setValue(2)
 sv.make_b.click()
 pump(1)
@@ -175,6 +195,9 @@ assert (sv.story.adopted_dir() / "01_ホーム.mp4").is_file()
 
 
 def shown_color(label):
+    end = time.time() + 5  # サムネールは裏で読むので、出るまで待つ
+    while time.time() < end and (label.pixmap() is None or label.pixmap().isNull()):
+        pump(0.1)
     pm = label.pixmap()
     assert pm is not None and not pm.isNull(), "元画像が出ていない"
     return pm.toImage().pixelColor(pm.width() // 2, pm.height() // 2)
@@ -184,11 +207,12 @@ pump(0.8)
 c = shown_color(sv.source_view)
 assert c.blue() > 150 and c.red() < 120, ("続きの元画像に最後のコマ (青) が出る", c.red(), c.green(), c.blue())
 # 前のシーンの採用を、最後のコマが緑の動画に変える → 続きのシーンの元画像 (同じ source.png) の表示も緑になる
-make_video(Path(s1.candidates[1].path), [(200, 40, 40)] * 4 + [(40, 200, 60)] * 4, size=(160, 96))
+# (採用していないほうの候補を使う。同じものを押すと「採用をやめる」になる)
+green_cand = next(c.path for c in s1.candidates if c.path != s1.adopted)
+make_video(Path(green_cand), [(200, 40, 40)] * 4 + [(40, 200, 60)] * 4, size=(160, 96))
 sv.select(s1)
 pump(0.3)
-sv.cands.setCurrentRow(next(i for i in range(sv.cands.count())
-                            if sv.cands.item(i).data(256) == s1.candidates[1].path))
+sv.cands.setCurrentRow(next(i for i in range(sv.cands.count()) if sv.cands.item(i).data(256) == green_cand))
 sv.adopt_only.click()
 pump(0.3)
 sv.select(s2)
@@ -284,6 +308,26 @@ sv.select(s1)
 pump(0.5)
 window.grab().save(str(OUT / "story_board.png"))
 
+# コマを選んで次へ: シーン 1 の候補 (赤 4 コマ → 青 4 コマ) の 2 コマ目 (赤) から、シーン 2 を始める
+def fake_exec(self):
+    self.slider.setValue(1)
+    return 1
+
+
+story_view.FrameDialog.exec = fake_exec
+first_cand = s1.candidates[0].path
+sv.cands.setCurrentRow(next(i for i in range(sv.cands.count()) if sv.cands.item(i).data(256) == first_cand))
+pump(0.2)
+assert sv.frame_next_b.isEnabled()
+sv.frame_next_b.click()
+pump(0.8)
+assert sv.scene is s2 and s1.adopted == first_cand, "候補を採用して、次のシーンへ"
+assert s2.link == story.CUT and s2.source_kind == story.SOURCE_FRAME and s2.source_from == first_cand
+c = shown_color(sv.source_view)
+assert c.red() > 150 and c.blue() < 120, ("元画像の欄に選んだコマ (赤)", c.red(), c.green(), c.blue())
+assert sv.source_note.text() == story.SOURCE_TITLES[story.SOURCE_FRAME], sv.source_note.text()
+window.grab().save(str(OUT / "story_frame_next.png"))
+
 # 保存して開き直す
 sv._save()
 again = story.Story.load(str(folder))
@@ -297,6 +341,28 @@ assert any(h["text"] == enhanced for h in again.scenes[0].history), "履歴は�
 dialog = story_view.PlayDialog([(s.label(i), s.adopted) for i, s in enumerate(again.scenes) if s.adopted], window)
 dialog.show()
 pump(1)
+dialog.done(0)
+# 通して再生の切れ目: 2 つのプレーヤーを交互に使い、次のクリップを裏で用意しておく。続きは 2 コマ目から
+c1, c2, c3 = TMP / "p1.mp4", TMP / "p2.mp4", TMP / "p3.mp4"
+make_video(c1, [(200, 40, 40)] * 6 + [(40, 60, 220)], size=(160, 96), fps=24)
+make_video(c2, [(40, 60, 220)] + [(40, 200, 60)] * 6, size=(160, 96), fps=24)
+make_video(c3, [(230, 230, 40)] * 7, size=(160, 96), fps=24)
+dialog = story_view.PlayDialog([("1", str(c1), False), ("2", str(c2), True), ("3", str(c3), False)], window)
+dialog.show()
+pump(0.15)
+assert dialog.index == 0 and dialog.decks[1 - dialog.active].index == 1, "次のクリップを裏で用意しておく"
+assert dialog.decks[1 - dialog.active].start_ms == 42, "続きのクリップは 2 コマ目から (24 fps)"
+seen = []
+end = time.time() + 4
+while time.time() < end and not (dialog.index == 2 and dialog._incoming is None):
+    pump(0.02)
+    seen.append((dialog.index, dialog.active))
+assert dialog.index == 2 and dialog.stack.currentWidget() is dialog.decks[dialog.active].widget, seen[-5:]
+assert len({a for _i, a in seen}) == 2, "プレーヤーを交互に使う"
+assert dialog.title.text().startswith("3 / 3"), dialog.title.text()
+dialog._go(1)
+pump(0.1)
+assert dialog.decks[dialog.active].start_ms == 0, "ボタンで選んだときは、続きでも 1 コマ目から"
 dialog.done(0)
 print("物語の画面: OK", [s.name for s in again.scenes])
 window.close()

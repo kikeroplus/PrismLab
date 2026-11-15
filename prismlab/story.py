@@ -294,6 +294,35 @@ class Story:
         scene.link = CUT if self.index_of(scene) > 0 else scene.link
         scene.source, scene.source_kind, scene.source_from = str(dest), SOURCE_FRAME, video
 
+    def next_source_taken(self, scene: Scene, video: str) -> bool:
+        """次のシーンに、自分で選んだ元画像 (手元の画像・T2I・ほかの動画のコマ) がもう入っているか。
+        「コマを選んで次へ」で置き換える前に確かめるため。最後のコマ・同じ動画のコマなら置き換えてよい。"""
+        i = self.index_of(scene)
+        if i + 1 >= len(self.scenes):
+            return False
+        nxt = self.scenes[i + 1]
+        if not nxt.source or nxt.source_kind == SOURCE_LAST:
+            return False
+        return not (nxt.source_kind == SOURCE_FRAME and nxt.source_from == video)
+
+    def start_next_from_frame(self, scene: Scene, video: str, frame: int, last: bool = False) -> Scene:
+        """候補の好きなコマから次のシーンを始める: その候補を採用し、次のシーン (なければ足す) の元画像をそのコマにする。
+        last (最後のコマを選んだ) なら「続き」と同じなので、つなぎを「続き」にする (採用が変わったら作り直す)。
+        ほかのコマは「シーンチェンジ」の「前のシーンのコマ」(あとで採用を変えても、選んだコマのまま)。次のシーンを返す。"""
+        i = self.index_of(scene)
+        nxt = self.scenes[i + 1] if i + 1 < len(self.scenes) else self.add_scene(scene, CONT if last else CUT)
+        if last:
+            if nxt.link != CONT:
+                nxt.link = CONT
+                nxt.source_kind = ""  # 作り直させる
+        else:
+            self.set_source_frame(nxt, video, frame)
+        if scene.adopted != video:
+            scene.adopted = video
+            self.sync_adopted()
+        self.refresh_links()  # 続きなら、ここで最後のコマを作る
+        return nxt
+
     def adopt(self, scene: Scene, path: str) -> list[Scene]:
         """候補を採用する (同じものをもう一度押すと採用をやめる)。続きのシーンの元画像を作り直し、採用のフォルダを揃える。"""
         scene.adopted = "" if scene.adopted == path else path
