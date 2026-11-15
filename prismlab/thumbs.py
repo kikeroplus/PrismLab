@@ -5,6 +5,7 @@ ImageMimicArt の results.py の make_thumbnail を引き継いだもの。読�
 """
 
 import ctypes
+import os
 from ctypes import wintypes
 from pathlib import Path
 from typing import Optional
@@ -161,13 +162,28 @@ class ThumbCache(QObject):
         self.size = size
         self._pixmaps: dict[str, QPixmap] = {}
         self._pending: set[str] = set()
+        self._stamps: dict[str, Optional[tuple]] = {}  # get(check=True) で見た (更新時刻, 大きさ)
+        self._stale: set[str] = set()
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(2)
         self._signals = _Signals()
         self._signals.loaded.connect(self._on_loaded)
 
-    def get(self, path: str) -> Optional[QPixmap]:
+    def get(self, path: str, check: bool = False) -> Optional[QPixmap]:
+        """check=True: ファイルの更新時刻・大きさも見て、変わっていたら読み直す
+        (物語の source.png のように、同じパスに書き直すファイル用。手元のファイルだけに使う)。"""
         key = path.lower()
+        if check:
+            try:
+                st = os.stat(path)
+                stamp = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                stamp = None
+            if self._stamps.get(key) != stamp:
+                self._stamps[key] = stamp
+                self._pixmaps.pop(key, None)
+                if key in self._pending:
+                    self._stale.add(key)  # 読んでいる途中のものは古いので、届いたら読み直す
         if key in self._pixmaps:
             return self._pixmaps[key]
         if key not in self._pending:
@@ -176,10 +192,18 @@ class ThumbCache(QObject):
         return None
 
     def forget(self, path: str) -> None:
-        self._pixmaps.pop(path.lower(), None)
+        key = path.lower()
+        self._pixmaps.pop(key, None)
+        self._stamps.pop(key, None)
+        if key in self._pending:
+            self._stale.add(key)
 
     def _on_loaded(self, path: str, image: QImage):
         key = path.lower()
         self._pending.discard(key)
+        if key in self._stale:  # 読んでいるあいだにファイルが変わった: 捨てて読み直してもらう
+            self._stale.discard(key)
+            self.changed.emit(path)
+            return
         self._pixmaps[key] = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         self.changed.emit(path)

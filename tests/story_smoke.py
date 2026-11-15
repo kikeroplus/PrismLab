@@ -172,6 +172,29 @@ assert s2 is not s1 and s2.link == story.CONT and Path(s2.source).is_file(), (s2
 c = QImage(s2.source).pixelColor(80, 48)
 assert c.blue() > 150 and c.red() < 120, (c.red(), c.green(), c.blue())
 assert (sv.story.adopted_dir() / "01_ホーム.mp4").is_file()
+
+
+def shown_color(label):
+    pm = label.pixmap()
+    assert pm is not None and not pm.isNull(), "元画像が出ていない"
+    return pm.toImage().pixelColor(pm.width() // 2, pm.height() // 2)
+
+
+pump(0.8)
+c = shown_color(sv.source_view)
+assert c.blue() > 150 and c.red() < 120, ("続きの元画像に最後のコマ (青) が出る", c.red(), c.green(), c.blue())
+# 前のシーンの採用を、最後のコマが緑の動画に変える → 続きのシーンの元画像 (同じ source.png) の表示も緑になる
+make_video(Path(s1.candidates[1].path), [(200, 40, 40)] * 4 + [(40, 200, 60)] * 4, size=(160, 96))
+sv.select(s1)
+pump(0.3)
+sv.cands.setCurrentRow(next(i for i in range(sv.cands.count())
+                            if sv.cands.item(i).data(256) == s1.candidates[1].path))
+sv.adopt_only.click()
+pump(0.3)
+sv.select(s2)
+pump(0.8)
+c = shown_color(sv.source_view)
+assert c.green() > 150 and c.blue() < 120, ("採用を変えたら、続きの元画像の表示も新しいコマに", c.red(), c.green(), c.blue())
 s2.name = "振り返る"
 sv.prompt.setPlainText("she turns around slowly")
 sv.make_b.click()

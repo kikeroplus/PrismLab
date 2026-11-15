@@ -1500,7 +1500,7 @@ class StoryView(QWidget):
             card.set_selected(scene is s)
             card.name.setText(scene.label(i))
             shown = scene.adopted if scene.adopted else scene.source
-            pix = self.thumbs.get(shown) if shown and Path(shown).exists() else None
+            pix = self.thumbs.get(shown, check=True) if shown and Path(shown).exists() else None
             card.thumb.setPixmap(_framed(pix, SCENE_THUMB, OK_COLOR if scene.adopted else ""))
             busy = self.job == ("cand", scene.id) and self.engine.active
             if busy:
@@ -1524,7 +1524,8 @@ class StoryView(QWidget):
         for b in (self.pick_file, self.pick_t2i):
             b.setVisible(cut)
         self.pick_frame.setVisible(cut and not first)
-        pix = self.thumbs.get(s.source) if s.source and Path(s.source).exists() else None
+        # 元画像はいつも同じ source.png に書き直すので、更新時刻を見て読み直す
+        pix = self.thumbs.get(s.source, check=True) if s.source and Path(s.source).exists() else None
         if pix is not None and not pix.isNull():
             self.source_view.setPixmap(pix.scaled(self.source_view.size(), Qt.AspectRatioMode.KeepAspectRatio,
                                                   Qt.TransformationMode.SmoothTransformation))
