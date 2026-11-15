@@ -3,10 +3,13 @@ GenCommon の設定の窓をそのまま開く (3 つのアプリと共有の登
 
 from typing import Optional
 
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-                               QHBoxLayout, QLabel, QPushButton, QVBoxLayout)
+from pathlib import Path
 
-from gencommon import comfy, enhancer, reader
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+                               QVBoxLayout)
+
+from gencommon import comfy, enhancer, inserts, reader
 from gencommon.comfy_dialogs import ComfySettingsDialog
 
 from . import kinds, recipes, theme
@@ -54,8 +57,39 @@ class StageDialog(QDialog):
             row.addWidget(self.preset, 1)
             row.addWidget(edit)
             form.addRow("エンハンサー", row)
-            box.addWidget(_hint("前のステップで読み取った説明を LLM に盛らせます。1 枚ごとに盛るので、毎回違う盛り方になります。"))
+            box.addWidget(_hint("前のステップまでの文 (読み取った説明・その後に足した文) を LLM に盛らせます。"
+                                "1 枚ごとに盛るので、毎回違う盛り方になります。"))
             self._fill_llm(enhancer.load_presets(), stage.enhancer)
+        elif stage.type == recipes.TEXT:
+            self.text = QPlainTextEdit(stage.text)
+            self.text.setPlaceholderText("例: slow camera pan, cinematic lighting")
+            self.text.setMinimumHeight(120)
+            form.addRow("足す文", self.text)
+            box.addWidget(_hint("前のステップまでのプロンプトに、改行してこの文を足します (どの画像にも同じ文)。"
+                                "「盛る」より前に置くと一緒に盛り、あとに置くと盛った文にそのまま付けます。"))
+        elif stage.type == recipes.INSERT:
+            self.folder = QLineEdit(stage.folder)
+            self.folder.setPlaceholderText("セリフやアクションの .txt を入れたフォルダ")
+            browse = QPushButton("参照...")
+            browse.clicked.connect(self._browse_folder)
+            row = QHBoxLayout()
+            row.addWidget(self.folder, 1)
+            row.addWidget(browse)
+            form.addRow("フォルダ", row)
+            self.next_note = _hint("")
+            self.restart = QPushButton("最初から使う")
+            self.restart.setToolTip("このフォルダを 1 つ目のファイルから使い直します (ほかのアプリとも共有の位置)。")
+            self.restart.clicked.connect(self._restart_folder)
+            nrow = QHBoxLayout()
+            nrow.addWidget(self.next_note, 1)
+            nrow.addWidget(self.restart)
+            form.addRow("", nrow)
+            box.addWidget(_hint("フォルダの .txt を名前順に、1 枚ごとに 1 つずつ足します。最後まで使ったら最初に戻ります。"
+                                "どこまで使ったかは PromptWordCrafter・ImageMimicArt・J-Rate の差し込みと共有で、"
+                                "次の量産はその続きから使います (「1 枚で試す」では進めません)。"
+                                "「盛る」より前に置くと一緒に盛り、あとに置くとそのまま付けます (セリフを一字一句守るならあと)。"))
+            self.folder.textChanged.connect(self._folder_changed)
+            self._folder_changed()
         else:
             self.workflow = QComboBox()
             self.chip = KindChip()
@@ -93,6 +127,26 @@ class StageDialog(QDialog):
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         box.addWidget(buttons)
+
+    # 差し込み -------------------------------------------------------------
+    def _browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "差し込みのフォルダを選ぶ", self.folder.text().strip())
+        if folder:
+            self.folder.setText(str(Path(folder)))
+
+    def _folder_changed(self) -> None:
+        try:
+            note = inserts.peek(self.folder.text().strip()).describe()
+            ok = True
+        except inserts.InsertError as exc:
+            note, ok = str(exc), False
+        self.next_note.setText(note)
+        self.next_note.setStyleSheet("" if ok else "color: #ef5350;")
+        self.restart.setEnabled(ok)
+
+    def _restart_folder(self) -> None:
+        inserts.reset(self.folder.text().strip())
+        self._folder_changed()
 
     # 読み取り・盛る -------------------------------------------------------
     def _fill_llm(self, presets: list, current: str) -> None:
@@ -168,6 +222,20 @@ class StageDialog(QDialog):
             s.reread = self.reread.isChecked()
         elif s.type == recipes.ENHANCE:
             s.enhancer = str(self.preset.currentData() or "")
+        elif s.type == recipes.TEXT:
+            text = self.text.toPlainText().strip()
+            if not text:
+                QMessageBox.warning(self, "追加テキスト", "足す文を入れてください。")
+                return
+            s.text = text
+        elif s.type == recipes.INSERT:
+            folder = self.folder.text().strip()
+            try:
+                inserts.list_files(folder)
+            except inserts.InsertError as exc:
+                QMessageBox.warning(self, "差し込み", str(exc))
+                return
+            s.folder = str(Path(folder))
         else:
             s.workflow = str(self.workflow.currentData() or "")
             s.seconds = self.seconds.value() if self.use_seconds.isChecked() and self.use_seconds.isEnabled() else None

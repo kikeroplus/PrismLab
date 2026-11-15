@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, Signal
 
-from gencommon import comfy, enhancer, llm, reader, store
+from gencommon import comfy, enhancer, inserts, llm, reader, store
 
 from . import kinds, recipes
 
@@ -42,6 +42,10 @@ class Item:
     read_name: str = ""  # 今の text を読み取った読み取りプリセットの名前
     # [{"stage": ステップ, "path": パス, "time": 時刻, "from": 元のファイル, "prompt": 読み取った文, "enhanced": 盛った文}]
     outputs: list = field(default_factory=list)
+    # 足した文 (追加テキスト・差し込み)。GenRequest.inserts の形 {slot: -1, name, folder, before, file, text}。
+    # before = 盛る前に足したもの (このあとの盛るに渡す)。生成を通ると空に戻す
+    adds: list = field(default_factory=list)
+    plan: dict = field(default_factory=dict)  # 差し込みの割り当て (ステップの番号の文字 → 枠の形)。始めたときに決める
     error: str = ""
     error_stage: int = -1
     machine: str = ""  # 頼み済みの台の URL (prompt_id とセット)
@@ -75,6 +79,10 @@ class Item:
         it.state = state if state in STATE_TEXT else WAITING
         if it.state == RUNNING:
             it.state = WAITING  # 閉じたとき実行中だったもの (頼み済みなら prompt_id で続きを待つ)
+        adds = data.get("adds")
+        it.adds = [d for d in adds if isinstance(d, dict)] if isinstance(adds, list) else []
+        plan = data.get("plan")
+        it.plan = {str(k): v for k, v in plan.items() if isinstance(v, dict)} if isinstance(plan, dict) else {}
         outs = data.get("outputs")
         it.outputs = [o for o in outs if isinstance(o, dict) and o.get("path")] if isinstance(outs, list) else []
         return it
@@ -111,6 +119,10 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
             snap["reader"] = {"name": stage.reader}
         elif stage.type == recipes.ENHANCE:
             snap["enhancer"] = {"name": stage.enhancer}
+        elif stage.type == recipes.TEXT:
+            snap["text"] = stage.text
+        elif stage.type == recipes.INSERT:
+            snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name if stage.folder else ""
         else:
             snap["workflow"] = stage.workflow
             names = [w.name for w in comfy.workflows() if stage.workflow and w.value.lower() == stage.workflow.lower()]
@@ -129,6 +141,16 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         if not found:
             raise ValueError(f"エンハンサー「{stage.enhancer or '(未選択)'}」が登録にありません。")
         snap["enhancer"] = enhancer.snapshot(found[0])
+    elif stage.type == recipes.TEXT:
+        if not stage.text.strip():
+            raise ValueError("追加テキストのステップの文が空です。")
+        snap["text"] = stage.text.strip()
+    elif stage.type == recipes.INSERT:
+        try:
+            inserts.list_files(stage.folder)
+        except inserts.InsertError as exc:
+            raise ValueError(f"差し込みのステップ: {exc}") from exc
+        snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name
     else:
         if not stage.workflow:
             raise ValueError("生成のステップにワークフローが選ばれていません。")
@@ -156,6 +178,7 @@ class Run:
 
     def __init__(self, recipe: dict, stages: list, output_dir: str, items: list, started: float = 0.0,
                  paused: bool = False, trial: bool = False):
+        self.pickers: list = []  # 差し込みの位置 (始めたときに書く。保存しない)
         self.trial = trial  # 試作 (1 枚で試す)。出力は (出力フォルダ)\試作
         self.recipe = recipe
         self.stages = stages
@@ -176,9 +199,26 @@ class Run:
         if not out:
             raise ValueError("出力フォルダが決まっていません。")
         items = [Item(str(p), current=str(p), stage=first) for p in sources]
+        pickers = []
+        for i, snap in enumerate(stages):
+            if snap["type"] != recipes.INSERT or snap.get("bypass"):
+                continue
+            # 差し込み: 1 枚ごとに次のファイルを割り当てる (続きから始めても変わらない)
+            try:
+                picker = inserts.Picker([inserts.Slot(snap["name"], snap["folder"], True, False)])
+                for it in items:
+                    it.plan[str(i)] = picker.next()[0]
+            except inserts.InsertError as exc:
+                raise ValueError(str(exc)) from exc
+            pickers.append(picker)
         if trial:
             out = str(Path(out) / TRIAL_DIR)
-        return Run(recipe.to_dict(), stages, out, items, trial=trial)
+            for picker in pickers:
+                picker.discard()  # 試作では位置を進めない (量産は同じファイルから始まる)
+            pickers = []
+        run = Run(recipe.to_dict(), stages, out, items, trial=trial)
+        run.pickers = pickers
+        return run
 
     def to_dict(self) -> dict:
         return {"recipe": self.recipe, "stages": self.stages, "output_dir": self.output_dir,
@@ -285,6 +325,9 @@ class Engine(QObject):
             if self.run is not None and any(i.state == RUNNING for i in self.run.items):
                 raise RuntimeError("量産が動いています。")
             self.run = run
+            for picker in run.pickers:  # 差し込みの位置を書く (ほかのアプリと共有)
+                picker.commit()
+            run.pickers = []
             self._stop = False
             self._unpin_missing()
             self._ensure_threads()
@@ -510,12 +553,14 @@ class Engine(QObject):
                 with self._cond:
                     it.text, it.enhanced = text, None
                     it.read_name = str(stage["reader"].get("name", ""))
+            elif stage["type"] in recipes.ADD_TYPES:
+                self._add_text(it, stage)
             else:
-                if it.text is None or not it.text.strip():
-                    raise llm.LLMError("盛る元のプロンプトがありません。前に読み取りのステップを置いてください。")
+                source = inserts.join(it.text, *inserts.texts(it.adds, True))  # 読み取った文 + 盛る前に足した文
+                if not source.strip():
+                    raise llm.LLMError("盛る元の文がありません。前に読み取り・追加テキスト・差し込みのステップを置いてください。")
                 self._set_status(it, "AI で盛っています...")
                 self.llm_status = f"盛る: {Path(it.current).name}"
-                source = it.text
                 enhanced = _cancellable(lambda: enhancer.enhance_with(stage["enhancer"], source), cancel)
                 if not enhanced.strip():
                     raise llm.LLMError("盛った結果が空でした。")
@@ -529,15 +574,32 @@ class Engine(QObject):
         finally:
             self.llm_status = ""
 
+    def _add_text(self, it: Item, stage: dict) -> None:
+        """追加テキスト・差し込みの文を足す。まだ盛っていなければ盛る前 (このあとの盛るに渡す)、盛ったあとならそのまま付ける。"""
+        before = it.enhanced is None
+        if stage["type"] == recipes.TEXT:
+            add = {"slot": -1, "name": "追加テキスト", "folder": "", "before": before, "file": "",
+                   "text": str(stage.get("text") or "")}
+        else:
+            planned = it.plan.get(str(it.stage))
+            if not planned:
+                raise ValueError("差し込みのファイルが割り当てられていません (始め直してください)。")
+            add = {"slot": -1, "name": "差し込み", "folder": str(planned.get("folder") or ""), "before": before,
+                   "file": str(planned.get("file") or ""), "text": str(planned.get("text") or "")}
+        with self._cond:
+            it.adds.append(add)
+
     def _run_gen(self, it: Item, m: Machine, cancel: threading.Event) -> None:
         run = self.run
         stage = run.stages[it.stage]
         req = comfy.GenRequest(
             connection_name=m.name, url=m.url,
             workflow_name=str(stage.get("workflow_name", "")), workflow_path=str(stage.get("workflow", "")),
-            prompt=it.text, seconds=stage.get("seconds"),
-            base_prompt=str(stage.get("base") or "") if it.text is not None else "",
+            # 読み取った文も足した文もなければ、ワークフローに書かれたプロンプトのまま (None)
+            prompt=(it.text or "") if (it.text is not None or it.adds) else None, seconds=stage.get("seconds"),
+            base_prompt=str(stage.get("base") or "") if (it.text is not None or it.adds) else "",
             enhanced_prompt=it.enhanced,
+            inserts=[dict(a) for a in it.adds] or None,
             reader={"name": it.read_name} if it.read_name else None,
             output_dir=run.output_dir,
         )
@@ -602,9 +664,11 @@ class Engine(QObject):
             for out in outputs:
                 # 使ったプロンプトも残す (このあと空に戻すので、結果の欄で見られるように)
                 it.outputs.append({"stage": it.stage, "path": out, "time": now, "from": it.current,
-                                   "prompt": it.text or "", "enhanced": it.enhanced or ""})
+                                   "prompt": it.text or "", "enhanced": it.enhanced or "",
+                                   "adds": [dict(a) for a in it.adds], "sent": req.full_prompt or ""})
             it.current = outputs[0]
             it.text, it.enhanced, it.read_name = None, None, ""  # 新しいファイルには新しい説明が要る
+            it.adds = []
             it.prompt_id, it.machine = "", ""
             m.done += 1
             m.fail_streak = 0

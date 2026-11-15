@@ -259,6 +259,52 @@ check(bool(o11.get("prompt")) and bool(o11.get("enhanced")) and Path(o11.get("fr
       "11: 出来たものに、元・読み取った文・盛った文を残した")
 check(engine.Run.from_dict(run11.to_dict()).trial, "11: 試作の印を保存する")
 
+# 12. 追加テキスト (盛る前) と 差し込み (盛ったあと)
+from gencommon import inserts  # noqa: E402
+lines = TMP / "lines"
+lines.mkdir()
+for n, word in ((1, "hello"), (2, "goodbye"), (10, "again")):
+    (lines / f"{n}.txt").write_text(f"says {word}", encoding="utf-8")
+src12 = make_images(TMP / "in12", 4)
+r12 = recipe("12", TMP / "in12", [S(recipes.READ, reader=READER), S(recipes.TEXT, text="slow pan"),
+                                   S(recipes.ENHANCE, enhancer=ENHANCER), S(recipes.INSERT, folder=str(lines)),
+                                   S(recipes.GEN, workflow=str(WF / "i2v.json"))])
+check(recipes.can_bypass(r12.stages, 0), "12: 追加テキストがあれば、読み取りをバイパスにしても盛れる")
+trial12 = engine.Run.create(r12, src12[:1], trial=True)
+check(trial12.items[0].plan["3"]["file"] == "1.txt" and not trial12.pickers, "12: 試作は 1 つ目を使い、位置を進めない")
+run12 = engine.Run.create(r12, src12)
+check([i.plan["3"]["file"] for i in run12.items] == ["1.txt", "2.txt", "10.txt", "1.txt"],
+      "12: 差し込みは 1 枚ごとに名前順 (自然順) で、一周したら最初へ")
+calls_before = len(llm.calls)
+eng.start(run12)
+check(inserts.last_used(str(lines)) == "1.txt", "12: 始めたときに差し込みの位置を書く (共有)")
+wait(eng)
+o12 = eng.run.items[1].outputs[-1] if eng.run.items[1].outputs else {}
+check(all(i.state == engine.DONE for i in eng.run.items), "12: 追加テキスト・差し込みを通して完了")
+check(any("slow pan" in json.dumps(c, ensure_ascii=False) for c in llm.calls[calls_before:]),
+      "12: 盛る前の追加テキストはエンハンサーに渡す")
+sent = o12.get("sent", "")
+check("says goodbye" in sent and sent.index(o12.get("enhanced", "?")) < sent.index("says goodbye"),
+      f"12: 盛ったあとの差し込みは、盛った文のあとにそのまま付ける ({sent!r})")
+check([(a["name"], a["before"]) for a in o12.get("adds", [])] == [("追加テキスト", True), ("差し込み", False)],
+      "12: 足した文を記録に残す (盛る前か)")
+check(eng.run.items[1].adds == [], "12: 生成を通ったら足した文は空に戻す")
+
+# 13. 入口を 1 枚に (回数ぶん同じ画像を通す)
+src13 = make_images(TMP / "in13", 1)[0]
+r13 = recipe("13", "", [S(recipes.INSERT, folder=str(lines)), S(recipes.GEN, workflow=str(WF / "i2v.json"))])
+r13.source, r13.image, r13.repeat = recipes.SINGLE, str(src13), 3
+check(Path(r13.resolved_output_dir()) == TMP / "in13" / "13", "13: 1 枚のときの出力は 画像のフォルダ\レシピ名")
+r13b = recipes.Recipe.from_dict(r13.to_dict())
+check(r13b.single and r13b.image == str(src13) and r13b.repeat == 3, "13: 1 枚・回数を保存する")
+eng.start(engine.Run.create(r13, [src13] * r13.repeat))
+wait(eng)
+names13 = sorted(Path(i.outputs[-1]["path"]).name for i in eng.run.items)
+files13 = [i.plan["0"]["file"] for i in eng.run.items]
+check(all(i.state == engine.DONE for i in eng.run.items) and len(set(names13)) == 3,
+      f"13: 同じ画像から 3 本 (名前は重ならない: {names13})")
+check(len(set(files13)) == 3, f"13: 1 本ずつ別の差し込み ({files13})")
+
 for s in (a, b, slow):
     s.close()
 llm.close()

@@ -129,6 +129,20 @@ window.grab().save(str(OUT / "prismlab_bypass.png"))
 lv.stage_cards[1].bypass.click()
 pump(0.5)
 assert not lv.recipe.stages[1].bypass
+# 追加テキスト・差し込みのステップ
+lines = TMP / "lines"
+lines.mkdir()
+for n in (1, 2, 3):
+    (lines / f"{n:03}.txt").write_text(f"line {n}", encoding="utf-8")
+lv.recipe.stages = [recipes.Stage.from_dict(d) for d in saved]
+lv.recipe.stages.insert(2, recipes.Stage(recipes.INSERT, folder=str(lines)))
+lv.recipe.stages.insert(1, recipes.Stage(recipes.TEXT, text="slow camera pan, cinematic lighting"))
+lv.refresh(rebuild=True)
+pump(0.5)
+titles = [c.title.text() for c in lv.stage_cards]
+assert titles == ["読み取り", "追加テキスト", "盛る", "差し込み", "生成"], titles
+assert "次: 001.txt (1 / 3)" in lv.stage_cards[3].detail.text(), lv.stage_cards[3].detail.text()
+window.grab().save(str(OUT / "prismlab_add_steps.png"))
 lv.recipe.stages = [recipes.Stage.from_dict(d) for d in saved]
 lv._save_recipes()
 lv.refresh(rebuild=True)
@@ -166,6 +180,29 @@ window.grab().save(str(OUT / "prismlab_done.png"))
 run = window.engine.run
 print("完了:", sum(1 for i in run.items if i.state == engine.DONE), "/", len(run.items),
       "台:", [m.done for m in window.engine.machines])
+# 入口を 1 枚に: 回数ぶん同じ画像を通す
+lv = window.line
+lv.mode_single.click()
+pump(0.5)
+assert lv.recipe.single and lv.repeat_box.isVisibleTo(lv.entry) and not lv.star_box.isVisibleTo(lv.entry)
+assert lv.entry.detail.text().startswith("クリックして画像を選ぶ"), lv.entry.detail.text()
+lv._set_image(str(src / "girl_005.png"))
+lv.repeat_box.setValue(2)
+pump(0.5)
+assert lv.entry.detail.text() == "画像: girl_005.png" and lv.entry.count.text() == "2 回通す", lv.entry.count.text()
+lv._start()
+end = time.time() + 90
+while time.time() < end and window.engine.active and window.engine.run.unfinished:
+    pump(0.3)
+pump(1)
+single_run = window.engine.run
+assert len(single_run.items) == 2 and all(i.state == engine.DONE for i in single_run.items)
+assert all(Path(i.source).name == "girl_005.png" for i in single_run.items)
+window.grab().save(str(OUT / "prismlab_single.png"))
+lv.mode_folder.click()
+pump(0.5)
+assert not lv.recipe.single and lv.star_box.isVisibleTo(lv.entry)
+
 window.engine.stop_threads()
 for s in (a, b, llm):
     s.close()

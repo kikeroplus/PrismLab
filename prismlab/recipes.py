@@ -17,7 +17,10 @@ MACHINES_FILE = "machines.txt"  # 台 (1 行に 1 つ、接続先の URL)。最�
 MAX_MACHINES = 3
 
 READ, ENHANCE, GEN = "read", "enhance", "gen"
-STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", GEN: "生成"}
+TEXT, INSERT = "text", "insert"  # 追加テキスト (入力した文を足す)・差し込み (フォルダの .txt を 1 枚ごとに順に足す)
+STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", TEXT: "追加テキスト", INSERT: "差し込み", GEN: "生成"}
+STAGE_ORDER = (READ, ENHANCE, TEXT, INSERT, GEN)  # メニューに並べる順
+ADD_TYPES = (TEXT, INSERT)  # プロンプトに文を足すステップ (盛るより前なら一緒に盛り、あとならそのまま付ける)
 IMAGE_EXTS = reader.IMAGE_EXTS
 
 
@@ -30,6 +33,8 @@ class Stage:
     workflow: str = ""  # ワークフローの JSON のパス
     seconds: Optional[float] = None  # 長さ (None = ワークフローのまま)
     base_prompt: bool = True  # ベースプロンプトを付ける
+    text: str = ""  # 追加テキストの文
+    folder: str = ""  # 差し込みのフォルダ
     bypass: bool = False  # バイパス (このステップを飛ばして、前のものをそのまま次に渡す)
 
     def to_dict(self) -> dict:
@@ -49,8 +54,14 @@ class Stage:
         sec = data.get("seconds")
         s.seconds = float(sec) if isinstance(sec, (int, float)) and not isinstance(sec, bool) and sec > 0 else None
         s.base_prompt = bool(data.get("base_prompt", True))
+        s.text = str(data.get("text") or "")
+        s.folder = str(data.get("folder") or "")
         s.bypass = bool(data.get("bypass", False))
         return s
+
+
+FOLDER, SINGLE = "folder", "single"  # 入口: フォルダの画像 / 1 枚の画像を回数ぶん (LoadImage のように)
+MAX_REPEAT = 999
 
 
 @dataclass
@@ -58,12 +69,20 @@ class Recipe:
     name: str = ""
     folder: str = ""  # 入口のフォルダ
     min_stars: int = 0  # ★の絞り込み (0 = なし)
-    output_dir: str = ""  # 空なら (入口のフォルダ)\(レシピ名)
+    output_dir: str = ""  # 空なら (入口のフォルダ)\(レシピ名)。1 枚のときは (画像のあるフォルダ)\(レシピ名)
     stages: list = field(default_factory=list)
+    source: str = FOLDER  # 入口の種類
+    image: str = ""  # 1 枚のときの画像
+    repeat: int = 1  # 1 枚のときの回数 (同じ画像を何回通すか)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "folder": self.folder, "min_stars": self.min_stars,
-                "output_dir": self.output_dir, "stages": [s.to_dict() for s in self.stages]}
+                "output_dir": self.output_dir, "source": self.source, "image": self.image, "repeat": self.repeat,
+                "stages": [s.to_dict() for s in self.stages]}
+
+    @property
+    def single(self) -> bool:
+        return self.source == SINGLE
 
     @staticmethod
     def from_dict(data: dict) -> "Recipe":
@@ -77,6 +96,12 @@ class Recipe:
         except (TypeError, ValueError):
             r.min_stars = 0
         r.output_dir = str(data.get("output_dir") or "")
+        r.source = SINGLE if data.get("source") == SINGLE else FOLDER
+        r.image = str(data.get("image") or "")
+        try:
+            r.repeat = max(1, min(MAX_REPEAT, int(data.get("repeat") or 1)))
+        except (TypeError, ValueError):
+            r.repeat = 1
         stages = data.get("stages")
         r.stages = [Stage.from_dict(s) for s in stages] if isinstance(stages, list) else []
         return r
@@ -87,15 +112,16 @@ class Recipe:
     def resolved_output_dir(self) -> str:
         if self.output_dir:
             return self.output_dir
-        if not self.folder:
+        base = str(Path(self.image).parent) if self.single and self.image else ("" if self.single else self.folder)
+        if not base:
             return ""
-        return str(Path(self.folder) / safe_name(self.name or "PrismLab"))
+        return str(Path(base) / safe_name(self.name or "PrismLab"))
 
 
 def line_problems(stages: list, skip: int = -1) -> set:
     """ラインが成り立たないところ (skip 番目もバイパスしたとして数える)。
-    "nogen" = 生成のステップが 1 つも動かない。("enhance", i) = i 番目の盛るの前に、読み取りがない
-    (生成を通るとプロンプトは空に戻るので、直前の生成よりあとに読み取りが要る)。"""
+    "nogen" = 生成のステップが 1 つも動かない。("enhance", i) = i 番目の盛るの前に、盛る元の文がない
+    (読み取り・追加テキスト・差し込みのどれか。生成を通るとプロンプトは空に戻るので、直前の生成よりあとに要る)。"""
     problems = set()
     has_gen = has_text = False
     for i, s in enumerate(stages):
@@ -103,7 +129,7 @@ def line_problems(stages: list, skip: int = -1) -> set:
             continue
         if s.type == GEN:
             has_gen, has_text = True, False
-        elif s.type == READ:
+        elif s.type == READ or s.type in ADD_TYPES:
             has_text = True
         elif not has_text:
             problems.add(("enhance", i))
@@ -124,7 +150,7 @@ def bypass_reason(stages: list, index: int) -> str:
     new = line_problems(stages, index) - line_problems(stages)
     if "nogen" in new:
         return "生成のステップがなくなるので、バイパスにできません。"
-    return "あとの「盛る」の元になる読み取りがなくなるので、バイパスにできません。"
+    return "あとの「盛る」の元になる文がなくなるので、バイパスにできません。"
 
 
 def safe_name(name: str) -> str:
