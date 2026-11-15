@@ -18,6 +18,18 @@ pip install -r requirements.txt
 
 接続先・ワークフロー・ベースプロンプト・エンハンサー・読み取りプリセット・LLM の接続は、J-Rate・PromptWordCrafter・ImageMimicArt と共有します (`%APPDATA%\GenCommon\`)。
 
+### EXE を作る
+
+ImageMimicArt と同じく、PyInstaller で 1 つの EXE にします (隣の `..\GenCommon` も取り込みます)。
+
+```powershell
+python -m PyInstaller PrismLab.spec --noconfirm   # → dist\PrismLab.exe
+```
+
+- アイコンは `assets\icon.ico`。アプリのアイコン (`prismlab.main.make_icon`) を変えたら `python tools\make_ico.py` で作り直します。
+- GenCommon を直したときも、EXE を作り直します (作った時点の GenCommon が中に入るため)。
+- 1 ファイルの EXE なので、起動すると EXE のプロセスが 2 つ (起動役と本体) 見えます。
+
 ## 使い方 (量産ライン)
 
 1. **台の設定...**: 量産で使う ComfyUI を 3 台まで選びます (登録してある接続先から)。
