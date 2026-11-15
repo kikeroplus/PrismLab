@@ -3,36 +3,16 @@
 import time
 
 from PySide6.QtCore import QEvent
-from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox, QPushButton, QTabWidget, QToolBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QMainWindow, QMessageBox, QPushButton, QTabWidget, QToolBar
 
 from gencommon import enhancer, reader
 from gencommon.comfy_dialogs import ComfySettingsDialog
 
 from . import engine, recipes, settings, theme
 from .line_view import LineView
+from .story_view import StoryView
 
 AWAY_SECONDS = 1.0  # これより長くほかのウィンドウにいたら、戻ったときに入口の★を読み直す
-
-
-class StoryPlaceholder(QWidget):
-    """物語 (段階 3)。いまは何を作るかだけを見せる。"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        box = QVBoxLayout(self)
-        box.setContentsMargins(40, 40, 40, 40)
-        title = QLabel("物語")
-        title.setStyleSheet("font-size: 20px; font-weight: bold;")
-        text = QLabel(
-            "シーンを横に並べた絵コンテで、1 シーンずつ作ってつなぎます (段階 3 で作ります)。\n\n"
-            "・つなぎ方は「続き」(前のシーンで採用した動画の最後のコマを元画像にする) と「シーンチェンジ」\n"
-            "・シーンごとにプロンプト (読み取り → 手直し → 差し込み → 盛る) と候補。候補から 1 つを採用して次へ\n"
-            "・「▶ 通して再生」で採用した動画を続けて再生。書き出しは動画編集ソフトで")
-        text.setWordWrap(True)
-        text.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 13px;")
-        box.addWidget(title)
-        box.addWidget(text)
-        box.addStretch(1)
 
 
 class MainWindow(QMainWindow):
@@ -45,7 +25,8 @@ class MainWindow(QMainWindow):
         self.line = LineView(self.engine)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.line, "量産ライン")
-        self.tabs.addTab(StoryPlaceholder(), "物語")
+        self.story = StoryView()
+        self.tabs.addTab(self.story, "物語")
         self.tabs.setStyleSheet("QTabBar::tab { padding: 6px 22px; font-size: 13px; }"
                                 f"QTabBar::tab:selected {{ background: {theme.ACCENT}; color: black; font-weight: bold; }}")
         self.setCentralWidget(self.tabs)
@@ -60,6 +41,7 @@ class MainWindow(QMainWindow):
             bar.addWidget(button)
 
         self.line.status.connect(self.show_status)
+        self.story.status.connect(self.show_status)
         self.statusBar().showMessage(notice or "準備ができました。", 8000)
         settings.restore_geometry(self)
 
@@ -90,14 +72,17 @@ class MainWindow(QMainWindow):
         ComfySettingsDialog(self).exec()
         self.engine.set_machines(recipes.machines())  # 接続先の名前を変えたとき
         self.line.refresh(rebuild=True)
+        self.story.settings_changed()
 
     def _reader_settings(self) -> None:
         reader.ReaderSettingsDialog(0, self).exec()
         self.line.refresh(rebuild=True)
+        self.story.settings_changed()
 
     def _enhancer_settings(self) -> None:
         enhancer.EnhancerSettingsDialog(0, self).exec()
         self.line.refresh(rebuild=True)
+        self.story.settings_changed()
 
     # 続きから始める ---------------------------------------------------------
     def offer_resume(self) -> None:
@@ -131,6 +116,14 @@ class MainWindow(QMainWindow):
 
     # 閉じる -----------------------------------------------------------------
     def closeEvent(self, event) -> None:
+        if self.story.busy():
+            # 物語の候補は続きから受け取れないので、閉じる前に聞く
+            if QMessageBox.question(self, "閉じる", "物語の候補を作っています。閉じると、作っている候補は受け取れません"
+                                    " (ComfyUI には中止を送ります)。閉じますか?",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         run = self.engine.run
         busy = run is not None and run.unfinished > 0 and self.engine.active
         stopped = busy and run.paused and not any(i.state == engine.RUNNING for i in run.items)
@@ -156,6 +149,7 @@ class MainWindow(QMainWindow):
                 self.engine.stop_threads()
         else:
             self.engine.stop_threads()
+        self.story.shutdown()
         settings.save_geometry(self)
         event.accept()
 

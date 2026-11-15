@@ -10,7 +10,8 @@ from gencommon import comfy
 from gencommon.diagram_dialog import LLM_LINE
 from gencommon.set_cards import KIND_COLORS
 
-__all__ = ["KIND_COLORS", "LLM_LINE", "TEXT_COLOR", "IMAGE_COLOR", "kind_of", "color_of", "is_video"]
+__all__ = ["KIND_COLORS", "LLM_LINE", "TEXT_COLOR", "IMAGE_COLOR", "kind_of", "color_of", "is_video",
+           "has_reference"]
 
 TEXT_COLOR = "#9aa3b3"  # 文字 (プロンプト) の札
 IMAGE_COLOR = KIND_COLORS["I2I"]  # 入口の画像の札 (画像は I2I と同じ緑)
@@ -41,6 +42,30 @@ def kind_of(workflow_path: str) -> str:
     with _lock:
         _cache[key] = kind
     return kind
+
+
+_ref_cache: dict = {}  # (パスの小文字, 更新日時) → リファレンス用の LoadImage があるか
+
+
+def has_reference(workflow_path: str) -> bool:
+    """リファレンス画像 (主に顔) を入れる LoadImage があるか (タイトルに reference / face / 顔 など。comfy.reference_nodes)。"""
+    if not workflow_path:
+        return False
+    try:
+        stamp = Path(workflow_path).stat().st_mtime
+    except OSError:
+        return False
+    key = (workflow_path.lower(), stamp)
+    with _lock:
+        if key in _ref_cache:
+            return _ref_cache[key]
+    try:
+        found = comfy.has_reference(comfy.load_workflow(workflow_path))
+    except (comfy.ComfyError, OSError, ValueError):
+        found = False
+    with _lock:
+        _ref_cache[key] = found
+    return found
 
 
 def color_of(kind: str) -> str:

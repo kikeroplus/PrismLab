@@ -45,6 +45,7 @@ class Item:
     # 足した文 (追加テキスト・差し込み)。GenRequest.inserts の形 {slot: -1, name, folder, before, file, text}。
     # before = 盛る前に足したもの (このあとの盛るに渡す)。生成を通ると空に戻す
     adds: list = field(default_factory=list)
+    reference: str = ""  # リファレンス画像 (主に顔)。ワークフローにリファレンス用の LoadImage があるときだけ使う
     plan: dict = field(default_factory=dict)  # 差し込みの割り当て (ステップの番号の文字 → 枠の形)。始めたときに決める
     error: str = ""
     error_stage: int = -1
@@ -64,7 +65,7 @@ class Item:
         if not isinstance(data, dict) or not data.get("source"):
             return None
         it = Item(str(data["source"]))
-        for key in ("current", "error", "machine", "prompt_id", "read_name"):
+        for key in ("current", "error", "machine", "prompt_id", "read_name", "reference"):
             setattr(it, key, str(data.get(key) or ""))
         it.current = it.current or it.source
         for key in ("text", "enhanced"):
@@ -289,8 +290,9 @@ class Engine(QObject):
     changed = Signal()
     finished = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, run_file: Optional[str] = RUN_FILE):
         super().__init__(parent)
+        self.run_file = run_file  # 続きから始めるための書き出し先 (None = 書かない。物語の候補づくりなど)
         self.run: Optional[Run] = None
         self.machines: list[Machine] = []
         self.llm_status = ""
@@ -607,6 +609,7 @@ class Engine(QObject):
             base_prompt=str(stage.get("base") or "") if (it.text is not None or it.adds) else "",
             enhanced_prompt=it.enhanced,
             inserts=[dict(a) for a in it.adds] or None,
+            reference=it.reference or None,
             reader={"name": it.read_name} if it.read_name else None,
             output_dir=run.output_dir,
         )
@@ -728,11 +731,11 @@ class Engine(QObject):
 
     def _save(self) -> None:
         with self._cond:
-            if self.run is None:
+            if self.run is None or not self.run_file:
                 return
             text = json.dumps(self.run.to_dict(), ensure_ascii=False)
         try:
-            store.write_text(store.app_file(RUN_FILE), text)
+            store.write_text(store.app_file(self.run_file), text)
             self._save_failed = False
         except OSError:
             self._save_failed = True

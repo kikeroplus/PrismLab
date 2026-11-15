@@ -20,6 +20,7 @@ class FakeComfy:
     def __init__(self, polls: int = 1):
         self.polls = polls
         self.fail = False
+        self.video_bytes = None  # 動画の出力に返す本物の mp4 (None なら中身のない文字)
         self.prompts: dict = {}  # id → {"wf": ..., "seen": n, "video": bool}
         self.received: list = []  # 受けたワークフロー (順に)
         self.lock = threading.Lock()
@@ -67,7 +68,12 @@ class FakeComfy:
                 if url.path == "/view":
                     q = parse_qs(url.query)
                     name = q["filename"][0]
-                    data = PNG if name.endswith(".png") else ("data:" + name).encode()
+                    if name.endswith(".png"):
+                        data = PNG
+                    elif owner.video_bytes is not None:
+                        data = owner.video_bytes
+                    else:
+                        data = ("data:" + name).encode()
                     return self._send(data, ctype="application/octet-stream")
                 self._send({}, 404)
 
@@ -154,6 +160,14 @@ def workflow_t2i() -> dict:
     }
 
 
+def workflow_i2v_ref() -> dict:
+    """I2V + 顔のリファレンス (タイトルが Face Reference の LoadImage)。"""
+    wf = workflow_i2v()
+    wf["6"] = {"class_type": "LoadImage", "_meta": {"title": "Face Reference"}, "inputs": {"image": "face.png"}}
+    wf["4"]["inputs"]["ref"] = ["6", 0]
+    return wf
+
+
 def workflow_cn() -> dict:
     return {
         "1": {"class_type": "LoadImage", "inputs": {"image": "x.png"}},
@@ -163,3 +177,17 @@ def workflow_cn() -> dict:
         "5": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c"}},
         "9": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
     }
+
+
+def make_video(path, colors_rgb, size=(64, 48), fps=8) -> None:
+    """色ごとに 1 コマの短い mp4 を作る (物語の「最後のコマ」のテスト用)。"""
+    import cv2
+    import numpy as np
+    writer = cv2.VideoWriter(str(path) + ".tmp.mp4", cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    for r, g, b in colors_rgb:
+        frame = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+        frame[:, :] = (b, g, r)
+        writer.write(frame)
+    writer.release()
+    import os
+    os.replace(str(path) + ".tmp.mp4", str(path))  # VideoWriter は日本語のパスに書けないことがあるので、名前を変えて置く

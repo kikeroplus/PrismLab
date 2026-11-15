@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from fakes import FakeComfy, FakeLLM, workflow_cn, workflow_i2v, workflow_t2i  # noqa: E402
+from fakes import FakeComfy, FakeLLM, workflow_cn, workflow_i2v, workflow_i2v_ref, workflow_t2i  # noqa: E402
 from gencommon import enhancer, reader, settings, store  # noqa: E402
 from prismlab import engine, profile, recipes  # noqa: E402
 
@@ -40,6 +40,7 @@ WF.mkdir()
 (WF / "i2v.json").write_text(json.dumps(workflow_i2v()), encoding="utf-8")
 (WF / "cn.json").write_text(json.dumps(workflow_cn()), encoding="utf-8")
 (WF / "t2i.json").write_text(json.dumps(workflow_t2i()), encoding="utf-8")
+(WF / "i2v_ref.json").write_text(json.dumps(workflow_i2v_ref()), encoding="utf-8")
 
 
 def make_images(folder: Path, n: int) -> list[Path]:
@@ -352,6 +353,26 @@ check(recipes.Recipe.from_dict({"name": "x"}).inherit, "15: 引き継ぎの既�
 # 16. 回数
 check([p for p in recipes.repeat_sources(["a", "b"], 3)] == ["a", "b", "a", "b", "a", "b"],
       "16: 回数は 全部を 1 回ずつ → 2 回目 … の順")
+
+# 17. リファレンス画像 (顔): リファレンス用の LoadImage にだけ別の画像を入れる
+from prismlab import kinds  # noqa: E402
+check(kinds.has_reference(str(WF / "i2v_ref.json")) and not kinds.has_reference(str(WF / "i2v.json")),
+      "17: リファレンス用の LoadImage (タイトルに Face Reference) があるワークフローを見分ける")
+src17 = make_images(TMP / "in17", 2)
+r17 = recipe("17", TMP / "in17", [S(recipes.GEN, workflow=str(WF / "i2v_ref.json"))])
+eng17 = engine.Engine()
+eng17.set_machines([a.url])
+run17 = engine.Run.create(r17, src17)
+run17.items[0].reference = str(src17[1])
+before = len(a.received)
+eng17.start(run17)
+wait(eng17)
+sent = a.received[before:]
+pairs = sorted((w["1"]["inputs"]["image"] != w["6"]["inputs"]["image"]) for w in sent)
+check(all(i.state == engine.DONE for i in run17.items) and pairs == [False, True],
+      "17: リファレンスを渡した件だけ、リファレンス用の LoadImage に別の画像を送る (渡さなければ元画像)")
+check(engine.Item.from_dict(run17.items[0].to_dict()).reference == str(src17[1]), "17: リファレンスを保存する")
+eng17.stop_threads()
 
 for s in (a, b, slow):
     s.close()
