@@ -1,4 +1,4 @@
-"""段の設定・台の設定の窓。登録 (接続先・ワークフロー・読み取りプリセット・エンハンサー) は
+"""ステップの設定・台の設定の窓。登録 (接続先・ワークフロー・読み取りプリセット・エンハンサー) は
 GenCommon の設定の窓をそのまま開く (3 つのアプリと共有の登録)。"""
 
 from typing import Optional
@@ -21,12 +21,12 @@ def _hint(text: str) -> QLabel:
 
 
 class StageDialog(QDialog):
-    """1 つの段の設定。OK で stage を書き換える。"""
+    """1 つのステップの設定。OK で stage を書き換える。"""
 
     def __init__(self, stage: recipes.Stage, parent=None):
         super().__init__(parent)
         self.stage = stage
-        self.setWindowTitle(f"段の設定: {recipes.STAGE_TITLES[stage.type]}")
+        self.setWindowTitle(f"ステップの設定: {recipes.STAGE_TITLES[stage.type]}")
         self.resize(520, 0)
         box = QVBoxLayout(self)
         form = QFormLayout()
@@ -54,7 +54,7 @@ class StageDialog(QDialog):
             row.addWidget(self.preset, 1)
             row.addWidget(edit)
             form.addRow("エンハンサー", row)
-            box.addWidget(_hint("前の段で読み取った説明を LLM に盛らせます。1 枚ごとに盛るので、毎回違う盛り方になります。"))
+            box.addWidget(_hint("前のステップで読み取った説明を LLM に盛らせます。1 枚ごとに盛るので、毎回違う盛り方になります。"))
             self._fill_llm(enhancer.load_presets(), stage.enhancer)
         else:
             self.workflow = QComboBox()

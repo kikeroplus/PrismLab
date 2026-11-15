@@ -1,8 +1,8 @@
 """量産ラインを動かす部分 (画面とは別)。
 
-- 入口の 1 枚につき 1 件 (Item)。件は段を左から順に通る。
+- 入口の 1 枚につき 1 件 (Item)。件はステップを左から順に通る。
 - 読み取り・盛る (LLM) は 1 つのスレッドで、生成は台ごとに 2 つのスレッドで進める。
-  どのスレッドも「次の段が自分の種類で、待機中の件」を前から順に取る (終わった台から次の 1 件を取る)。
+  どのスレッドも「次のステップが自分の種類で、待機中の件」を前から順に取る (終わった台から次の 1 件を取る)。
 - 台に繋がらなくなったら、その台の件は待機に戻し、ほかの台に回す。繋がらない台は 30 秒ごとに確かめる。
 - 状態が変わるたびに %APPDATA%\\PrismLab\\line_run.json に書く (続きから始めるため)。
 """
@@ -21,6 +21,7 @@ from gencommon import comfy, enhancer, llm, reader, store
 from . import kinds, recipes
 
 RUN_FILE = "line_run.json"
+TRIAL_DIR = "試作"  # 1 枚で試すときの出力 (出力フォルダの下)
 SLOTS_PER_MACHINE = 2  # 1 台に同時に送る件数 (generation-standard 6 章)
 FAIL_LIMIT = 3  # ある台でだけ、これだけ続けて失敗したら、その台を外す
 DOWN_RECHECK = 30.0  # 繋がらない台を確かめ直す間隔 (秒)
@@ -33,13 +34,14 @@ UP, DOWN, OFF = "up", "down", "off"
 @dataclass
 class Item:
     source: str
-    current: str = ""  # 次の段に渡すファイル (生成の段を通るたびに、出来たファイルに変わる)
-    stage: int = 0  # 次にやる段の番号
+    current: str = ""  # 次のステップに渡すファイル (生成のステップを通るたびに、出来たファイルに変わる)
+    stage: int = 0  # 次にやるステップの番号
     state: str = WAITING
     text: Optional[str] = None  # 元のプロンプト (読み取った説明)。None = まだない
     enhanced: Optional[str] = None  # 盛ったプロンプト
     read_name: str = ""  # 今の text を読み取った読み取りプリセットの名前
-    outputs: list = field(default_factory=list)  # [{"stage": 段, "path": パス, "time": 時刻}]
+    # [{"stage": ステップ, "path": パス, "time": 時刻, "from": 元のファイル, "prompt": 読み取った文, "enhanced": 盛った文}]
+    outputs: list = field(default_factory=list)
     error: str = ""
     error_stage: int = -1
     machine: str = ""  # 頼み済みの台の URL (prompt_id とセット)
@@ -99,9 +101,23 @@ class Machine:
 
 
 def stage_snapshot(stage: recipes.Stage) -> dict:
-    """始めたときの段の写し (途中で設定を変えても、始めたときの中身で続ける)。
+    """始めたときのステップの写し (途中で設定を変えても、始めたときの中身で続ける)。
     名前で覚えている読み取りプリセット・エンハンサーは、ここで中身を写す。見つからなければ ValueError。"""
     snap = {"type": stage.type}
+    if stage.bypass:
+        # バイパス: 中身は使わないので確かめない (見せるための名前だけ写す)
+        snap["bypass"] = True
+        if stage.type == recipes.READ:
+            snap["reader"] = {"name": stage.reader}
+        elif stage.type == recipes.ENHANCE:
+            snap["enhancer"] = {"name": stage.enhancer}
+        else:
+            snap["workflow"] = stage.workflow
+            names = [w.name for w in comfy.workflows() if stage.workflow and w.value.lower() == stage.workflow.lower()]
+            snap["workflow_name"] = (names[0] if names and names[0] else Path(stage.workflow).stem)                 if stage.workflow else ""
+            snap["kind"] = kinds.kind_of(stage.workflow)
+            snap["seconds"] = None
+        return snap
     if stage.type == recipes.READ:
         found = [p for p in reader.load_presets() if not p.is_empty and p.name == stage.reader]
         if not found:
@@ -115,7 +131,7 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         snap["enhancer"] = enhancer.snapshot(found[0])
     else:
         if not stage.workflow:
-            raise ValueError("生成の段にワークフローが選ばれていません。")
+            raise ValueError("生成のステップにワークフローが選ばれていません。")
         wf = comfy.load_workflow(stage.workflow)  # 読めなければ ComfyError
         kind = kinds.kind_of(stage.workflow)
         names = [p.name for p in comfy.workflows() if p.value.lower() == stage.workflow.lower() and p.name]
@@ -127,11 +143,20 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
     return snap
 
 
+def next_stage(stages: list, index: int) -> int:
+    """index のあとで、バイパスしていない最初のステップの番号 (なければ len(stages))。"""
+    i = index + 1
+    while i < len(stages) and stages[i].get("bypass"):
+        i += 1
+    return i
+
+
 class Run:
-    """1 回の量産 (始めたときのレシピの写し・段の写し・件)。"""
+    """1 回の量産 (始めたときのレシピの写し・ステップの写し・件)。"""
 
     def __init__(self, recipe: dict, stages: list, output_dir: str, items: list, started: float = 0.0,
-                 paused: bool = False):
+                 paused: bool = False, trial: bool = False):
+        self.trial = trial  # 試作 (1 枚で試す)。出力は (出力フォルダ)\試作
         self.recipe = recipe
         self.stages = stages
         self.output_dir = output_dir
@@ -140,19 +165,25 @@ class Run:
         self.paused = paused
 
     @staticmethod
-    def create(recipe: recipes.Recipe, sources: list[Path]) -> "Run":
+    def create(recipe: recipes.Recipe, sources: list[Path], trial: bool = False) -> "Run":
         stages = [stage_snapshot(s) for s in recipe.stages]
         if not stages:
-            raise ValueError("段が 1 つもありません。")
+            raise ValueError("ステップが 1 つもありません。")
+        first = next_stage(stages, -1)
+        if first >= len(stages):
+            raise ValueError("バイパスしていないステップが 1 つもありません。")
         out = recipe.resolved_output_dir()
         if not out:
             raise ValueError("出力フォルダが決まっていません。")
-        items = [Item(str(p), current=str(p)) for p in sources]
-        return Run(recipe.to_dict(), stages, out, items)
+        items = [Item(str(p), current=str(p), stage=first) for p in sources]
+        if trial:
+            out = str(Path(out) / TRIAL_DIR)
+        return Run(recipe.to_dict(), stages, out, items, trial=trial)
 
     def to_dict(self) -> dict:
         return {"recipe": self.recipe, "stages": self.stages, "output_dir": self.output_dir,
-                "started": self.started, "paused": self.paused, "items": [i.to_dict() for i in self.items]}
+                "started": self.started, "paused": self.paused, "trial": self.trial,
+                "items": [i.to_dict() for i in self.items]}
 
     @staticmethod
     def from_dict(data) -> Optional["Run"]:
@@ -164,7 +195,7 @@ class Run:
         except (TypeError, ValueError):
             started = 0.0
         return Run(data.get("recipe") or {}, data["stages"], str(data.get("output_dir") or ""), items,
-                   started, bool(data.get("paused")))
+                   started, bool(data.get("paused")), bool(data.get("trial")))
 
     @property
     def unfinished(self) -> int:
@@ -293,7 +324,7 @@ class Engine(QObject):
         self.changed.emit()
 
     def retry_failed(self) -> int:
-        """失敗したものを、失敗した段からやり直す。戻り値は件数。"""
+        """失敗したものを、失敗したステップからやり直す。戻り値は件数。"""
         with self._cond:
             if self.run is None:
                 return 0
@@ -453,7 +484,7 @@ class Engine(QObject):
         self.changed.emit()
 
     # ------------------------------------------------------------------
-    # 段
+    # ステップ
     # ------------------------------------------------------------------
     def _set_status(self, it: Item, text: str) -> None:
         it.status = text
@@ -481,7 +512,7 @@ class Engine(QObject):
                     it.read_name = str(stage["reader"].get("name", ""))
             else:
                 if it.text is None or not it.text.strip():
-                    raise llm.LLMError("盛る元のプロンプトがありません。前に読み取りの段を置いてください。")
+                    raise llm.LLMError("盛る元のプロンプトがありません。前に読み取りのステップを置いてください。")
                 self._set_status(it, "AI で盛っています...")
                 self.llm_status = f"盛る: {Path(it.current).name}"
                 source = it.text
@@ -512,7 +543,7 @@ class Engine(QObject):
         )
         if it.enhanced is not None:
             names = [s.get("enhancer", {}).get("name", "") for s in run.stages[:it.stage]
-                     if s["type"] == recipes.ENHANCE]
+                     if s["type"] == recipes.ENHANCE and not s.get("bypass")]
             req.enhancer = {"name": names[-1] if names else ""}
         resume_id = it.prompt_id if it.machine.lower() == m.url.lower() else ""
 
@@ -569,7 +600,9 @@ class Engine(QObject):
         with self._cond:
             now = time.time()
             for out in outputs:
-                it.outputs.append({"stage": it.stage, "path": out, "time": now})
+                # 使ったプロンプトも残す (このあと空に戻すので、結果の欄で見られるように)
+                it.outputs.append({"stage": it.stage, "path": out, "time": now, "from": it.current,
+                                   "prompt": it.text or "", "enhanced": it.enhanced or ""})
             it.current = outputs[0]
             it.text, it.enhanced, it.read_name = None, None, ""  # 新しいファイルには新しい説明が要る
             it.prompt_id, it.machine = "", ""
@@ -579,7 +612,7 @@ class Engine(QObject):
 
     def _advance(self, it: Item) -> None:
         with self._cond:
-            it.stage += 1
+            it.stage = next_stage(self.run.stages, it.stage)  # バイパスは飛ばす
             it.status, it.at = "", ""
             it.state = DONE if it.stage >= len(self.run.stages) else WAITING
             self._cancels.pop(id(it), None)

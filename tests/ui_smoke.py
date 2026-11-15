@@ -79,6 +79,82 @@ def pump(seconds: float):
 
 pump(1.5)
 window.grab().save(str(OUT / "prismlab_idle.png"))
+
+# 入口の★: J-Rate で★を付けて戻ったときの読み直し (★の読み取りは差し替える)
+from prismlab import rating
+fake_stars = {}
+real_get_stars = rating.get_stars
+rating.get_stars = lambda p: fake_stars.get(Path(p).name, 0)
+window.line.rescan()
+pump(1)
+assert window.line.breakdown.text() == "なし 8", window.line.breakdown.text()
+assert window.line.rate_button.isVisible()
+fake_stars.update({"girl_001.png": 5, "girl_002.png": 4, "girl_003.png": 4})
+window.line.rescan()
+pump(1)
+bd = window.line.breakdown.text()
+assert "★5</span> 1" in bd and "★4</span> 2" in bd and bd.endswith("なし 5"), bd
+window.line.star_box.setCurrentIndex(4)
+pump(0.5)
+assert window.line.entry.count.text().startswith("対象 3 枚"), window.line.entry.count.text()
+window.grab().save(str(OUT / "prismlab_stars.png"))
+window.line.star_box.setCurrentIndex(0)
+rating.get_stars = real_get_stars
+window.line.rescan()
+pump(1)
+# ステップの挿入・種類の変更 (設定の窓は OK を押したことにする)
+from prismlab import line_view
+from prismlab.widgets import InsertArrow
+real_dialog = line_view.StageDialog
+line_view.StageDialog = type("OkDialog", (), {"__init__": lambda self, *a: None, "exec": lambda self: 1})
+lv = window.line
+saved = [st.to_dict() for st in lv.recipe.stages]
+assert len(lv.flow_host.findChildren(InsertArrow)) == len(saved) + 1
+lv._add_stage(recipes.ENHANCE, 1)
+assert [st.type for st in lv.recipe.stages] == ["read", "enhance", "enhance", "gen"], [st.type for st in lv.recipe.stages]
+lv._change_stage_type(1, recipes.READ)
+assert [st.type for st in lv.recipe.stages] == ["read", "read", "enhance", "gen"]
+pump(0.5)
+assert len(lv.stage_cards) == 4 and lv.stage_cards[1].title.text() == "読み取り"
+# バイパス: 盛るは入れられる。読み取り (盛るの元) とただ 1 つの生成は入れられない (スイッチを出さない)
+lv.recipe.stages = [recipes.Stage.from_dict(d) for d in saved]
+lv.refresh(rebuild=True)
+pump(0.3)
+assert [c.bypass.isVisibleTo(c) for c in lv.stage_cards] == [False, True, False],     [c.bypass.isVisibleTo(c) for c in lv.stage_cards]
+lv.stage_cards[1].bypass.click()
+pump(0.5)
+assert lv.recipe.stages[1].bypass and lv.stage_cards[1]._bypassed
+assert lv.stage_cards[1].count.text() == "バイパス中"
+window.grab().save(str(OUT / "prismlab_bypass.png"))
+lv.stage_cards[1].bypass.click()
+pump(0.5)
+assert not lv.recipe.stages[1].bypass
+lv.recipe.stages = [recipes.Stage.from_dict(d) for d in saved]
+lv._save_recipes()
+lv.refresh(rebuild=True)
+line_view.StageDialog = real_dialog
+pump(0.5)
+
+# 1 枚で試す: 入口の 2 枚目をクリックで選んで、試作する
+lv.refresh()
+pump(1)
+lv.entry.thumbs.clicked.emit(1)
+pump(0.3)
+assert "girl_002.png" in lv.entry.count.text(), lv.entry.count.text()
+lv.trial_button.click()
+end = time.time() + 60
+while time.time() < end and window.engine.active and window.engine.run.unfinished:
+    pump(0.3)
+pump(1)
+trial_run = window.engine.run
+assert trial_run.trial and len(trial_run.items) == 1 and trial_run.items[0].state == engine.DONE
+assert Path(trial_run.items[0].outputs[-1]["path"]).parent.name == "試作"
+assert "girl_002.png" in lv.prompt_view.toPlainText() and "盛った文" in lv.prompt_view.toPlainText(),     lv.prompt_view.toPlainText()
+window.grab().save(str(OUT / "prismlab_trial.png"))
+lv.results.setCurrentRow(0)
+pump(0.3)
+assert "読み取った文" in lv.prompt_view.toPlainText()
+
 window.line._start()
 pump(7)
 window.grab().save(str(OUT / "prismlab_running.png"))

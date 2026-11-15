@@ -126,7 +126,7 @@ check(eng3.machines[0].state == engine.DOWN, "3: 繋がらない台は「繋が�
 names = sorted(Path(i.outputs[-1]["path"]).name for i in eng3.run.items)
 check(names == [f"img{n}_cn.png" for n in range(1, 5)], f"3: I2I CN の印は _cn ({names[0]})")
 
-# 4. つないだ段: I2I CN → 読み取り → I2V
+# 4. つないだステップ: I2I CN → 読み取り → I2V
 src4 = make_images(TMP / "in4", 2)
 r4 = recipe("クローン → 動画", TMP / "in4", [recipes.Stage(recipes.GEN, workflow=str(WF / "cn.json")),
                                          recipes.Stage(recipes.READ, reader=READER),
@@ -134,8 +134,8 @@ r4 = recipe("クローン → 動画", TMP / "in4", [recipes.Stage(recipes.GEN, 
 eng.start(engine.Run.create(r4, src4))
 wait(eng)
 last = sorted(Path(i.outputs[-1]["path"]).name for i in eng.run.items)
-check(last == ["img1_cn_video.mp4", "img2_cn_video.mp4"], f"4: つないだ段の名前 ({last})")
-check(all(len(i.outputs) == 2 for i in eng.run.items), "4: 段ごとの出力を残した")
+check(last == ["img1_cn_video.mp4", "img2_cn_video.mp4"], f"4: つないだステップの名前 ({last})")
+check(all(len(i.outputs) == 2 for i in eng.run.items), "4: ステップごとの出力を残した")
 
 # 5. 失敗とやり直し
 a.fail = True
@@ -211,6 +211,53 @@ check([p.name for p in recipes.list_images(str(TMP / "in1"))][:3] == ["img1.png"
       "9: 入口は画像だけを名前順で")
 from prismlab import rating  # noqa: E402
 check([rating.stars(v) for v in (0, 1, 25, 50, 75, 99)] == [0, 1, 2, 3, 4, 5], "9: ★の区切り (J-Rate と同じ)")
+
+# 10. バイパス
+S = recipes.Stage
+cn, rd, en, i2v = (S(recipes.GEN, workflow=str(WF / "cn.json")), S(recipes.READ, reader=READER),
+                   S(recipes.ENHANCE, enhancer=ENHANCER), S(recipes.GEN, workflow=str(WF / "i2v.json")))
+line = [cn, rd, en, i2v]
+check([recipes.can_bypass(line, i) for i in range(4)] == [True, False, True, True],
+      "10: 入れられるステップ (読み取りは、あとの盛るが困るので不可)")
+line10 = [S(recipes.READ, reader=READER), S(recipes.GEN, workflow=str(WF / "i2v.json"))]
+check(not recipes.can_bypass(line10, 1) and "生成" in recipes.bypass_reason(line10, 1),
+      "10: ただ 1 つの生成はバイパスにできない")
+en.bypass = True
+check(recipes.can_bypass(line, 1), "10: 盛るをバイパスにすれば、読み取りもバイパスにできる")
+src10 = make_images(TMP / "in10", 2)
+cn10 = S(recipes.GEN, workflow=str(WF / "cn.json"), bypass=True)
+en10 = S(recipes.ENHANCE, enhancer="(消えたエンハンサー)", bypass=True)  # バイパスなら中身は確かめない
+r10 = recipe("10", TMP / "in10", [cn10, S(recipes.READ, reader=READER), en10,
+                                   S(recipes.GEN, workflow=str(WF / "i2v.json"))])
+run10 = engine.Run.create(r10, src10)
+check(all(i.stage == 1 for i in run10.items), "10: 先頭のバイパスは飛ばして始める")
+eng.start(run10)
+wait(eng)
+names10 = sorted(Path(i.outputs[-1]["path"]).name for i in eng.run.items)
+check(all(i.state == engine.DONE for i in eng.run.items) and names10 == ["img1_video.mp4", "img2_video.mp4"],
+      f"10: バイパスした生成・盛るを飛ばして完了 ({names10})")
+check(all(i.enhanced is None and len(i.outputs) == 1 for i in eng.run.items), "10: 飛ばしたステップは何も作らない")
+try:
+    engine.Run.create(recipe("10b", TMP / "in10", [cn10]), src10)
+    check(False, "10: すべてバイパスなら始めない")
+except ValueError:
+    check(True, "10: すべてバイパスなら始めない")
+
+# 11. 1 枚で試す (試作)
+src11 = make_images(TMP / "in11", 3)
+r11 = recipe("11", TMP / "in11", [S(recipes.READ, reader=READER), S(recipes.ENHANCE, enhancer=ENHANCER),
+                                   S(recipes.GEN, workflow=str(WF / "i2v.json"))])
+run11 = engine.Run.create(r11, [src11[1]], trial=True)
+check(run11.trial and Path(run11.output_dir) == TMP / "in11" / "11" / engine.TRIAL_DIR, "11: 試作の出力は 試作 のフォルダ")
+eng.start(run11)
+wait(eng)
+it11 = eng.run.items[0]
+o11 = it11.outputs[-1] if it11.outputs else {}
+check(it11.state == engine.DONE and Path(o11.get("path", "")).parent == TMP / "in11" / "11" / engine.TRIAL_DIR,
+      "11: 1 枚だけ通して、試作のフォルダに出来た")
+check(bool(o11.get("prompt")) and bool(o11.get("enhanced")) and Path(o11.get("from", "")).name == "img2.png",
+      "11: 出来たものに、元・読み取った文・盛った文を残した")
+check(engine.Run.from_dict(run11.to_dict()).trial, "11: 試作の印を保存する")
 
 for s in (a, b, slow):
     s.close()

@@ -1,7 +1,7 @@
 """PrismLab の、共通部品 (gencommon) に渡すアプリごとの決まり。
 
 出来たファイルは「出力フォルダ\\(元の名前)_(印).(拡張子)」に保存する。印は動画なら video、
-画像はワークフローの種類で t2i / i2i / cn。つないだ段では続けて付く (photo_cn_video.mp4)。
+画像はワークフローの種類で t2i / i2i / cn。つないだステップでは続けて付く (photo_cn_video.mp4)。
 """
 
 from pathlib import Path
@@ -31,11 +31,11 @@ PROFILE = app.Profile(
     source_word="元画像",
     unit="枚",
     prompt_word="説明プロンプト",
-    prompt_where="段",
+    prompt_where="ステップ",
     column="元画像",
     output_path=_output_path,
     workflow_hint=(
-        "段で読み取った説明 (盛ったときは盛ったもの) がワークフローのプロンプトに入ります "
+        "ステップで読み取った説明 (盛ったときは盛ったもの) がワークフローのプロンプトに入ります "
         f"(文字欄に「{comfy.PROMPT_MARKER}」があればそこ。なければ prompt 入力、CLIPTextEncode の順)。"
         "「Load Image」ノードがあれば元画像も送ります。seed は毎回ランダムになります。"
     ),

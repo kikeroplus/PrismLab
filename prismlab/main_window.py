@@ -1,5 +1,8 @@
 """PrismLab のウィンドウ: 「量産ライン」と「物語」のタブ、ステータスバー、閉じるときの確認、続きから始める。"""
 
+import time
+
+from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox, QPushButton, QTabWidget, QToolBar, QVBoxLayout, QWidget
 
 from gencommon import enhancer, reader
@@ -7,6 +10,8 @@ from gencommon.comfy_dialogs import ComfySettingsDialog
 
 from . import engine, recipes, settings, theme
 from .line_view import LineView
+
+AWAY_SECONDS = 1.0  # これより長くほかのウィンドウにいたら、戻ったときに入口の★を読み直す
 
 
 class StoryPlaceholder(QWidget):
@@ -57,6 +62,18 @@ class MainWindow(QMainWindow):
         self.line.status.connect(self.show_status)
         self.statusBar().showMessage(notice or "準備ができました。", 8000)
         settings.restore_geometry(self)
+
+    def changeEvent(self, event) -> None:
+        # J-Rate などで★を付けて戻ってきたら、入口の★を読み直す (ダイアログを閉じただけのときは読まない)
+        if event.type() == QEvent.Type.ActivationChange:
+            if self.isActiveWindow():
+                away = getattr(self, "_left_at", None)
+                if away is not None and time.monotonic() - away >= AWAY_SECONDS:
+                    self.line.rescan()
+                self._left_at = None
+            elif not any(w.isVisible() for w in self.findChildren(QMessageBox)):
+                self._left_at = time.monotonic()
+        super().changeEvent(event)
 
     def show_status(self, text: str) -> None:
         self.statusBar().showMessage(text, 15000)

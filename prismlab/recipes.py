@@ -1,4 +1,4 @@
-"""量産ラインのレシピ (入口 + 左から右へ並べた段)。%APPDATA%\\PrismLab\\recipes.json に置く。
+"""量産ラインのレシピ (入口 + 左から右へ並べたステップ)。%APPDATA%\\PrismLab\\recipes.json に置く。
 
 中身は値で覚える (ワークフローはパス)。読み取りプリセットとエンハンサーは名前で覚える (generation-standard 2 章)。
 """
@@ -30,6 +30,7 @@ class Stage:
     workflow: str = ""  # ワークフローの JSON のパス
     seconds: Optional[float] = None  # 長さ (None = ワークフローのまま)
     base_prompt: bool = True  # ベースプロンプトを付ける
+    bypass: bool = False  # バイパス (このステップを飛ばして、前のものをそのまま次に渡す)
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -48,6 +49,7 @@ class Stage:
         sec = data.get("seconds")
         s.seconds = float(sec) if isinstance(sec, (int, float)) and not isinstance(sec, bool) and sec > 0 else None
         s.base_prompt = bool(data.get("base_prompt", True))
+        s.bypass = bool(data.get("bypass", False))
         return s
 
 
@@ -88,6 +90,41 @@ class Recipe:
         if not self.folder:
             return ""
         return str(Path(self.folder) / safe_name(self.name or "PrismLab"))
+
+
+def line_problems(stages: list, skip: int = -1) -> set:
+    """ラインが成り立たないところ (skip 番目もバイパスしたとして数える)。
+    "nogen" = 生成のステップが 1 つも動かない。("enhance", i) = i 番目の盛るの前に、読み取りがない
+    (生成を通るとプロンプトは空に戻るので、直前の生成よりあとに読み取りが要る)。"""
+    problems = set()
+    has_gen = has_text = False
+    for i, s in enumerate(stages):
+        if s.bypass or i == skip:
+            continue
+        if s.type == GEN:
+            has_gen, has_text = True, False
+        elif s.type == READ:
+            has_text = True
+        elif not has_text:
+            problems.add(("enhance", i))
+    if not has_gen:
+        problems.add("nogen")
+    return problems
+
+
+def can_bypass(stages: list, index: int) -> bool:
+    """index 番目をバイパスにできるか (バイパスにしても、ラインに新しい問題が出ない)。"""
+    return not stages[index].bypass and line_problems(stages, index) <= line_problems(stages)
+
+
+def bypass_reason(stages: list, index: int) -> str:
+    """バイパスにできない理由 (できるなら "")。"""
+    if can_bypass(stages, index) or stages[index].bypass:
+        return ""
+    new = line_problems(stages, index) - line_problems(stages)
+    if "nogen" in new:
+        return "生成のステップがなくなるので、バイパスにできません。"
+    return "あとの「盛る」の元になる読み取りがなくなるので、バイパスにできません。"
 
 
 def safe_name(name: str) -> str:
