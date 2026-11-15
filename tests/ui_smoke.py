@@ -36,6 +36,11 @@ profile.setup()
 assert str(store.APP_DIR).startswith(str(TMP))
 
 a, b, llm = FakeComfy(polls=4), FakeComfy(polls=6), FakeLLM()
+# 動画は本物の短い mp4 (赤 → 最後のコマだけ青): ステップのサムネールに最後のコマを重ねるのを確かめる
+from fakes import make_video  # noqa: E402
+clip = TMP / "clip.mp4"
+make_video(clip, [(200, 40, 40)] * 7 + [(40, 60, 220)], size=(160, 160))
+a.video_bytes = b.video_bytes = clip.read_bytes()
 settings.set_llm_url(llm.url)
 comfy.set_connections([comfy.Preset("メイン", a.url), comfy.Preset("サブ", b.url)]
                       + [comfy.Preset() for _ in range(comfy.PRESET_COUNT - 2)])
@@ -176,6 +181,22 @@ end = time.time() + 90
 while time.time() < end and window.engine.active:
     pump(0.3)
 pump(1.5)
+# 生成のステップのサムネール: いつもの絵の右下に、最後のコマ (青) を小さく重ねる
+gen_card = lv.stage_cards[-1]
+end = time.time() + 10
+while time.time() < end:
+    pm = gen_card.thumbs.labels[0].pixmap()
+    if pm is not None and not pm.isNull():
+        corner = pm.toImage().pixelColor(pm.width() - 8, pm.height() - 8)
+        if corner.blue() > 150 and corner.red() < 120:
+            break
+    pump(0.3)
+pm = gen_card.thumbs.labels[0].pixmap()
+assert pm is not None and not pm.isNull(), "生成のステップにサムネールがない"
+corner = pm.toImage().pixelColor(pm.width() - 8, pm.height() - 8)
+middle = pm.toImage().pixelColor(pm.width() // 4, pm.height() // 4)
+assert corner.blue() > 150 and corner.red() < 120, ("右下に最後のコマ (青)", corner.getRgb())
+assert middle.red() > 150 and middle.blue() < 120, ("いつもの絵 (赤) はそのまま", middle.getRgb())
 window.grab().save(str(OUT / "prismlab_done.png"))
 run = window.engine.run
 print("完了:", sum(1 for i in run.items if i.state == engine.DONE), "/", len(run.items),

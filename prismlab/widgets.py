@@ -3,7 +3,7 @@
 from typing import Optional
 
 from PySide6.QtCore import QEvent, QSize, Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QProgressBar, QSizePolicy, QToolButton,
                                QVBoxLayout, QWidget)
 
@@ -61,10 +61,16 @@ class Thumbs(QWidget):
             return True  # 囲みのクリック (フォルダを選ぶ) にはしない
         return super().eventFilter(obj, event)
 
-    def set(self, pixmaps: list, failed: Optional[list] = None, selected: int = -1) -> None:
+    def set(self, pixmaps: list, failed: Optional[list] = None, selected: int = -1,
+            insets: Optional[list] = None) -> None:
+        """insets: 右下に小さく重ねる絵 (動画の最後のコマ)。None の所は重ねない。"""
         failed = failed or []
+        insets = insets or []
         for i, label in enumerate(self.labels):
             pix = pixmaps[i] if i < len(pixmaps) else None
+            inset = insets[i] if i < len(insets) else None
+            if pix is not None and not pix.isNull() and inset is not None and not inset.isNull():
+                pix = with_inset(pix, inset, THUMB)
             if self.clickable:
                 label.setCursor(Qt.CursorShape.PointingHandCursor if pix is not None else Qt.CursorShape.ArrowCursor)
             border = f"border: 2px solid {FAIL_COLOR};" if i < len(failed) and failed[i] else ""
@@ -300,3 +306,26 @@ class AddButton(QToolButton):
 
 def blank_pixmap() -> QPixmap:
     return QPixmap()
+
+
+INSET_RATIO = 0.45  # 重ねる小さな絵の大きさ (枠に対して)
+
+
+def with_inset(main: QPixmap, inset: QPixmap, size: QSize) -> QPixmap:
+    """main を size に収めて真ん中に置き、右下に inset (最後のコマ) を小さく重ねた絵。
+    小さな絵には黒い縁と白い細線を付けて、元の絵と見分けやすくする。"""
+    out = QPixmap(size)
+    out.fill(QColor("#161616"))
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    big = main.scaled(size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    painter.drawPixmap((size.width() - big.width()) // 2, (size.height() - big.height()) // 2, big)
+    box = QSize(max(8, int(size.width() * INSET_RATIO)), max(8, int(size.height() * INSET_RATIO)))
+    small = inset.scaled(box, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    x, y = size.width() - small.width() - 2, size.height() - small.height() - 2
+    painter.fillRect(x - 2, y - 2, small.width() + 4, small.height() + 4, QColor("#000000"))
+    painter.drawPixmap(x, y, small)
+    painter.setPen(QColor("#e0e0e0"))
+    painter.drawRect(x - 1, y - 1, small.width() + 1, small.height() + 1)
+    painter.end()
+    return out

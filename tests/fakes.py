@@ -124,6 +124,8 @@ class FakeLLM:
                     text = f"a photo {len(owner.calls)}"
                 elif "英語に翻訳" in system:
                     text = user.strip() + " in English"
+                elif "日本語に翻訳" in system:
+                    text = "訳: " + user.strip()
                 else:
                     text = user.strip().splitlines()[-1] + " enhanced"
                 owner.calls.append(body)

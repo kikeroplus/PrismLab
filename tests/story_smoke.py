@@ -174,6 +174,49 @@ pump(0.2)
 assert sv.prompt.toPlainText() == before, "Ctrl+Z で足す前の文に"
 sv.to_english.setChecked(False)
 assert not translate.remembered()
+
+# H3 タグの色分け: <d>…</d> は青い文字、[Japanese] のあと (セリフ) は背景に色
+from prismlab import highlight  # noqa: E402
+H3 = "she smiles <d>[Japanese]またね</d> and leaves"
+sv.prompt.setPlainText(H3)
+pump(0.2)
+fmts = sv.prompt.document().firstBlock().layout().formats()
+
+
+def fmt_at(pos):
+    return [f.format for f in fmts if f.start <= pos < f.start + f.length]
+
+
+tag_pos, speech_pos = H3.index("<d>"), H3.index("またね")
+assert any(f.foreground().color() == highlight.TAG_TEXT_COLOR for f in fmt_at(tag_pos)), "<d> は青い文字"
+assert any(f.background().color() == highlight.SPEECH_BACKGROUND for f in fmt_at(speech_pos)), "セリフに背景の色"
+assert not fmt_at(H3.index("leaves")), "タグの外は色を付けない"
+
+# 訳を見る: 送るプロンプトの日本語訳を下に出す (見るだけ)。チェックは覚えておく
+assert not sv.view_translation.isChecked() and not sv.translation.isVisible()
+sv.view_translation.setChecked(True)
+assert translate.remembered(translate.VIEW_FILE) and sv.translation.isVisible()
+end = time.time() + 10
+while time.time() < end and sv.translation.toPlainText() != "訳: " + H3:
+    pump(0.1)
+assert sv.translation.toPlainText() == "訳: " + H3, sv.translation.toPlainText()
+assert "日本語に翻訳" in llm.calls[-1]["messages"][0]["content"]
+assert sv.prompt.toPlainText() == H3, "送る文は変わらない"
+calls = len(llm.calls)
+sv.prompt.setPlainText("rain on the platform")
+pump(0.3)
+assert sv.translation_state.text() == "直し終わったら訳します…" and len(llm.calls) == calls, "直しているあいだは訳さない"
+end = time.time() + 10
+while time.time() < end and sv.translation.toPlainText() != "訳: rain on the platform":
+    pump(0.1)
+assert sv.translation.toPlainText() == "訳: rain on the platform"
+calls = len(llm.calls)
+sv.prompt.setPlainText(H3)
+pump(0.2)
+assert sv.translation.toPlainText() == "訳: " + H3 and len(llm.calls) == calls, "訳したことのある文はすぐ出す"
+window.grab().save(str(OUT / "story_translation.png"))
+sv.view_translation.setChecked(False)
+assert not translate.remembered(translate.VIEW_FILE) and not sv.translation.isVisible()
 sv.count_box.setValue(2)
 sv.make_b.click()
 pump(1)
@@ -182,6 +225,27 @@ wait_engine()
 assert len(s1.candidates) == 2, s1.candidates
 assert all(Path(c.path).parent == sv.story.scene_dir(s1) for c in s1.candidates)
 assert sv.cands.count() == 2
+
+# 候補を選ぶと、元画像 (緑) | 候補 (始め) | 候補の最後のコマ (青) を並べる
+sv.cands.setCurrentRow(0)
+end = time.time() + 10
+while time.time() < end and any(lb.pixmap() is None or lb.pixmap().isNull()
+                                for lb in (sv.preview_src, sv.preview, sv.preview_last)):
+    pump(0.1)
+
+
+def center(label):
+    pm = label.pixmap()
+    assert pm is not None and not pm.isNull(), (label.text(), "絵が出ていない")
+    return pm.toImage().pixelColor(pm.width() // 2, pm.height() // 2)
+
+
+cs, cl = center(sv.preview_src), center(sv.preview_last)
+center(sv.preview)
+assert cs.green() > 120 and cs.red() < 120, ("元画像 (緑)", cs.getRgb())
+assert cl.blue() > 150 and cl.red() < 120, ("候補の最後のコマ (青)", cl.getRgb())
+assert sv.preview_last.isVisible() and sv.preview_caps[1].text() == "候補 (始め)"
+window.grab().save(str(OUT / "story_compare.png"))
 
 # 採用して次へ: 「続き」でシーン 2 が出来て、元画像は最後のコマ (青)
 sv.cands.setCurrentRow(0)

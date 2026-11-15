@@ -137,17 +137,62 @@ def make_thumbnail(path: Path, size: int) -> Optional[QImage]:
     return image
 
 
+def make_last_frame(path: Path, size: int) -> Optional[QImage]:
+    """動画の最後のコマの、size × size に収まるサムネール (OpenCV)。
+    数えたコマ数が当てにならない動画があるので、終わりの少し手前から終わりまで読み、最後に読めたものを使う
+    (手前へ飛べなければ初めから読む)。ファイルは読み終えたらすぐ閉じる (ごみ箱へ送れるように)。"""
+    try:
+        import cv2
+    except ImportError:
+        return None
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return None
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frame = None
+        if count > 8:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, count - 8)
+        while True:
+            ok, img = cap.read()
+            if not ok:
+                break
+            frame = img
+        if frame is None and count > 8:  # 手前へ飛べなかった: 初めから読む
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            while True:
+                ok, img = cap.read()
+                if not ok:
+                    break
+                frame = img
+    finally:
+        cap.release()
+    if frame is None:
+        return None
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w, _ = rgb.shape
+    image = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+    return image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+
+LAST_SUFFIX = "|last"  # 最後のコマのサムネールを覚えるときのキーの印
+
+
 class _Signals(QObject):
     loaded = Signal(str, QImage)
 
 
 class _Job(QRunnable):
-    def __init__(self, path: str, size: int, signals: _Signals):
+    def __init__(self, path: str, size: int, signals: _Signals, last: bool = False):
         super().__init__()
-        self.path, self.size, self.signals = path, size, signals
+        self.path, self.size, self.signals, self.last = path, size, signals, last
 
     def run(self):
         init_thread_com()
+        if self.last:
+            image = make_last_frame(Path(self.path), self.size)
+            self.signals.loaded.emit(self.path + LAST_SUFFIX, image if image is not None else QImage())
+            return
         image = make_thumbnail(Path(self.path), self.size)
         self.signals.loaded.emit(self.path, image if image is not None else QImage())
 
@@ -169,10 +214,11 @@ class ThumbCache(QObject):
         self._signals = _Signals()
         self._signals.loaded.connect(self._on_loaded)
 
-    def get(self, path: str, check: bool = False) -> Optional[QPixmap]:
+    def get(self, path: str, check: bool = False, last: bool = False) -> Optional[QPixmap]:
         """check=True: ファイルの更新時刻・大きさも見て、変わっていたら読み直す
-        (物語の source.png のように、同じパスに書き直すファイル用。手元のファイルだけに使う)。"""
-        key = path.lower()
+        (物語の source.png のように、同じパスに書き直すファイル用。手元のファイルだけに使う)。
+        last=True: 動画の最後のコマのサムネール (出来たら changed(パス + LAST_SUFFIX))。"""
+        key = path.lower() + (LAST_SUFFIX if last else "")
         if check:
             try:
                 st = os.stat(path)
@@ -188,15 +234,21 @@ class ThumbCache(QObject):
             return self._pixmaps[key]
         if key not in self._pending:
             self._pending.add(key)
-            self._pool.start(_Job(path, self.size, self._signals))
+            self._pool.start(_Job(path, self.size, self._signals, last))
         return None
 
+    def busy(self, paths) -> bool:
+        """そのファイルのサムネール (最後のコマも) をまだ作っているか (読んでいるあいだは消せない)。"""
+        keys = {str(p).lower() for p in paths}
+        keys |= {k + LAST_SUFFIX for k in keys}
+        return bool(keys & self._pending)
+
     def forget(self, path: str) -> None:
-        key = path.lower()
-        self._pixmaps.pop(key, None)
-        self._stamps.pop(key, None)
-        if key in self._pending:
-            self._stale.add(key)
+        for key in (path.lower(), path.lower() + LAST_SUFFIX):
+            self._pixmaps.pop(key, None)
+            self._stamps.pop(key, None)
+            if key in self._pending:
+                self._stale.add(key)
 
     def _on_loaded(self, path: str, image: QImage):
         key = path.lower()

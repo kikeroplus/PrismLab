@@ -23,7 +23,7 @@ from gencommon import comfy, inserts
 
 from . import engine, kinds, rating, recipes, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
-from .thumbs import ThumbCache
+from .thumbs import MOVIE_EXTS, ThumbCache
 from .widgets import AddButton, Card, InsertArrow, MachineCard, io_html
 
 CONFIRM_COUNT = 30  # これを超える件数で始めるときは確かめる (generation-standard 6 章)
@@ -1196,7 +1196,10 @@ class LineView(QWidget):
             if stage_type == recipes.GEN:
                 outs = sorted((o for it in items for o in it.outputs if o.get("stage") == i),
                               key=lambda o: float(o.get("time") or 0), reverse=True)[:3]
-                card.thumbs.set([self.thumbs.get(str(o["path"])) for o in outs])
+                # 動画は、いつものサムネール (始めのほう) の右下に最後のコマを小さく重ねる
+                card.thumbs.set([self.thumbs.get(str(o["path"])) for o in outs],
+                                insets=[self.thumbs.get(str(o["path"]), last=True)
+                                        if Path(str(o["path"])).suffix.lower() in MOVIE_EXTS else None for o in outs])
             elif here:
                 card.detail.setToolTip(here[0].status)
 

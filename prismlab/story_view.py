@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFrame, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem,
@@ -21,12 +21,14 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDia
 
 from gencommon import comfy, enhancer, inserts, reader, store
 
-from . import engine, kinds, recipes, recycle, story, theme, translate
+from . import engine, highlight, kinds, recipes, recycle, story, theme, translate
 from .dialogs import ask_text
 from .thumbs import ThumbCache
 from .widgets import AddButton
 
 ENGLISH = "英語に直し"  # LLM の仕事の名前 (「英語に直し中…」「英語に直しに失敗しました」)
+TRANSLATE_DELAY_MS = 900  # 送るプロンプトを直して、これだけ止まったら訳し直す
+MAX_TRANSLATIONS = 100  # 覚えておく訳の数
 CONT_COLOR = "#f0a04b"  # 続き (動画の色)
 CUT_COLOR = "#8c99ff"  # シーンチェンジ
 OK_COLOR = "#66bb6a"  # 採用
@@ -552,6 +554,7 @@ class HistoryDialog(QDialog):
 class StoryView(QWidget):
     status = Signal(str)
     _llm_done = Signal(str, str, str)  # (シーンの id, 文, 失敗の理由)
+    _translated = Signal(int, str, str, str)  # (頼んだ番号, 訳した文, 訳, 失敗の理由)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -569,6 +572,7 @@ class StoryView(QWidget):
         self._before: dict[str, str] = {}  # シーンの id → 読み取る・盛るを始めたときの文 (うまくいったら履歴に残す)
         self._llm_busy = ""
         self._llm_done.connect(self._on_llm_done)
+        self._translated.connect(self._on_translated)
         self._loading = False
         self._player = None
 
@@ -754,7 +758,39 @@ class StoryView(QWidget):
         self.prompt.setPlaceholderText("「読み取る」で元画像の説明を入れる・「↓ 元の文を足す」・直接書く。Ctrl+Z で戻せます。")
         self.prompt.textChanged.connect(self._prompt_changed)
         self.prompt.undoAvailable.connect(lambda _a: self._schedule())
-        box.addWidget(self.prompt, 1)
+        self.prompt.setMinimumHeight(60)
+        box.addWidget(self.prompt, 2)
+        # MiniMax H3 のタグ (<d>…</d>、[Japanese] のセリフ) を色分けする
+        self._highlighters = [highlight.TagHighlighter(self.original.document()),
+                              highlight.TagHighlighter(self.prompt.document())]
+        # 送るプロンプトの訳を見る (見るだけ。文が変わって少し止まったら LLM で日本語に訳す)
+        r0 = QHBoxLayout()
+        self.view_translation = QCheckBox("訳を見る")
+        self.view_translation.setToolTip("送るプロンプトの日本語訳を下に出します (見るだけで、送る文は変わりません)。\n"
+                                         "文を直して少し止まると訳し直します。接続先とモデルは「エンハンサーの設定」と同じ。")
+        self.view_translation.setChecked(translate.remembered(translate.VIEW_FILE))
+        self.view_translation.toggled.connect(self._translation_toggled)
+        self.translation_state = QLabel()
+        self.translation_state.setStyleSheet(f"color: {theme.TEXT_DIM}; background: transparent; font-size: 11px;")
+        r0.addWidget(self.view_translation)
+        r0.addWidget(self.translation_state, 1)
+        box.addLayout(r0)
+        self.translation = QPlainTextEdit()
+        self.translation.setReadOnly(True)
+        self.translation.setMinimumHeight(44)  # 送るプロンプトと高さを分け合う (2 : 1)
+        self.translation.setPlaceholderText("送るプロンプトの訳")
+        self.translation.setStyleSheet(f"QPlainTextEdit {{ background: #1b1b1b; color: {theme.TEXT_DIM}; }}")
+        self._highlighters.append(highlight.TagHighlighter(self.translation.document()))
+        self.translation.setVisible(self.view_translation.isChecked())
+        box.addWidget(self.translation, 1)
+        self._translate_timer = QTimer(self)
+        self._translate_timer.setSingleShot(True)
+        self._translate_timer.setInterval(TRANSLATE_DELAY_MS)
+        self._translate_timer.timeout.connect(self._translate_now)
+        self._translations: dict[str, str] = {}  # 訳した文 → 訳 (同じ文はもう一度訳さない)
+        self._translate_seq = 0  # 頼んだ順の番号 (古い返事は捨てる)
+        self._translating = ""  # いま訳している文
+        self.prompt.textChanged.connect(self._schedule_translation)
         r1 = QHBoxLayout()
         self.reader_box = QComboBox()
         self.read_b = QPushButton("読み取る")
@@ -834,11 +870,28 @@ class StoryView(QWidget):
         r3.addWidget(self.stop_b)
         r3.addWidget(self.gen_state, 1)
         box.addLayout(r3)
-        self.preview = QLabel()  # 選んだ候補 (動画はダブルクリックで再生)
-        self.preview.setFixedHeight(170)
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setStyleSheet(f"background: #111; color: {theme.TEXT_DIM}; border-radius: 4px;")
-        box.addWidget(self.preview)
+        # 選んだ候補を元画像と並べる: 元画像 | 候補 (始め) | 候補 (最後のコマ)。動画はダブルクリックで再生
+        compare = QHBoxLayout()
+        compare.setSpacing(6)
+        self.preview_src, self.preview, self.preview_last = QLabel(), QLabel(), QLabel()
+        self.preview_caps = []
+        for label, cap in ((self.preview_src, "元画像"), (self.preview, "候補"), (self.preview_last, "候補の最後のコマ")):
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            label.setFixedHeight(150)
+            label.setMinimumWidth(60)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setWordWrap(True)
+            label.setStyleSheet(f"background: #111; color: {theme.TEXT_DIM}; border-radius: 4px; font-size: 11px;")
+            caption = QLabel(cap)
+            caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            caption.setStyleSheet(f"color: {theme.TEXT_DIM}; background: transparent; font-size: 11px;")
+            col.addWidget(label)
+            col.addWidget(caption)
+            compare.addLayout(col, 1)
+            self.preview_caps.append(caption)
+        box.addLayout(compare)
         self.cands = QListWidget()
         self.cands.setViewMode(QListView.ViewMode.IconMode)
         self.cands.setIconSize(CAND_ICON)
@@ -1154,6 +1207,66 @@ class StoryView(QWidget):
         self.scene.record("元の文を足す前の文", self.prompt.toPlainText(), before=True)
         self._set_prompt(inserts.join(self.prompt.toPlainText(), self.scene.original))
 
+    # 訳を見る -------------------------------------------------------------
+    def _translation_toggled(self, on: bool) -> None:
+        translate.remember(on, translate.VIEW_FILE)
+        self.translation.setVisible(on)
+        if on:
+            self._translate_now()
+        else:
+            self._translate_timer.stop()
+            self.translation_state.setText("")
+
+    def _schedule_translation(self) -> None:
+        """送るプロンプトが変わった: 覚えている訳ならすぐ出し、なければ少し止まってから訳す。"""
+        if not self.view_translation.isChecked():
+            return
+        text = self.prompt.toPlainText().strip()
+        if not text or text in self._translations:
+            self._translate_timer.stop()
+            self._translate_now()
+            return
+        self.translation_state.setText("直し終わったら訳します…")
+        self._translate_timer.start()
+
+    def _translate_now(self) -> None:
+        text = self.prompt.toPlainText().strip()
+        self._translate_seq += 1
+        if not text:
+            self.translation.setPlainText("")
+            self.translation_state.setText("")
+            return
+        if text in self._translations:
+            self.translation.setPlainText(self._translations[text])
+            self.translation_state.setText("")
+            return
+        seq, snap = self._translate_seq, translate.snapshot()
+        self._translating = text
+        self.translation_state.setText("訳しています…")
+
+        def run():
+            try:
+                result, error = translate.to_japanese(snap, text), ""
+            except Exception as exc:  # noqa: BLE001 - LLM の失敗は理由を出す
+                result, error = "", str(exc)
+            self._translated.emit(seq, text, result, error)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_translated(self, seq: int, text: str, result: str, error: str) -> None:
+        if not error:
+            self._translations[text] = result
+            while len(self._translations) > MAX_TRANSLATIONS:
+                del self._translations[next(iter(self._translations))]
+        if seq != self._translate_seq:  # 古い頼み (文がもう変わった)。訳は覚えておく
+            return
+        self._translating = ""
+        if error:
+            self.translation_state.setText(f"訳せませんでした: {error}")
+            return
+        self.translation.setPlainText(result)
+        self.translation_state.setText("")
+
     def _prompt_changed(self) -> None:
         if self._loading or self.scene is None:
             return
@@ -1419,13 +1532,27 @@ class StoryView(QWidget):
     def _show_candidate(self) -> None:
         item = self.cands.currentItem()
         path = str(item.data(Qt.ItemDataRole.UserRole)) if item else ""
-        pix = self.thumbs.get(path) if path else None
-        if pix is not None and not pix.isNull():
-            self.preview.setPixmap(pix.scaled(self.preview.width(), self.preview.height(),
-                                              Qt.AspectRatioMode.KeepAspectRatio,
-                                              Qt.TransformationMode.SmoothTransformation))
-        else:
-            self.preview.setText("候補を選ぶと、ここに出します (動画はダブルクリックで再生)" if not path else "")
+        video = bool(path) and _is_video(path)
+        src = self.scene.source if self.scene is not None and self.scene.source else ""
+        has_src = bool(src) and Path(src).is_file()
+
+        def put(label: QLabel, pix, empty: str) -> None:
+            if pix is not None and not pix.isNull():
+                label.setPixmap(pix.scaled(label.width(), label.height(), Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
+            else:
+                label.setPixmap(QPixmap())
+                label.setText("表示できません" if pix is not None else empty)  # null = 読めなかった
+
+        put(self.preview_src, self.thumbs.get(src, check=True) if has_src else None,
+            "読み込み中…" if has_src else "元画像なし")
+        put(self.preview, self.thumbs.get(path) if path else None,
+            "読み込み中…" if path else "候補を選ぶと、元画像と並べて出します (動画はダブルクリックで再生)")
+        self.preview_last.setVisible(video)
+        self.preview_caps[2].setVisible(video)
+        if video:
+            put(self.preview_last, self.thumbs.get(path, last=True), "読み込み中…")
+        self.preview_caps[1].setText("候補 (始め)" if video else "候補")
         self.adopt_b.setEnabled(bool(path))
         self.adopt_only.setEnabled(bool(path))
         self.frame_next_b.setEnabled(bool(path) and _is_video(path) and Path(path).is_file())
@@ -1524,9 +1651,15 @@ class StoryView(QWidget):
             if QMessageBox.question(self, "候補を削除", text) != QMessageBox.StandardButton.Yes:
                 return
         first_row = min(self.cands.row(i) for i in items)
-        self.preview.clear()  # 表示中のものを手放してから消す
+        for label in (self.preview, self.preview_last):  # 表示中のものを手放してから消す
+            label.clear()
         self._deleting = True
         try:
+            # サムネール (最後のコマ) を読んでいる途中なら、読み終わるのを待つ (読んでいるあいだは消せない)
+            end = time.monotonic() + 3
+            while self.thumbs.busy(paths) and time.monotonic() < end:
+                QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 50)
+                time.sleep(0.02)
             error = recycle.send_to_recycle_bin(paths + self._captions(paths))
         finally:
             self._deleting = False
