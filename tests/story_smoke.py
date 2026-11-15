@@ -247,6 +247,22 @@ pump(0.3)
 cands2 = [Path(c.path) for c in s2.candidates]
 adopted2 = Path(s2.adopted)
 other = next(p for p in cands2 if p != adopted2)
+# 再生して閉じた候補も消せる (閉じたらプレーヤーが動画を手放す)
+real_exec = story_view.PlayDialog.exec
+
+
+def play_and_close(self):
+    self.show()
+    pump(1.0)
+    self.done(0)
+    return 0
+
+
+story_view.PlayDialog.exec = play_and_close
+sv._play_candidate(next(sv.cands.item(i) for i in range(sv.cands.count()) if Path(sv.cands.item(i).data(256)) == other))
+pump(0.3)
+assert not recycle.lockers([other]), ("再生を閉じたあとも開いたまま", recycle.lockers([other]))
+story_view.PlayDialog.exec = real_exec
 (other.with_suffix(".txt")).write_text("説明", encoding="utf-8")  # 説明の .txt も一緒に消える
 row = next(i for i in range(sv.cands.count()) if Path(sv.cands.item(i).data(256)) == other)
 sv.cands.setCurrentRow(row)

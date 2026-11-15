@@ -246,6 +246,8 @@ class PlayDialog(QDialog):
             deck.widget.videoSink().videoFrameChanged.connect(lambda frame, n=n: self._frame(n, frame))
         self.active = 0
         self._incoming: Optional[int] = None  # 動かし始めた次のプレーヤー (画面を切り替える前)
+        self._closed = False
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)  # 閉じたら窓ごと片付ける
         box.addWidget(self.stack, 1)
         row = QHBoxLayout()
         self.title = QLabel()
@@ -267,6 +269,8 @@ class PlayDialog(QDialog):
 
     def _load(self, deck: _Deck, index: int, play: bool) -> None:
         """deck にクリップを読み込む。play でなければ、始める位置で止めて待つ (次のクリップの用意)。"""
+        if self._closed:  # 閉じたあと (予約していた先読みなど) は開かない
+            return
         _title, path, cont = self.playlist[index]
         deck.index, deck.ready = index, False
         deck.frame_ms = _frame_ms(path)
@@ -305,7 +309,7 @@ class PlayDialog(QDialog):
 
     def _advance(self) -> None:
         """次のクリップのプレーヤーを動かし始める (画面はまだ前のクリップの最後のコマ)。"""
-        if self._incoming is not None or self.index + 1 >= len(self.playlist):
+        if self._closed or self._incoming is not None or self.index + 1 >= len(self.playlist):
             return
         self.index += 1
         n = 1 - self.active
@@ -360,8 +364,13 @@ class PlayDialog(QDialog):
             self._switch()
 
     def done(self, result: int) -> None:
+        # 動画を手放す (stop だけではファイルを開いたままで、候補をごみ箱へ送れない)
+        self._closed = True
+        self._incoming = None
         for deck in self.decks:
             deck.player.stop()
+            deck.player.setSource(QUrl())
+            deck.index = -1
         super().done(result)
 
 
