@@ -60,7 +60,10 @@ class Stage:
         return s
 
 
-FOLDER, SINGLE = "folder", "single"  # 入口: フォルダの画像 / 1 枚の画像を回数ぶん (LoadImage のように)
+# 入口: フォルダの画像 / 1 枚の画像 (LoadImage のように) / フォルダのテキスト (1 ファイル = 1 件の T2I)
+FOLDER, SINGLE, TEXTS = "folder", "single", "texts"
+SOURCES = (FOLDER, SINGLE, TEXTS)
+TEXT_EXT = ".txt"
 MAX_REPEAT = 999
 
 
@@ -73,16 +76,22 @@ class Recipe:
     stages: list = field(default_factory=list)
     source: str = FOLDER  # 入口の種類
     image: str = ""  # 1 枚のときの画像
-    repeat: int = 1  # 1 枚のときの回数 (同じ画像を何回通すか)
+    repeat: int = 1  # 回数 (同じ元を何回通すか。どの入口でも)
+    inherit: bool = True  # 元の★を、出来たファイルに引き継ぐ (generation-standard 6 章のオプション。既定はオン)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "folder": self.folder, "min_stars": self.min_stars,
                 "output_dir": self.output_dir, "source": self.source, "image": self.image, "repeat": self.repeat,
+                "inherit": self.inherit,
                 "stages": [s.to_dict() for s in self.stages]}
 
     @property
     def single(self) -> bool:
         return self.source == SINGLE
+
+    @property
+    def texts(self) -> bool:
+        return self.source == TEXTS
 
     @staticmethod
     def from_dict(data: dict) -> "Recipe":
@@ -96,7 +105,8 @@ class Recipe:
         except (TypeError, ValueError):
             r.min_stars = 0
         r.output_dir = str(data.get("output_dir") or "")
-        r.source = SINGLE if data.get("source") == SINGLE else FOLDER
+        r.source = data.get("source") if data.get("source") in SOURCES else FOLDER
+        r.inherit = bool(data.get("inherit", True))
         r.image = str(data.get("image") or "")
         try:
             r.repeat = max(1, min(MAX_REPEAT, int(data.get("repeat") or 1)))
@@ -118,18 +128,28 @@ class Recipe:
         return str(Path(base) / safe_name(self.name or "PrismLab"))
 
 
-def line_problems(stages: list, skip: int = -1) -> set:
+def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set:
     """ラインが成り立たないところ (skip 番目もバイパスしたとして数える)。
     "nogen" = 生成のステップが 1 つも動かない。("enhance", i) = i 番目の盛るの前に、盛る元の文がない
-    (読み取り・追加テキスト・差し込みのどれか。生成を通るとプロンプトは空に戻るので、直前の生成よりあとに要る)。"""
+    (読み取り・追加テキスト・差し込みのどれか。生成を通るとプロンプトは空に戻るので、直前の生成よりあとに要る)。
+    ("needimage", i) = テキストの入口で、まだ画像がないのに i 番目が画像を要る (読み取り・I2I・I2V)。"""
+    from . import kinds
     problems = set()
-    has_gen = has_text = False
+    has_gen = False
+    has_text = text_entry  # テキストの入口は、初めから文がある
+    has_image = not text_entry
     for i, s in enumerate(stages):
         if s.bypass or i == skip:
             continue
         if s.type == GEN:
-            has_gen, has_text = True, False
-        elif s.type == READ or s.type in ADD_TYPES:
+            if not has_image and kinds.kind_of(s.workflow).startswith("I"):
+                problems.add(("needimage", i))
+            has_gen, has_text, has_image = True, False, True
+        elif s.type == READ:
+            if not has_image:
+                problems.add(("needimage", i))
+            has_text = True
+        elif s.type in ADD_TYPES:
             has_text = True
         elif not has_text:
             problems.add(("enhance", i))
@@ -138,18 +158,21 @@ def line_problems(stages: list, skip: int = -1) -> set:
     return problems
 
 
-def can_bypass(stages: list, index: int) -> bool:
+def can_bypass(stages: list, index: int, text_entry: bool = False) -> bool:
     """index 番目をバイパスにできるか (バイパスにしても、ラインに新しい問題が出ない)。"""
-    return not stages[index].bypass and line_problems(stages, index) <= line_problems(stages)
+    return not stages[index].bypass and \
+        line_problems(stages, index, text_entry) <= line_problems(stages, text_entry=text_entry)
 
 
-def bypass_reason(stages: list, index: int) -> str:
+def bypass_reason(stages: list, index: int, text_entry: bool = False) -> str:
     """バイパスにできない理由 (できるなら "")。"""
-    if can_bypass(stages, index) or stages[index].bypass:
+    if can_bypass(stages, index, text_entry) or stages[index].bypass:
         return ""
-    new = line_problems(stages, index) - line_problems(stages)
+    new = line_problems(stages, index, text_entry) - line_problems(stages, text_entry=text_entry)
     if "nogen" in new:
         return "生成のステップがなくなるので、バイパスにできません。"
+    if any(isinstance(p, tuple) and p[0] == "needimage" for p in new):
+        return "あとのステップに要る画像がなくなるので、バイパスにできません。"
     return "あとの「盛る」の元になる文がなくなるので、バイパスにできません。"
 
 
@@ -213,6 +236,30 @@ def set_machines(urls: list[str]) -> None:
 
 def natural_key(text: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
+
+
+def entry_problem(stages: list, text_entry: bool) -> str:
+    """始める前に知らせる、ラインの問題 (なければ "")。"""
+    problems = line_problems(stages, text_entry=text_entry)
+    if any(isinstance(p, tuple) and p[0] == "needimage" for p in problems):
+        return ("テキストの入口には画像がないので、最初の生成は T2I か T2V にしてください "
+                "(読み取り・I2I・I2V は、画像が出来たあとに置けます)。")
+    return ""
+
+
+def list_texts(folder: str) -> list[Path]:
+    """フォルダの直下の .txt (名前の自然順。中身が空のものは除く)。"""
+    from gencommon import inserts
+    try:
+        files = [p for p in Path(folder).iterdir() if p.is_file() and p.suffix.lower() == TEXT_EXT]
+    except OSError:
+        return []
+    return [p for p in sorted(files, key=lambda p: natural_key(p.name)) if inserts.read_file(p)]
+
+
+def repeat_sources(sources: list, times: int) -> list:
+    """回数ぶん並べる。全部の元を 1 回ずつ → 2 回目 … の順 (途中で止めても、どの元も 1 本は出来ているように)。"""
+    return [p for _ in range(max(1, times)) for p in sources]
 
 
 def list_images(folder: str) -> list[Path]:

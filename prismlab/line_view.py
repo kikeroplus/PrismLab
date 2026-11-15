@@ -15,7 +15,7 @@ from typing import Optional
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListView,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListView,
                                QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
                                QTextBrowser, QVBoxLayout, QWidget)
 
@@ -89,6 +89,8 @@ class LineView(QWidget):
         self._results_key = None
         self.trial_source: Optional[str] = None  # 1 枚で試す画像 (None = 入口の対象の先頭)
         self._prompt_html = None
+        self._texts_key = None  # テキストの入口: 読んだフォルダ
+        self._text_files: list = []
         self._result_items: dict = {}
 
         root = QVBoxLayout(self)
@@ -129,7 +131,11 @@ class LineView(QWidget):
         self.out_change.clicked.connect(self._change_output)
         self.out_reset = QPushButton("既定に戻す")
         self.out_reset.clicked.connect(self._reset_output)
+        self.inherit_box = QCheckBox("元の★を引き継ぐ")
+        self.inherit_box.setToolTip("1 件が終わった時点の元の★を、その件で出来たファイルに付けます (更新日時は変えません)。")
+        self.inherit_box.toggled.connect(self._inherit_changed)
         out_row.addWidget(self.out_label, 1)
+        out_row.addWidget(self.inherit_box)
         out_row.addWidget(self.out_change)
         out_row.addWidget(self.out_reset)
         root.addLayout(out_row)
@@ -380,67 +386,82 @@ class LineView(QWidget):
             if w is not None:
                 w.hide()  # 消えるまでのあいだも描かない (新しい並びと重ならないように)
                 w.deleteLater()
+        run = self.engine.run
+        source = str(run.recipe.get("source") or recipes.FOLDER) if self.running() else self.recipe.source
+        single, texts = source == recipes.SINGLE, source == recipes.TEXTS
         self.entry = Card()
         self.entry.title.setText("入口")
-        self.entry.chip.set("画像", kinds.IMAGE_COLOR)
-        self.entry.set_color(kinds.IMAGE_COLOR)
+        if texts:
+            self.entry.chip.set("文字", kinds.TEXT_COLOR)
+            self.entry.set_color(kinds.TEXT_COLOR)
+        else:
+            self.entry.chip.set("画像", kinds.IMAGE_COLOR)
+            self.entry.set_color(kinds.IMAGE_COLOR)
         self.entry.clicked.connect(self._entry_clicked)
         self.entry.bar.hide()
         self.entry.thumbs.clickable = True
         self.entry.thumbs.clicked.connect(self._pick_trial)
-        self.entry.accept_files(recipes.IMAGE_EXTS)
+        self.entry.thumbs.setVisible(not texts)
+        self.entry.accept_files((recipes.TEXT_EXT,) if texts else recipes.IMAGE_EXTS)
         self.entry.file_dropped.connect(self._entry_dropped)
-        # 入口の種類: フォルダ / 1 枚 (LoadImage のように 1 枚を回数ぶん)
+        # 入口の種類: フォルダ / 1 枚 (LoadImage のように) / テキスト (T2I の量産)
         self.mode_folder = QPushButton("フォルダ")
         self.mode_single = QPushButton("1 枚")
+        self.mode_texts = QPushButton("テキスト")
         self.mode_single.setToolTip("フォルダのかわりに 1 枚の画像から始めます。回数ぶん同じ画像を通します"
                                     " (差し込み・盛るで 1 本ずつ変わります)。")
+        self.mode_texts.setToolTip("フォルダの .txt を 1 つずつ元の文にして始めます (T2I の量産)。"
+                                   "最初の生成は T2I か T2V にします。")
         mode_row = QHBoxLayout()
         mode_row.setSpacing(0)
         self.mode_group = QButtonGroup(self.entry)
-        for n, b in enumerate((self.mode_folder, self.mode_single)):
+        self.mode_buttons = (self.mode_folder, self.mode_single, self.mode_texts)
+        for n, b in enumerate(self.mode_buttons):
             b.setCheckable(True)
-            b.setStyleSheet("QPushButton { padding: 2px 10px; font-size: 11px; }")
+            b.setStyleSheet("QPushButton { padding: 2px 8px; font-size: 11px; }")
             self.mode_group.addButton(b, n)
             mode_row.addWidget(b)
         mode_row.addStretch(1)
-        single = self.recipe.single
-        (self.mode_single if single else self.mode_folder).setChecked(True)
+        self.mode_buttons[recipes.SOURCES.index(source)].setChecked(True)
         self.mode_group.idClicked.connect(self._source_changed)
         self.entry.box.insertLayout(1, mode_row)
-        self.entry.setToolTip("1 枚のとき: クリックかドラッグで画像を選ぶ。" if single else
-                              "クリックでフォルダを選ぶ。サムネールのクリックか画像のドラッグで、試す 1 枚を選ぶ。")
+        self.entry.setToolTip(
+            "クリックかドラッグで画像を選ぶ。" if single else
+            "クリックでテキストのフォルダを選ぶ。.txt のドラッグで、試す 1 つを選ぶ。" if texts else
+            "クリックでフォルダを選ぶ。サムネールのクリックか画像のドラッグで、試す 1 枚を選ぶ。")
         self.repeat_box = QSpinBox()
         self.repeat_box.setRange(1, recipes.MAX_REPEAT)
         self.repeat_box.setPrefix("回数 ")
         self.repeat_box.setSuffix(" 回")
         self.repeat_box.setValue(self.recipe.repeat)
+        self.repeat_box.setToolTip("同じ元を何回通すか。全部の元を 1 回ずつ → 2 回目 … の順に作ります。")
         self.repeat_box.valueChanged.connect(self._repeat_changed)
-        self.repeat_box.setVisible(single)
         self.entry.box.insertWidget(2, self.repeat_box)
         self.star_box = QComboBox()
         self.star_box.addItems(STAR_ITEMS)
         self.star_box.setCurrentIndex(self.recipe.min_stars)
         self.star_box.currentIndexChanged.connect(self._stars_changed)
-        self.star_box.setVisible(not single)
+        self.star_box.setVisible(source == recipes.FOLDER)
         self.entry.box.insertWidget(3, self.star_box)
         self.breakdown = QLabel()
         self.breakdown.setTextFormat(Qt.TextFormat.RichText)
         self.breakdown.setStyleSheet(f"background: transparent; color: {theme.TEXT_DIM}; font-size: 11px;")
-        self.breakdown.setVisible(not single)
+        self.breakdown.setVisible(not single)  # テキストの入口では、先頭の文を出す
+        self.breakdown.setWordWrap(True)
         self.entry.box.insertWidget(4, self.breakdown)
         self.rate_button = QPushButton("J-Rate で★を付ける")
         self.rate_button.setToolTip("入口のフォルダを J-Rate で開きます。★を付けて戻ると、ここに反映します。")
         self.rate_button.clicked.connect(self._rate_in_jrate)
-        self.rate_button.setVisible(not single)
+        self.rate_button.setVisible(source == recipes.FOLDER)
         self.entry.box.insertWidget(self.entry.box.count() - 1, self.rate_button)
         self.flow.addWidget(self.entry)
 
         self.stage_cards: list[Card] = []
         views = self._stage_views()
         running_now = self.running()
-        prev_out = ("画像", kinds.IMAGE_COLOR)
-        has_text = False
+        problems = set() if running_now else recipes.line_problems(self.recipe.stages, text_entry=texts)
+        prev_out = ("文字", kinds.TEXT_COLOR) if texts else ("画像", kinds.IMAGE_COLOR)
+        has_text = texts  # テキストの入口は、初めから文がある
         for i, v in enumerate(views):
             self.flow.addWidget(self._insert_arrow(i))
             card = Card()
@@ -486,7 +507,18 @@ class LineView(QWidget):
                 card.thumbs.hide()
             card.set_bypassed(v["bypass"])
             stages = self.recipe.stages
-            can = not running_now and i < len(stages) and (stages[i].bypass or recipes.can_bypass(stages, i))
+            if not running_now and not v["bypass"]:
+                # その位置では動かないステップに、理由を赤で出す (始める前に気付けるように)
+                reason = ""
+                if ("needimage", i) in problems:
+                    reason = "画像がまだありません (テキストの入口では、先に T2I / T2V の生成を置く)"
+                elif ("enhance", i) in problems:
+                    reason = "盛る元の文がありません (前に読み取り・追加テキスト・差し込みを置く)"
+                if reason:
+                    card.io.setText(f'<span style="color:#ef5350; font-weight:bold">⚠ {html.escape(reason)}</span>')
+                    card.io.setWordWrap(True)
+                    card.set_color("#ef5350")
+            can = not running_now and i < len(stages) and (stages[i].bypass or recipes.can_bypass(stages, i, self.recipe.texts))
             card.bypass.setVisible(can)
             card.bypass_toggled.connect(lambda on, n=i: self._set_bypass(n, on))
             card.clicked.connect(lambda n=i: self._edit_stage(n))
@@ -549,10 +581,10 @@ class LineView(QWidget):
         bypass = menu.addAction("バイパス")
         bypass.setCheckable(True)
         bypass.setChecked(stages[index].bypass)
-        bypass.setEnabled(stages[index].bypass or recipes.can_bypass(stages, index))
+        bypass.setEnabled(stages[index].bypass or recipes.can_bypass(stages, index, self.recipe.texts))
         if not bypass.isEnabled():
             bypass.setText("バイパス (入れられません)")
-            bypass.setToolTip(recipes.bypass_reason(stages, index))
+            bypass.setToolTip(recipes.bypass_reason(stages, index, self.recipe.texts))
             menu.setToolTipsVisible(True)
         menu.addSeparator()
         left = menu.addAction("◀ 左へ")
@@ -588,8 +620,8 @@ class LineView(QWidget):
         stages = self.recipe.stages
         if self.running() or index >= len(stages) or stages[index].bypass == on:
             return
-        if on and not recipes.can_bypass(stages, index):
-            self.status.emit(recipes.bypass_reason(stages, index))
+        if on and not recipes.can_bypass(stages, index, self.recipe.texts):
+            self.status.emit(recipes.bypass_reason(stages, index, self.recipe.texts))
             QTimer.singleShot(0, lambda: self.refresh(rebuild=True))  # スイッチを戻す
             return
         stages[index].bypass = on
@@ -637,6 +669,11 @@ class LineView(QWidget):
         else:
             self._choose_folder()
 
+    def _inherit_changed(self, on: bool) -> None:
+        if self.recipe.inherit != on:
+            self.recipe.inherit = on
+            self._save_recipes()
+
     def _entry_dropped(self, path: str) -> None:
         if self.recipe.single:
             self._set_image(path)
@@ -646,9 +683,10 @@ class LineView(QWidget):
     def _source_changed(self, mode: int) -> None:
         if self.running():
             return
-        source = recipes.SINGLE if mode == 1 else recipes.FOLDER
+        source = recipes.SOURCES[mode] if 0 <= mode < len(recipes.SOURCES) else recipes.FOLDER
         if source != self.recipe.source:
             self.recipe.source = source
+            self.trial_source = None
             self._save_recipes()
             QTimer.singleShot(0, lambda: self.refresh(rebuild=True))  # 押したボタンも作り直すので、抜けてから
 
@@ -677,9 +715,14 @@ class LineView(QWidget):
         self.refresh()
 
     def _entry_sources(self) -> list:
-        """入口の対象 (読んである★で絞ったもの。1 枚のときはその画像)。"""
+        """入口の対象 (読んである★で絞ったもの。1 枚のときはその画像、テキストのときは .txt)。"""
         if self.recipe.single:
             return [Path(self.recipe.image)] if self.recipe.image and Path(self.recipe.image).is_file() else []
+        if self.recipe.texts:
+            if self._texts_key != self.recipe.folder:
+                self._texts_key = self.recipe.folder
+                self._text_files = recipes.list_texts(self.recipe.folder) if self.recipe.folder else []
+            return list(self._text_files)
         return [p for p, s in self._scanned_files if s >= self.recipe.min_stars]
 
     def _trial_path(self) -> Optional[Path]:
@@ -705,7 +748,8 @@ class LineView(QWidget):
         if self.running():
             return
         self.trial_source = str(Path(path))
-        self.status.emit(f"試す 1 枚: {Path(path).name}  (「▶ 1 枚で試す」で通します)")
+        what = "試す 1 つ" if self.recipe.texts else "試す 1 枚"
+        self.status.emit(f"{what}: {Path(path).name}  (「▶ 1 枚で試す」で通します)")
         self.refresh()
 
     def _stars_changed(self, index: int) -> None:
@@ -740,6 +784,7 @@ class LineView(QWidget):
         if self.running():
             return
         self._input_key = None
+        self._texts_key = None  # テキストの入口も読み直す (ほかのアプリで .txt を直したかもしれない)
         self._schedule()
 
     def _rate_in_jrate(self) -> None:
@@ -798,6 +843,10 @@ class LineView(QWidget):
         if not r.stages:
             QMessageBox.warning(self, title, "ステップがありません。「＋ ステップ」で足してください。")
             return False
+        problem = recipes.entry_problem(r.stages, r.texts)
+        if problem:
+            QMessageBox.warning(self, title, problem)
+            return False
         if any(s.type == recipes.GEN and not s.bypass for s in r.stages) and not self.engine.machines:
             QMessageBox.warning(self, title, "使う台が決まっていません。「台の設定...」で選んでください。")
             return False
@@ -810,7 +859,8 @@ class LineView(QWidget):
         r = self.recipe
         source = self._trial_path()
         if source is None:
-            QMessageBox.warning(self, "1 枚で試す", "試す画像がありません。入口のフォルダを選ぶか、画像を入口にドラッグしてください。")
+            QMessageBox.warning(self, "1 枚で試す", "試す元がありません。入口のフォルダを選ぶか、画像 (テキストの入口なら .txt) を"
+                                                  "入口にドラッグしてください。")
             return
         if not self._ready("1 枚で試す", need_folder=False):
             return
@@ -831,32 +881,37 @@ class LineView(QWidget):
         r = self.recipe
         if not self._ready("開始"):
             return
-        if r.single:
-            files = [Path(r.image)] * r.repeat  # 同じ画像を回数ぶん (1 本ずつ別の件)
-        else:
-            self.setCursor(Qt.CursorShape.WaitCursor)
-            try:
-                files = recipes.list_images(r.folder)
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            if r.single:
+                base = [Path(r.image)]
+            elif r.texts:
+                base = recipes.list_texts(r.folder)
+            else:
+                base = recipes.list_images(r.folder)
                 if r.min_stars:
-                    files = [p for p in files if rating.get_stars(p) >= r.min_stars]
-            finally:
-                self.unsetCursor()
-        if not files:
-            QMessageBox.warning(self, "開始", "入口に対象の画像がありません (★の絞り込みも確かめてください)。")
+                    base = [p for p in base if rating.get_stars(p) >= r.min_stars]
+        finally:
+            self.unsetCursor()
+        if not base:
+            QMessageBox.warning(self, "開始", "入口に中身のあるテキスト (.txt) がありません。" if r.texts else
+                                "入口に対象の画像がありません (★の絞り込みも確かめてください)。")
             return
+        files = recipes.repeat_sources(base, r.repeat)  # 回数ぶん (1 本ずつ別の件)
         try:
             run = engine.Run.create(r.copy(), files)
         except (ValueError, comfy.ComfyError) as exc:
             QMessageBox.warning(self, "開始", str(exc))
             return
         if len(files) > CONFIRM_COUNT:
-            what = f"{Path(r.image).name} を {len(files)} 回" if r.single else f"{len(files)} 枚"
+            what = (f"{Path(r.image).name} を {len(files)} 回" if r.single else
+                    f"{len(base)} 件 × {r.repeat} 回 = {len(files)} 件" if r.repeat > 1 else f"{len(files)} 件")
             if QMessageBox.question(self, "開始", f"{what}「{r.name}」で量産します。始めますか?",
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                     QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
                 return
         self.engine.start(run)
-        self.status.emit(f"「{r.name}」を始めました ({len(files)} {'回' if r.single else '枚'})。")
+        self.status.emit(f"「{r.name}」を始めました ({len(files)} 件)。")
         self.refresh(rebuild=True)
 
     def _toggle_pause(self) -> None:
@@ -1054,13 +1109,15 @@ class LineView(QWidget):
             b.setEnabled(not running or self.recipe_group.id(b) == self.index)
 
         # 入口
-        single = (run.recipe.get("source") == recipes.SINGLE) if running else self.recipe.single
+        source = str(run.recipe.get("source") or recipes.FOLDER) if running else self.recipe.source
+        single, texts = source == recipes.SINGLE, source == recipes.TEXTS
         image = str(run.recipe.get("image", "")) if running else self.recipe.image
+        repeat = int(run.recipe.get("repeat") or 1) if running else self.recipe.repeat
         if running:
-            sources = [Path(i.source) for i in items]
+            sources = list(dict.fromkeys(Path(i.source) for i in items))  # 回数ぶん重なったものは 1 つに
             folder = str(run.recipe.get("folder", ""))
             stars = int(run.recipe.get("min_stars") or 0)
-        elif single:
+        elif single or texts:
             folder, stars = self.recipe.folder, 0
             sources = self._entry_sources()
         else:
@@ -1071,34 +1128,44 @@ class LineView(QWidget):
                     self._scanned_files, self._scanned_folder = [], None  # 別のフォルダ: 前のものは見せない
                 self._scan.start(folder)
             sources = [p for p, s in self._scanned_files if s >= stars]
-        self.breakdown.setText("" if running else self._star_breakdown(self._scanned_files))
-        self.rate_button.setVisible(not running and not single)
+        if texts:
+            first = sources[0] if sources else None
+            self.breakdown.setText(("先頭: " + html.escape(self._short(inserts.read_file(first), 80))) if first else "")
+        else:
+            self.breakdown.setText("" if running else self._star_breakdown(self._scanned_files))
+        self.rate_button.setVisible(not running and source == recipes.FOLDER)
+        self.inherit_box.blockSignals(True)
+        self.inherit_box.setChecked(bool(run.recipe.get("inherit", True)) if running else self.recipe.inherit)
+        self.inherit_box.setEnabled(not running and not texts)  # テキストには★がない
+        self.inherit_box.blockSignals(False)
         self.star_box.blockSignals(True)
         self.star_box.setCurrentIndex(stars)
         self.star_box.setEnabled(not running)
         self.star_box.blockSignals(False)
-        for b in (self.mode_folder, self.mode_single):
+        for b in self.mode_buttons:
             b.setEnabled(not running)
         self.repeat_box.setEnabled(not running)
+        times = f" × {repeat} 回" if repeat > 1 else ""
         if single:
             self.entry.detail.setText(("画像: " + Path(image).name) if image else "クリックして画像を選ぶ (ドラッグも)")
             self.entry.detail.setToolTip(image)
             trial = None
-            repeat = len(items) if running else self.recipe.repeat
             count = f"{repeat} 回通す" if image else ""
             sources = sources[:1]
         else:
-            self.entry.detail.setText(("フォルダ: " + (Path(folder).name or folder)) if folder else "クリックしてフォルダを選ぶ")
+            what = "テキストのフォルダ" if texts else "フォルダ"
+            self.entry.detail.setText((f"{what}: " + (Path(folder).name or folder)) if folder
+                                      else f"クリックして{what}を選ぶ")
             self.entry.detail.setToolTip(folder)
             trial = None if running else self._trial_path()
-            count = f"対象 {len(sources)} 枚" if folder else ""
+            count = (f"対象 {len(sources)} {'件' if texts else '枚'}{times}") if folder else ""
             if trial is not None:
-                count += ("  ・ " if count else "") + f"試す 1 枚: {trial.name}"
+                count += ("  ・ " if count else "") + f"{'試す 1 つ' if texts else '試す 1 枚'}: {trial.name}"
         self.entry.count.setText(count)
         self.entry.count.setToolTip(str(trial) if trial else "")
         shown = [Path(p) for p in sources[:3]]
         selected = shown.index(trial) if trial is not None and self.trial_source and trial in shown else -1
-        self.entry.thumbs.clickable = not running and not single
+        self.entry.thumbs.clickable = not running and not single and not texts
         self.entry.thumbs.set([self.thumbs.get(str(p)) for p in shown], selected=selected)
 
         # ステップ

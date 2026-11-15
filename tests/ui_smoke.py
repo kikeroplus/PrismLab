@@ -203,6 +203,29 @@ lv.mode_folder.click()
 pump(0.5)
 assert not lv.recipe.single and lv.star_box.isVisibleTo(lv.entry)
 
+# テキストの入口と回数
+txt = TMP / "prompts"
+txt.mkdir()
+(txt / "001.txt").write_text("a red fox walking in deep snow, morning light", encoding="utf-8")
+(txt / "002.txt").write_text("a lighthouse at dusk", encoding="utf-8")
+lv.mode_texts.click()
+pump(0.5)
+lv.recipe.folder = str(txt)
+lv.repeat_box.setValue(3)
+pump(0.5)
+assert lv.recipe.texts and not lv.star_box.isVisibleTo(lv.entry) and not lv.entry.thumbs.isVisibleTo(lv.entry)
+assert lv.entry.count.text().startswith("対象 2 件 × 3 回"), lv.entry.count.text()
+assert "a red fox" in lv.breakdown.text(), lv.breakdown.text()
+assert not lv.inherit_box.isEnabled()
+lv.refresh(rebuild=True)
+pump(0.3)
+assert "画像がまだありません" in lv.stage_cards[0].io.text(), lv.stage_cards[0].io.text()  # 読み取りが先頭
+window.grab().save(str(OUT / "prismlab_texts.png"))
+lv.repeat_box.setValue(1)
+lv.mode_folder.click()
+pump(0.5)
+assert lv.inherit_box.isEnabled() and lv.inherit_box.isChecked()
+
 window.engine.stop_threads()
 for s in (a, b, llm):
     s.close()

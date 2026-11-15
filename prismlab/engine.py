@@ -18,7 +18,7 @@ from PySide6.QtCore import QObject, Signal
 
 from gencommon import comfy, enhancer, inserts, llm, reader, store
 
-from . import kinds, recipes
+from . import kinds, rating, recipes
 
 RUN_FILE = "line_run.json"
 TRIAL_DIR = "試作"  # 1 枚で試すときの出力 (出力フォルダの下)
@@ -199,6 +199,13 @@ class Run:
         if not out:
             raise ValueError("出力フォルダが決まっていません。")
         items = [Item(str(p), current=str(p), stage=first) for p in sources]
+        if recipe.texts:
+            # テキストの入口: ファイルの中身が元の文 (読み取ったものと同じ扱い)
+            texts = {}
+            for it in items:
+                if it.source not in texts:
+                    texts[it.source] = inserts.read_file(Path(it.source))
+                it.text = texts[it.source] or None
         pickers = []
         for i, snap in enumerate(stages):
             if snap["type"] != recipes.INSERT or snap.get("bypass"):
@@ -674,11 +681,25 @@ class Engine(QObject):
             m.fail_streak = 0
         self._advance(it)
 
+    def _inherit(self, it: Item) -> None:
+        """元の★を、この件で出来たファイルに引き継ぐ。見るのは終わった時点の★ (生成中に付けたものも)。"""
+        run = self.run
+        if run is None or not run.recipe.get("inherit", True) or not it.outputs:
+            return
+        stars = rating.get_stars(Path(it.source))
+        if stars:
+            for o in it.outputs:
+                rating.set_stars(Path(o["path"]), stars)
+
     def _advance(self, it: Item) -> None:
         with self._cond:
             it.stage = next_stage(self.run.stages, it.stage)  # バイパスは飛ばす
+            done = it.stage >= len(self.run.stages)
+        if done:
+            self._inherit(it)  # 完了にする前に (完了を見て J-Rate で開いたときに★が付いているように)
+        with self._cond:
             it.status, it.at = "", ""
-            it.state = DONE if it.stage >= len(self.run.stages) else WAITING
+            it.state = DONE if done else WAITING
             self._cancels.pop(id(it), None)
             self._cond.notify_all()
         self._save()

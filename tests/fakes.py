@@ -145,6 +145,15 @@ def workflow_i2v() -> dict:
     }
 
 
+def workflow_t2i() -> dict:
+    return {
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "{prompt}", "clip": ["5", 0]}},
+        "4": {"class_type": "KSampler", "inputs": {"seed": 1, "positive": ["2", 0]}},
+        "5": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c"}},
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+    }
+
+
 def workflow_cn() -> dict:
     return {
         "1": {"class_type": "LoadImage", "inputs": {"image": "x.png"}},

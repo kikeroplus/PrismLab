@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from fakes import FakeComfy, FakeLLM, workflow_cn, workflow_i2v  # noqa: E402
+from fakes import FakeComfy, FakeLLM, workflow_cn, workflow_i2v, workflow_t2i  # noqa: E402
 from gencommon import enhancer, reader, settings, store  # noqa: E402
 from prismlab import engine, profile, recipes  # noqa: E402
 
@@ -39,6 +39,7 @@ WF = TMP / "wf"
 WF.mkdir()
 (WF / "i2v.json").write_text(json.dumps(workflow_i2v()), encoding="utf-8")
 (WF / "cn.json").write_text(json.dumps(workflow_cn()), encoding="utf-8")
+(WF / "t2i.json").write_text(json.dumps(workflow_t2i()), encoding="utf-8")
 
 
 def make_images(folder: Path, n: int) -> list[Path]:
@@ -304,6 +305,53 @@ files13 = [i.plan["0"]["file"] for i in eng.run.items]
 check(all(i.state == engine.DONE for i in eng.run.items) and len(set(names13)) == 3,
       f"13: 同じ画像から 3 本 (名前は重ならない: {names13})")
 check(len(set(files13)) == 3, f"13: 1 本ずつ別の差し込み ({files13})")
+
+# 14. テキストの入口 (T2I の量産)
+txt = TMP / "txt14"
+txt.mkdir()
+(txt / "p2.txt").write_text("a red fox in snow", encoding="utf-8")
+(txt / "p10.txt").write_text("a lighthouse at dusk", encoding="utf-8")
+(txt / "empty.txt").write_text("  ", encoding="utf-8")
+check([p.name for p in recipes.list_texts(str(txt))] == ["p2.txt", "p10.txt"], "14: 入口の .txt (自然順、空は除く)")
+t2i, i2v = S(recipes.GEN, workflow=str(WF / "t2i.json")), S(recipes.GEN, workflow=str(WF / "i2v.json"))
+check(recipes.entry_problem([S(recipes.READ, reader=READER), t2i], True) != "", "14: テキストの入口で、画像の前の読み取りは置けない")
+check(recipes.entry_problem([i2v], True) != "" and recipes.entry_problem([i2v], False) == "",
+      "14: テキストの入口で、最初の生成が I2V なら始めない")
+check(not recipes.can_bypass([t2i, S(recipes.READ, reader=READER), i2v], 0, text_entry=True),
+      "14: テキストの入口で T2I をバイパスにすると画像がなくなるので不可")
+r14 = recipe("14", txt, [t2i, S(recipes.READ, reader=READER), i2v])
+r14.source = recipes.TEXTS
+run14 = engine.Run.create(r14, recipes.list_texts(str(txt)))
+check([i.text for i in run14.items] == ["a red fox in snow", "a lighthouse at dusk"], "14: ファイルの中身が元の文")
+eng.start(run14)
+wait(eng)
+o14 = eng.run.items[0].outputs
+check(all(i.state == engine.DONE for i in eng.run.items) and len(o14) == 2, "14: T2I → 読み取り → I2V で完了")
+check([Path(o["path"]).name for o in o14] == ["p2_t2i.png", "p2_t2i_video.mp4"], f"14: 名前は テキストの名前_t2i ({[Path(o['path']).name for o in o14]})")
+check("a red fox in snow" in o14[0].get("sent", ""), "14: テキストの中身を T2I に送った")
+
+# 15. 元の★を引き継ぐ (書き込みは差し替えて記録する)
+from prismlab import rating as rating_mod  # noqa: E402
+written = []
+real_get, real_set = rating_mod.get_stars, rating_mod.set_stars
+rating_mod.get_stars = lambda p: 4 if Path(p).name == "img1.png" else 0
+rating_mod.set_stars = lambda p, n, tries=3: written.append((Path(p).name, n)) or True
+src15 = make_images(TMP / "in15", 2)
+r15 = recipe("15", TMP / "in15", [S(recipes.GEN, workflow=str(WF / "cn.json")), S(recipes.GEN, workflow=str(WF / "i2v.json"))])
+eng.start(engine.Run.create(r15, src15))
+wait(eng)
+check(sorted(written) == [("img1_cn.png", 4), ("img1_cn_video.mp4", 4)], f"15: ★のある元だけ、出来たファイルすべてに引き継ぐ ({written})")
+written.clear()
+r15.inherit = False
+eng.start(engine.Run.create(r15, src15))
+wait(eng)
+check(written == [], "15: 引き継がない設定なら書かない")
+rating_mod.get_stars, rating_mod.set_stars = real_get, real_set
+check(recipes.Recipe.from_dict({"name": "x"}).inherit, "15: 引き継ぎの既定はオン")
+
+# 16. 回数
+check([p for p in recipes.repeat_sources(["a", "b"], 3)] == ["a", "b", "a", "b", "a", "b"],
+      "16: 回数は 全部を 1 回ずつ → 2 回目 … の順")
 
 for s in (a, b, slow):
     s.close()
