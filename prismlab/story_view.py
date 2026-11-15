@@ -569,6 +569,7 @@ class StoryView(QWidget):
         self._job_prompt = ""
         self._job_original = ""  # 候補づくりのときの元のプロンプト (候補に記録する)
         self._job_reference = ""
+        self._job_last = ""
         self._before: dict[str, str] = {}  # シーンの id → 読み取る・盛るを始めたときの文 (うまくいったら履歴に残す)
         self._llm_busy = ""
         self._llm_done.connect(self._on_llm_done)
@@ -696,28 +697,51 @@ class StoryView(QWidget):
         self.pick_t2i.clicked.connect(self._make_source_t2i)
         for b in (self.pick_file, self.pick_frame, self.pick_t2i):
             box.addWidget(b)
-        # リファレンス画像 (主に顔)。ワークフローが対応するときだけ
-        ref_head = QLabel("リファレンス画像 (主に顔)")
-        ref_head.setStyleSheet(f"color: {theme.TEXT_DIM}; font-weight: bold; background: transparent;"
-                               " margin-top: 8px;")
-        box.addWidget(ref_head)
-        ref_row = QHBoxLayout()
-        self.ref_view = QLabel()
-        self.ref_view.setFixedSize(96, 96)
-        self.ref_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.ref_view.setStyleSheet(f"background: #111; color: {theme.TEXT_DIM}; border-radius: 4px; font-size: 10px;")
-        ref_buttons = QVBoxLayout()
+        # リファレンス画像 (主に顔) と ラストフレーム。ワークフローが対応するときだけ (縦の場所が足りないので横に並べる)
+        pair = QHBoxLayout()
+        pair.setSpacing(8)
+
+        def column(title: str):
+            col = QVBoxLayout()
+            col.setSpacing(3)
+            head = QLabel(title)
+            head.setStyleSheet(f"color: {theme.TEXT_DIM}; font-weight: bold; background: transparent; margin-top: 8px;")
+            view = QLabel()
+            view.setFixedSize(124, 84)
+            view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            view.setWordWrap(True)
+            view.setStyleSheet(f"background: #111; color: {theme.TEXT_DIM}; border-radius: 4px; font-size: 10px;")
+            buttons = QHBoxLayout()
+            buttons.setSpacing(3)
+            col.addWidget(head)
+            col.addWidget(view)
+            col.addLayout(buttons)
+            pair.addLayout(col)
+            return view, buttons
+
+        self.ref_view, ref_buttons = column("リファレンス (顔)")
         self.ref_pick = QPushButton("選ぶ...")
         self.ref_pick.clicked.connect(self._choose_reference)
         self.ref_clear = QPushButton("外す")
         self.ref_clear.clicked.connect(self._clear_reference)
         ref_buttons.addWidget(self.ref_pick)
         ref_buttons.addWidget(self.ref_clear)
-        ref_buttons.addStretch(1)
-        ref_row.addWidget(self.ref_view)
-        ref_row.addLayout(ref_buttons, 1)
-        box.addLayout(ref_row)
-        self.ref_note = QLabel()
+        self.last_view, last_buttons = column("ラストフレーム")
+        self.last_pick = QToolButton()
+        self.last_pick.setText("選ぶ")  # ボタンの矢印でメニューと分かる
+        self.last_pick.setToolTip("手元の画像か、次のシーンの元画像 (追いかける) を選びます。")
+        self.last_pick.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.last_pick.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        last_menu = QMenu(self.last_pick)
+        last_menu.addAction("手元の画像...", self._choose_last_frame)
+        self.last_next_action = last_menu.addAction("次のシーンの元画像 (追いかける)", self._follow_next_last_frame)
+        self.last_pick.setMenu(last_menu)
+        self.last_clear = QPushButton("外す")
+        self.last_clear.clicked.connect(self._clear_last_frame)
+        last_buttons.addWidget(self.last_pick)
+        last_buttons.addWidget(self.last_clear)
+        box.addLayout(pair)
+        self.ref_note = QLabel()  # リファレンスとラストフレームの説明 (短く。詳しいことは指を置くと出す)
         self.ref_note.setWordWrap(True)
         self.ref_note.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 11px; background: transparent;")
         box.addWidget(self.ref_note)
@@ -874,8 +898,10 @@ class StoryView(QWidget):
         compare = QHBoxLayout()
         compare.setSpacing(6)
         self.preview_src, self.preview, self.preview_last = QLabel(), QLabel(), QLabel()
+        self.preview_target = QLabel()  # その候補で指定したラストフレーム (ファーストフレーム・ラストフレームのワークフロー)
         self.preview_caps = []
-        for label, cap in ((self.preview_src, "元画像"), (self.preview, "候補"), (self.preview_last, "候補の最後のコマ")):
+        for label, cap in ((self.preview_src, "元画像"), (self.preview, "候補"), (self.preview_last, "候補の最後のコマ"),
+                           (self.preview_target, "指定したラストフレーム")):
             col = QVBoxLayout()
             col.setSpacing(2)
             label.setFixedHeight(150)
@@ -1160,6 +1186,32 @@ class StoryView(QWidget):
             self.story.set_reference(self.scene, "")
             self._changed()
 
+    def _choose_last_frame(self) -> None:
+        if self.scene is None or self._busy_here(self.scene):
+            return
+        exts = " ".join("*" + e for e in recipes.IMAGE_EXTS)
+        path, _ = QFileDialog.getOpenFileName(self, "ラストフレームを選ぶ", "", f"画像 ({exts})")
+        if path:
+            self._set_last_frame(path)
+
+    def _set_last_frame(self, path: str = "", follow_next: bool = False) -> None:
+        try:
+            self.story.set_last_frame(self.scene, path, follow_next)
+        except story.StoryError as exc:
+            QMessageBox.warning(self, "ラストフレーム", str(exc))
+            return
+        if self.scene.last_frame:
+            self.thumbs.forget(self.scene.last_frame)
+        self._changed()
+
+    def _follow_next_last_frame(self) -> None:
+        if self.scene is not None and not self._busy_here(self.scene):
+            self._set_last_frame(follow_next=True)
+
+    def _clear_last_frame(self) -> None:
+        if self.scene is not None and self.scene.last_kind and not self._busy_here(self.scene):
+            self._set_last_frame()
+
     def _drag_enter(self, event) -> None:
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
         if len(urls) == 1 and urls[0].isLocalFile() and urls[0].toLocalFile().lower().endswith(recipes.IMAGE_EXTS):
@@ -1428,6 +1480,20 @@ class StoryView(QWidget):
         self._save_timer.start()
         self._schedule()  # ワークフローでリファレンスの欄が変わる
 
+    def _put_small(self, label: QLabel, path: str, empty: str, check: bool = False) -> None:
+        """小さな欄に画像を出す (なければ empty の文)。"""
+        pix = self.thumbs.get(path, check=check) if path else None
+        if pix is not None and not pix.isNull():
+            label.setPixmap(pix.scaled(label.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation))
+        else:
+            label.setPixmap(QPixmap())
+            label.setText(empty if not path else "")
+
+    def _busy_job(self, scene: story.Scene) -> bool:
+        """このシーンの候補を作っているか (知らせない)。"""
+        return self.job is not None and self.job[1] == scene.id and self.engine.active
+
     def _busy_here(self, scene: story.Scene) -> bool:
         if self.job is not None and self.job[1] == scene.id and self.engine.active:
             self.status.emit("このシーンは候補を作っています。終わるか中止してから直してください。")
@@ -1435,7 +1501,7 @@ class StoryView(QWidget):
         return False
 
     def start_job(self, job, workflow: str, prompt: str, seconds, base: bool, count: int, source: str,
-                  out_dir: str, reference: str = "", original: str = "") -> bool:
+                  out_dir: str, reference: str = "", original: str = "", last_frame: str = "") -> bool:
         """候補 (または T2I の元画像) を作り始める。一度に 1 つだけ。"""
         run = self.engine.run
         if self.engine.active and run is not None and run.unfinished:
@@ -1459,8 +1525,9 @@ class StoryView(QWidget):
         for it in new.items:
             it.text = prompt or None  # 空ならワークフローに書かれたプロンプトのまま
             it.reference = reference
+            it.last_frame = last_frame
         self.job, self._job_prompt = job, prompt
-        self._job_original, self._job_reference = original, reference
+        self._job_original, self._job_reference, self._job_last = original, reference, last_frame
         self.engine.start(new)
         self.refresh()
         return True
@@ -1486,8 +1553,25 @@ class StoryView(QWidget):
                 pass
         reference = s.reference if s.reference and Path(s.reference).is_file() and kinds.has_reference(s.workflow) \
             else ""
+        last_frame = ""
+        if kinds.has_last_frame(s.workflow):
+            last_frame = self.story.last_frame_of(s)
+            if not last_frame:  # 渡さないと始めも終わりも元画像になるので、作らずに知らせる
+                why = ("次のシーンの元画像がまだありません" if s.last_kind == story.LAST_NEXT
+                       else "ラストフレームが決まっていません")
+                QMessageBox.information(self, "候補を作る",
+                                        f"このワークフローはラストフレームを指定するものですが、{why}。\n"
+                                        "左の「ラストフレーム」の「選ぶ」で、手元の画像か次のシーンの元画像を選んでください。")
+                return
+            if s.last_kind == story.LAST_NEXT:
+                # 次のシーンの元画像は書き直されることがあるので、作る時点の絵を写して使う (候補の記録もこれを指す)
+                try:
+                    last_frame = self.story.freeze_last_frame(s, last_frame)
+                except story.StoryError as exc:
+                    QMessageBox.warning(self, "候補を作る", str(exc))
+                    return
         if self.start_job(("cand", s.id), s.workflow, s.send_text, s.seconds, s.base_prompt, s.count, source,
-                          str(folder), reference=reference, original=s.original):
+                          str(folder), reference=reference, original=s.original, last_frame=last_frame):
             s.record("候補に送った文", s.send_text)
         self._save()
 
@@ -1511,7 +1595,7 @@ class StoryView(QWidget):
                         if o["path"] not in known and Path(o["path"]).exists():  # 作っている途中で消したものは戻さない
                             scene.candidates.append(story.Candidate(
                                 o["path"], self._job_prompt, float(o.get("time") or time.time()),
-                                self._job_original, self._job_reference))
+                                self._job_original, self._job_reference, self._job_last))
                 self._save()
                 failed = [it.error for it in items if it.state == engine.FAILED]
                 self.status.emit(f"シーン「{scene.label(self.story.index_of(scene))}」の候補が出来ました"
@@ -1552,6 +1636,13 @@ class StoryView(QWidget):
         self.preview_caps[2].setVisible(video)
         if video:
             put(self.preview_last, self.thumbs.get(path, last=True), "読み込み中…")
+        # その候補でラストフレームを指定していたら、候補の最後のコマと見比べられるように並べる
+        cand = next((c for c in self.scene.candidates if c.path == path), None) if self.scene and path else None
+        target = cand.last_frame if cand is not None and cand.last_frame and Path(cand.last_frame).is_file() else ""
+        self.preview_target.setVisible(bool(target))
+        self.preview_caps[3].setVisible(bool(target))
+        if target:
+            put(self.preview_target, self.thumbs.get(target), "読み込み中…")
         self.preview_caps[1].setText("候補 (始め)" if video else "候補")
         self.adopt_b.setEnabled(bool(path))
         self.adopt_only.setEnabled(bool(path))
@@ -1890,21 +1981,38 @@ class StoryView(QWidget):
         has_ref = bool(s.reference) and Path(s.reference).is_file()
         self.ref_pick.setEnabled(can_ref)
         self.ref_clear.setEnabled(has_ref)
-        rpix = self.thumbs.get(s.reference) if has_ref else None
-        if rpix is not None and not rpix.isNull():
-            self.ref_view.setPixmap(rpix.scaled(self.ref_view.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                                                Qt.TransformationMode.SmoothTransformation))
+        self._put_small(self.ref_view, s.reference if has_ref else "", "なし" if can_ref else "対応なし")
+        ref_note = ("リファレンス用の LoadImage に入れます。" if has_ref else
+                    "リファレンスを選ばなければ、リファレンス用の LoadImage にも元画像を入れます。") if can_ref else \
+            ("リファレンス: このワークフローは対応していません" + (" (選んだ画像は残っています)。" if has_ref else "。"))
+        self.ref_view.setToolTip((s.reference + "\n\n" if has_ref else "") +
+                                 "LoadImage のタイトルに「face」「reference」「顔」「参照」などを入れたワークフローで使えます。")
+        # ラストフレーム (ファーストフレーム・ラストフレームを指定するワークフロー)
+        can_last = kinds.has_last_frame(s.workflow)
+        last = self.story.last_frame_of(s)
+        follow = s.last_kind == story.LAST_NEXT
+        nxt = self.story.scenes[index + 1] if index + 1 < len(self.story.scenes) else None
+        self.last_pick.setEnabled(can_last and not self._busy_job(s))
+        self.last_next_action.setEnabled(nxt is not None)
+        self.last_clear.setEnabled(bool(s.last_kind) and not self._busy_job(s))
+        if follow and not last:
+            empty = "次のシーンがありません" if nxt is None else "次のシーンの元画像がまだ"
         else:
-            self.ref_view.setPixmap(QPixmap())
-            self.ref_view.setText("なし" if can_ref else "対応なし")
-        if can_ref:
-            self.ref_note.setText("候補を作るとき、ワークフローのリファレンス用の LoadImage に入れます。" if has_ref else
-                                  "選ばなければ、リファレンス用の LoadImage にも元画像を入れます。")
+            empty = "なし" if can_last else "対応なし"
+        self._put_small(self.last_view, last, empty, check=follow)
+        if can_last:
+            last_note = ("ラストフレーム: 次のシーンの元画像を使います (変わったら追いかけます)。" if follow else
+                         "ラストフレーム用の LoadImage に入れます。" if last else
+                         "ラストフレームを選んでから候補を作ります。")
+            if follow and nxt is not None and nxt.link == story.CONT:
+                last_note += " 次のシーンは「続き」なので、このシーンの採用の最後のコマです。"
         else:
-            self.ref_note.setText("選んでいるワークフローはリファレンス画像に対応していません。LoadImage のタイトルに "
-                                  "「face」「reference」「顔」「参照」などを入れると対応します。"
-                                  + (" (設定済みの画像は残っています)" if has_ref else ""))
-        self.ref_view.setToolTip(s.reference if has_ref else "")
+            last_note = "ラストフレーム: このワークフローは対応していません" + \
+                (" (選んだ画像は残っています)。" if s.last_kind else "。") if s.last_kind else ""
+        self.last_view.setToolTip((last + "\n\n" if last else "") +
+                                  "LoadImage のタイトルに「last」「end」「ラスト」「最後」などを入れたワークフロー"
+                                  " (ファーストフレームとラストフレームを指定するもの) で使えます。")
+        self.ref_note.setText("\n".join(t for t in (ref_note if (can_ref or has_ref) else "", last_note) if t))
 
         # プロンプト
         llm = bool(self._llm_busy)
@@ -1948,7 +2056,8 @@ class StoryView(QWidget):
                 if cand is not None:
                     tip += (f"\n\n元のプロンプト: {cand.original}" if cand.original else "") + \
                            (f"\n盛ったあとのプロンプト: {cand.prompt}" if cand.prompt else "") + \
-                           (f"\nリファレンス: {Path(cand.reference).name}" if cand.reference else "")
+                           (f"\nリファレンス: {Path(cand.reference).name}" if cand.reference else "") + \
+                           (f"\nラストフレーム: {cand.last_frame}" if cand.last_frame else "")
                 item.setToolTip(tip)
                 self.cands.addItem(item)
                 if path == keep or (not keep and path == s.adopted):

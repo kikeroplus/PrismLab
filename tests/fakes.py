@@ -23,6 +23,7 @@ class FakeComfy:
         self.video_bytes = None  # 動画の出力に返す本物の mp4 (None なら中身のない文字)
         self.prompts: dict = {}  # id → {"wf": ..., "seen": n, "video": bool}
         self.received: list = []  # 受けたワークフロー (順に)
+        self.uploads: dict = {}  # 受けた画像の名前 → 送られてきた中身 (multipart のまま)
         self.lock = threading.Lock()
         owner = self
 
@@ -82,7 +83,10 @@ class FakeComfy:
                 raw = self.rfile.read(length)
                 url = urlparse(self.path)
                 if url.path == "/upload/image":
-                    return self._send({"name": "up_" + uuid.uuid4().hex[:6] + ".png", "subfolder": ""})
+                    name = "up_" + uuid.uuid4().hex[:6] + ".png"
+                    with owner.lock:
+                        owner.uploads[name] = raw  # どの LoadImage にどの画像が入ったか確かめられるように
+                    return self._send({"name": name, "subfolder": ""})
                 if url.path == "/prompt":
                     wf = json.loads(raw)["prompt"]
                     pid = uuid.uuid4().hex
@@ -171,6 +175,15 @@ def workflow_i2v_ref() -> dict:
     wf = workflow_i2v()
     wf["6"] = {"class_type": "LoadImage", "_meta": {"title": "Face Reference"}, "inputs": {"image": "face.png"}}
     wf["4"]["inputs"]["ref"] = ["6", 0]
+    return wf
+
+
+def workflow_flf() -> dict:
+    """ファーストフレーム・ラストフレームを指定する I2V (タイトルが First Frame / Last Frame の LoadImage)。"""
+    wf = workflow_i2v()
+    wf["1"]["_meta"] = {"title": "First Frame"}
+    wf["7"] = {"class_type": "LoadImage", "_meta": {"title": "Last Frame"}, "inputs": {"image": "end.png"}}
+    wf["4"]["inputs"]["end_image"] = ["7", 0]
     return wf
 
 

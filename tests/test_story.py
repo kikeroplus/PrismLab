@@ -195,6 +195,34 @@ fs.set_source_file(n, str(src))
 check(fs.next_source_taken(f1, str(v1b)), "7: 手元の画像が入っていたら確かめる")
 check(not fs.next_source_taken(n, str(v1b)), "7: 次のシーンがなければ確かめない")
 
+# 8. ラストフレーム: 手元の画像 (last.png に写す) / 次のシーンの元画像を追いかける
+ls = story.Story.create(str(TMP / "ラスト"), "ラスト")
+l1 = ls.scenes[0]
+check(ls.last_frame_of(l1) == "", "8: 初めはラストフレームなし")
+ls.set_last_frame(l1, str(src))
+check(l1.last_kind == story.LAST_FILE and Path(l1.last_frame) == ls.scene_dir(l1) / story.LAST_NAME
+      and ls.last_frame_of(l1) == l1.last_frame, "8: 手元の画像はシーンのフォルダの last.png に写す")
+ls.set_last_frame(l1, follow_next=True)
+check(l1.last_kind == story.LAST_NEXT and ls.last_frame_of(l1) == "", "8: 次のシーンがなければ空")
+l2 = ls.add_scene(l1, story.CUT)
+check(ls.last_frame_of(l1) == "", "8: 次のシーンに元画像がなければ空")
+ls.set_source_file(l2, str(src))
+check(ls.last_frame_of(l1) == l2.source, "8: 次のシーンの元画像を使う")
+ls.set_source_frame(l2, str(v1), 2)
+check(ls.last_frame_of(l1) == l2.source and near(color_at(Path(ls.last_frame_of(l1))), (0, 0, 255)),
+      "8: 次のシーンの元画像が変わったら、それを追いかける")
+frozen = ls.freeze_last_frame(l1, ls.last_frame_of(l1))
+check(Path(frozen).parent == ls.scene_dir(l1) and near(color_at(Path(frozen)), (0, 0, 255)),
+      "8: 候補を作る時点の絵を写して使う (あとで次のシーンの元画像が変わっても残る)")
+ls.save()
+again8 = story.Story.load(str(TMP / "ラスト"))
+check(again8.scenes[0].last_kind == story.LAST_NEXT and again8.last_frame_of(again8.scenes[0]) == l2.source,
+      "8: 保存して開き直しても同じ")
+c8 = story.Candidate("x.mp4", last_frame=frozen)
+check(story.Candidate.from_dict(c8.to_dict()).last_frame == frozen, "8: 候補に使ったラストフレームを残す")
+ls.set_last_frame(l1)
+check(l1.last_kind == "" and ls.last_frame_of(l1) == "", "8: 外す")
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 print("失敗: " + ", ".join(failures) if failures else "すべて OK")

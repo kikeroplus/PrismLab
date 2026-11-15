@@ -46,6 +46,7 @@ class Item:
     # before = 盛る前に足したもの (このあとの盛るに渡す)。生成を通ると空に戻す
     adds: list = field(default_factory=list)
     reference: str = ""  # リファレンス画像 (主に顔)。ワークフローにリファレンス用の LoadImage があるときだけ使う
+    last_frame: str = ""  # ラストフレーム。ワークフローにラストフレーム用の LoadImage があるときだけ使う
     plan: dict = field(default_factory=dict)  # 差し込みの割り当て (ステップの番号の文字 → 枠の形)。始めたときに決める
     error: str = ""
     error_stage: int = -1
@@ -65,7 +66,7 @@ class Item:
         if not isinstance(data, dict) or not data.get("source"):
             return None
         it = Item(str(data["source"]))
-        for key in ("current", "error", "machine", "prompt_id", "read_name", "reference"):
+        for key in ("current", "error", "machine", "prompt_id", "read_name", "reference", "last_frame"):
             setattr(it, key, str(data.get(key) or ""))
         it.current = it.current or it.source
         for key in ("text", "enhanced"):
@@ -610,6 +611,7 @@ class Engine(QObject):
             enhanced_prompt=it.enhanced,
             inserts=[dict(a) for a in it.adds] or None,
             reference=it.reference or None,
+            last_frame=it.last_frame or None,
             reader={"name": it.read_name} if it.read_name else None,
             output_dir=run.output_dir,
         )

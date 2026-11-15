@@ -25,6 +25,8 @@ SCENES_DIR = "scenes"
 ADOPTED_DIR = "採用"
 SOURCE_NAME = "source.png"
 REFERENCE_NAME = "reference.png"
+LAST_NAME = "last.png"  # ラストフレーム (手元の画像を写したもの)
+LAST_FILE, LAST_NEXT = "file", "next"  # ラストフレームの決め方: 手元の画像 / 次のシーンの元画像 (追いかける)
 RECENT_FILE = "stories.txt"  # 最近開いた物語のフォルダ (1 行に 1 つ、新しい順)
 MAX_RECENT = 10
 MAX_HISTORY = 60  # シーンごとのプロンプトの履歴 (いちばん最初のものは消さない)
@@ -46,10 +48,11 @@ class Candidate:
     time: float = 0.0
     original: str = ""  # そのときの元のプロンプト
     reference: str = ""  # そのとき使ったリファレンス画像 (使わなければ空)
+    last_frame: str = ""  # そのとき使ったラストフレーム (使わなければ空)
 
     def to_dict(self) -> dict:
         return {"path": self.path, "prompt": self.prompt, "time": self.time, "original": self.original,
-                "reference": self.reference}
+                "reference": self.reference, "last_frame": self.last_frame}
 
     @staticmethod
     def from_dict(data) -> Optional["Candidate"]:
@@ -60,7 +63,7 @@ class Candidate:
         except (TypeError, ValueError):
             t = 0.0
         return Candidate(str(data["path"]), str(data.get("prompt") or ""), t, str(data.get("original") or ""),
-                         str(data.get("reference") or ""))
+                         str(data.get("reference") or ""), str(data.get("last_frame") or ""))
 
 
 @dataclass
@@ -72,6 +75,10 @@ class Scene:
     source_kind: str = ""  # SOURCE_*
     source_from: str = ""  # 元画像を取った動画 (続き・コマのとき。採用が変わったら作り直すため)
     reference: str = ""  # リファレンス画像 (主に顔。シーンのフォルダの reference.png)。ワークフローが対応するときだけ使う
+    # ラストフレーム (ファーストフレーム・ラストフレームを指定するワークフローのとき)。
+    # last_kind が LAST_FILE なら last_frame (シーンのフォルダの last.png)、LAST_NEXT なら次のシーンの元画像を使う
+    last_kind: str = ""
+    last_frame: str = ""
     original: str = ""  # 元のプロンプト (自分で書く文。読み取る・盛る・差し込みでは書き換えない)
     prompt: str = ""  # 送るプロンプト (読み取る・差し込み・盛るの結果。候補を作るで送る)
     workflow: str = ""
@@ -116,8 +123,11 @@ class Scene:
             return s
         s.id = str(data.get("id") or s.id)
         for key in ("name", "source", "source_kind", "source_from", "reference", "original", "prompt", "workflow",
-                    "adopted"):
+                    "adopted", "last_frame"):
             setattr(s, key, str(data.get(key) or ""))
+        s.last_kind = str(data.get("last_kind") or "")
+        if s.last_kind not in (LAST_FILE, LAST_NEXT):
+            s.last_kind, s.last_frame = "", ""
         if "original" not in data and s.prompt and not data.get("history"):
             s.original = s.prompt  # 元のプロンプトの欄がなかったころの物語: 手で書いた文を元のプロンプトに
         s.link = CONT if data.get("link") == CONT else CUT
@@ -286,6 +296,44 @@ class Story:
         if Path(path).resolve() != dest.resolve():
             _write_png(path, dest)
         scene.reference = str(dest)
+
+    def set_last_frame(self, scene: Scene, path: str = "", follow_next: bool = False) -> None:
+        """ラストフレームを決める。path なら手元の画像 (シーンのフォルダの last.png に写す)、
+        follow_next なら次のシーンの元画像を使う (次のシーンの元画像が変わったら、それを使う)。どちらもなければ外す。"""
+        if follow_next:
+            scene.last_kind, scene.last_frame = LAST_NEXT, ""
+            return
+        if not path:
+            scene.last_kind, scene.last_frame = "", ""
+            return
+        dest = self.scene_dir(scene) / LAST_NAME
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if Path(path).resolve() != dest.resolve():
+            _write_png(path, dest)
+        scene.last_kind, scene.last_frame = LAST_FILE, str(dest)
+
+    def last_frame_of(self, scene: Scene) -> str:
+        """候補を作るときに使うラストフレームのパス (なければ空)。次のシーンの元画像を追いかけるときは、その今のもの。"""
+        if scene.last_kind == LAST_FILE:
+            return scene.last_frame if scene.last_frame and Path(scene.last_frame).is_file() else ""
+        if scene.last_kind == LAST_NEXT:
+            i = self.index_of(scene)
+            nxt = self.scenes[i + 1] if i + 1 < len(self.scenes) else None
+            if nxt is not None and nxt.source and Path(nxt.source).is_file():
+                return nxt.source
+        return ""
+
+    def freeze_last_frame(self, scene: Scene, path: str) -> str:
+        """候補を作る時点のラストフレームを、シーンのフォルダの last_(時刻).png に写して、そのパスを返す
+        (次のシーンの元画像を追いかけるとき。元の source.png はあとで書き直されることがあるため)。"""
+        import time
+        dest = self.scene_dir(scene) / f"last_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(path, dest)
+        except OSError as exc:
+            raise StoryError(f"ラストフレームを写せません ({exc})") from exc
+        return str(dest)
 
     def set_source_frame(self, scene: Scene, video: str, frame: int) -> None:
         """前のシーンの好きなコマを元画像にする。"""

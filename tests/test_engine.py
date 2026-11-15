@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from fakes import FakeComfy, FakeLLM, workflow_cn, workflow_i2v, workflow_i2v_ref, workflow_t2i  # noqa: E402
+from fakes import (FakeComfy, FakeLLM, workflow_cn, workflow_flf, workflow_i2v, workflow_i2v_ref,  # noqa: E402
+                   workflow_t2i)
 from gencommon import enhancer, reader, settings, store  # noqa: E402
 from prismlab import engine, profile, recipes  # noqa: E402
 
@@ -373,6 +374,45 @@ check(all(i.state == engine.DONE for i in run17.items) and pairs == [False, True
       "17: リファレンスを渡した件だけ、リファレンス用の LoadImage に別の画像を送る (渡さなければ元画像)")
 check(engine.Item.from_dict(run17.items[0].to_dict()).reference == str(src17[1]), "17: リファレンスを保存する")
 eng17.stop_threads()
+
+# 18. ラストフレーム: ラストフレーム用の LoadImage にだけ別の画像を入れる (渡さなければ元画像)
+from gencommon import comfy as comfy18  # noqa: E402
+(WF / "flf.json").write_text(json.dumps(workflow_flf()), encoding="utf-8")
+
+
+def titled(title):
+    return {"class_type": "LoadImage", "_meta": {"title": title}, "inputs": {"image": "x.png"}}
+
+
+check(kinds.has_last_frame(str(WF / "flf.json")) and not kinds.has_last_frame(str(WF / "i2v.json"))
+      and not kinds.has_last_frame(str(WF / "i2v_ref.json")),
+      "18: ラストフレーム用の LoadImage (タイトルに Last Frame) があるワークフローを見分ける")
+check(all(comfy18.is_last_frame_node(titled(t)) for t in ("Last Frame", "End Image", "final", "ラストフレーム", "最後のコマ"))
+      and not any(comfy18.is_last_frame_node(titled(t)) for t in ("First Frame", "Legend", "Blender", "Start", "")),
+      "18: タイトルの見分け (英語は単語として。Legend・Blender などは拾わない)")
+check(not comfy18.is_reference_node(titled("End Face")) and not kinds.has_reference(str(WF / "flf.json")),
+      "18: ラストフレーム用のものはリファレンスにしない")
+src18 = make_images(TMP / "in18", 2)
+(TMP / "in18" / "last.png").write_bytes(b"\x89PNG-LAST-FRAME-MARK")
+r18 = recipe("18", TMP / "in18", [S(recipes.GEN, workflow=str(WF / "flf.json"))])
+eng18 = engine.Engine()
+eng18.set_machines([a.url])
+run18 = engine.Run.create(r18, src18)
+run18.items[0].last_frame = str(TMP / "in18" / "last.png")
+before = len(a.received)
+eng18.start(run18)
+wait(eng18)
+sent = a.received[before:]
+with_last = [w for w in sent if b"LAST-FRAME-MARK" in a.uploads.get(w["7"]["inputs"]["image"], b"")]
+check(all(i.state == engine.DONE for i in run18.items) and len(sent) == 2 and len(with_last) == 1
+      and b"LAST-FRAME-MARK" not in a.uploads[with_last[0]["1"]["inputs"]["image"]],
+      "18: ラストフレームを渡した件だけ、ラストフレーム用の LoadImage にその画像を送る (始めは元画像)")
+plain = [w for w in sent if w is not with_last[0]]
+check(plain and plain[0]["1"]["inputs"]["image"] == plain[0]["7"]["inputs"]["image"],
+      "18: 渡さなければ、ラストフレーム用の LoadImage にも元画像 (今までどおり)")
+check(engine.Item.from_dict(run18.items[0].to_dict()).last_frame == str(TMP / "in18" / "last.png"),
+      "18: ラストフレームを保存する")
+eng18.stop_threads()
 
 for s in (a, b, slow):
     s.close()

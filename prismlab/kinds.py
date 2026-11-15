@@ -11,7 +11,7 @@ from gencommon.diagram_dialog import LLM_LINE
 from gencommon.set_cards import KIND_COLORS
 
 __all__ = ["KIND_COLORS", "LLM_LINE", "TEXT_COLOR", "IMAGE_COLOR", "kind_of", "color_of", "is_video",
-           "has_reference"]
+           "has_reference", "has_last_frame"]
 
 TEXT_COLOR = "#9aa3b3"  # 文字 (プロンプト) の札
 IMAGE_COLOR = KIND_COLORS["I2I"]  # 入口の画像の札 (画像は I2I と同じ緑)
@@ -44,28 +44,37 @@ def kind_of(workflow_path: str) -> str:
     return kind
 
 
-_ref_cache: dict = {}  # (パスの小文字, 更新日時) → リファレンス用の LoadImage があるか
+_ref_cache: dict = {}  # (何を見るか, パスの小文字, 更新日時) → その LoadImage があるか
 
 
-def has_reference(workflow_path: str) -> bool:
-    """リファレンス画像 (主に顔) を入れる LoadImage があるか (タイトルに reference / face / 顔 など。comfy.reference_nodes)。"""
+def _has(what: str, test, workflow_path: str) -> bool:
     if not workflow_path:
         return False
     try:
         stamp = Path(workflow_path).stat().st_mtime
     except OSError:
         return False
-    key = (workflow_path.lower(), stamp)
+    key = (what, workflow_path.lower(), stamp)
     with _lock:
         if key in _ref_cache:
             return _ref_cache[key]
     try:
-        found = comfy.has_reference(comfy.load_workflow(workflow_path))
+        found = test(comfy.load_workflow(workflow_path))
     except (comfy.ComfyError, OSError, ValueError):
         found = False
     with _lock:
         _ref_cache[key] = found
     return found
+
+
+def has_reference(workflow_path: str) -> bool:
+    """リファレンス画像 (主に顔) を入れる LoadImage があるか (タイトルに reference / face / 顔 など。comfy.reference_nodes)。"""
+    return _has("ref", comfy.has_reference, workflow_path)
+
+
+def has_last_frame(workflow_path: str) -> bool:
+    """ラストフレームを入れる LoadImage があるか (タイトルに last / end / ラスト など。comfy.last_frame_nodes)。"""
+    return _has("last", comfy.has_last_frame, workflow_path)
 
 
 def color_of(kind: str) -> str:

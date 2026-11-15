@@ -24,7 +24,8 @@ from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 
-from fakes import FakeComfy, FakeLLM, make_video, workflow_i2v, workflow_i2v_ref, workflow_t2i  # noqa: E402
+from fakes import (FakeComfy, FakeLLM, make_video, workflow_flf, workflow_i2v, workflow_i2v_ref,  # noqa: E402
+                   workflow_t2i)
 from gencommon import comfy, settings, store  # noqa: E402
 from prismlab import profile, recipes, story, story_view, theme  # noqa: E402
 from prismlab.main import make_icon  # noqa: E402
@@ -47,10 +48,12 @@ wf_dir.mkdir()
 (wf_dir / "Wan I2V.json").write_text(json.dumps(workflow_i2v()), encoding="utf-8")
 (wf_dir / "Flux T2I.json").write_text(json.dumps(workflow_t2i()), encoding="utf-8")
 (wf_dir / "Wan I2V Face.json").write_text(json.dumps(workflow_i2v_ref()), encoding="utf-8")
+(wf_dir / "Wan FLF.json").write_text(json.dumps(workflow_flf()), encoding="utf-8")
 comfy.set_workflows([comfy.Preset("Wan I2V", str(wf_dir / "Wan I2V.json")),
                      comfy.Preset("Flux T2I", str(wf_dir / "Flux T2I.json")),
-                     comfy.Preset("Wan I2V Face", str(wf_dir / "Wan I2V Face.json"))]
-                    + [comfy.Preset() for _ in range(comfy.WORKFLOW_COUNT - 3)])
+                     comfy.Preset("Wan I2V Face", str(wf_dir / "Wan I2V Face.json")),
+                     comfy.Preset("Wan FLF", str(wf_dir / "Wan FLF.json"))]
+                    + [comfy.Preset() for _ in range(comfy.WORKFLOW_COUNT - 4)])
 recipes.set_machines([a.url])
 
 photo = TMP / "ホーム.png"
@@ -91,7 +94,7 @@ assert sv.story is not None and sv.story.name == "雨の駅", "最近開いた�
 s1 = sv.scene
 assert len(sv.scene_cards) == 1 and "元画像がまだ" in sv.scene_cards[0].state.text()
 # 開いた直後から、選ぶ欄が埋まっている (ここが空だと、読み取る・盛る・候補を作るが動かない)
-assert sv.workflow_box.count() == 3 and sv.reader_box.count() > 0 and sv.enhancer_box.count() > 0,     (sv.workflow_box.count(), sv.reader_box.count(), sv.enhancer_box.count())
+assert sv.workflow_box.count() == 4 and sv.reader_box.count() > 0 and sv.enhancer_box.count() > 0,     (sv.workflow_box.count(), sv.reader_box.count(), sv.enhancer_box.count())
 assert Path(s1.workflow).name == "Wan I2V.json", s1.workflow  # 初めは I2V を選んでおく
 
 # 1 シーン目: 手元の画像 → 読み取る → 差し込み → 盛る → 候補 2 本
@@ -348,7 +351,8 @@ sv.cands.setCurrentRow(-1)
 # リファレンス画像 (顔): 対応するワークフローのときだけ選べる
 sv.select(s1)
 pump(0.3)
-assert not sv.ref_pick.isEnabled() and "対応していません" in sv.ref_note.text(), sv.ref_note.text()
+assert not sv.ref_pick.isEnabled() and sv.ref_view.text() == "対応なし", sv.ref_view.text()
+assert "face" in sv.ref_view.toolTip(), "タイトルの付け方は指を置くと出す"
 sv.workflow_box.setCurrentIndex(sv.workflow_box.findData(str(wf_dir / "Wan I2V Face.json")))
 pump(0.5)
 assert sv.ref_pick.isEnabled(), "リファレンス対応のワークフローなら選べる"
@@ -377,8 +381,50 @@ sv._back_to_candidate(newest)
 pump(0.2)
 assert sv.original.toPlainText() == "顔を残して振り向く" and sv.prompt.toPlainText() == newest.prompt
 sv.workflow_box.setCurrentIndex(sv.workflow_box.findData(str(wf_dir / "Wan I2V.json")))
+pump(0.6)
+assert not sv.ref_pick.isEnabled() and "選んだ画像は残っています" in sv.ref_note.text(), sv.ref_note.text()
+
+# ラストフレーム (ファーストフレーム・ラストフレームを指定するワークフロー)
+assert not sv.last_pick.isEnabled() and sv.last_view.text() == "対応なし"
+sv.workflow_box.setCurrentIndex(sv.workflow_box.findData(str(wf_dir / "Wan FLF.json")))
+pump(0.6)  # 描き直しは 300 ms あと
+assert sv.last_pick.isEnabled() and sv.last_view.text() == "なし" and "選んでから" in sv.ref_note.text(), \
+    (sv.last_pick.isEnabled(), sv.last_view.text(), sv.ref_note.text())
+told = []
+real_info = story_view.QMessageBox.information
+story_view.QMessageBox.information = staticmethod(lambda *a, **k: told.append(a[2]))
+before_sent = len(a.received)
+sv.make_b.click()
 pump(0.3)
-assert not sv.ref_pick.isEnabled() and "設定済みの画像は残っています" in sv.ref_note.text()
+assert told and "ラストフレームが決まっていません" in told[-1] and len(a.received) == before_sent and not sv.busy(), \
+    "ラストフレームが決まっていなければ作らずに知らせる"
+# 次のシーンの元画像を追いかける (シーン 2 は「続き」で、シーン 1 の採用の最後のコマ)
+sv._follow_next_last_frame()
+pump(0.5)
+assert s1.last_kind == story.LAST_NEXT and sv.story.last_frame_of(s1) == s2.source
+assert sv.last_view.pixmap() is not None and not sv.last_view.pixmap().isNull(), "次のシーンの元画像を出す"
+assert "次のシーンの元画像を使います" in sv.ref_note.text() and "続き" in sv.ref_note.text(), sv.ref_note.text()
+window.grab().save(str(OUT / "story_last_frame.png"))
+sv.make_b.click()
+wait_engine()
+story_view.QMessageBox.information = real_info
+wf_sent = a.received[before_sent]
+assert Path(s2.source).read_bytes() in a.uploads[wf_sent["7"]["inputs"]["image"]], "ラストフレーム用に次のシーンの元画像"
+assert wf_sent["1"]["inputs"]["image"] != wf_sent["7"]["inputs"]["image"], "始めは元画像 (別の画像)"
+newest_flf = max(s1.candidates, key=lambda c: c.time)
+assert Path(newest_flf.last_frame).name.startswith("last_") and Path(newest_flf.last_frame).parent == \
+    sv.story.scene_dir(s1), ("作る時点の絵を写して記録する", newest_flf.last_frame)
+sv.cands.setCurrentRow(next(i for i in range(sv.cands.count()) if sv.cands.item(i).data(256) == newest_flf.path))
+end = time.time() + 5
+while time.time() < end and (sv.preview_target.pixmap() is None or sv.preview_target.pixmap().isNull()):
+    pump(0.1)
+assert sv.preview_target.isVisible() and not sv.preview_target.pixmap().isNull(), "指定したラストフレームも並べる"
+window.grab().save(str(OUT / "story_last_compare.png"))
+sv._clear_last_frame()
+sv._back_to_candidate(newest)  # プロンプトは前のまま (あとの確かめのため)
+sv.workflow_box.setCurrentIndex(sv.workflow_box.findData(str(wf_dir / "Wan I2V.json")))
+pump(0.6)
+assert s1.last_kind == "" and sv.last_view.text() == "対応なし"
 
 # シーン 3: シーンチェンジ (T2I のワークフローなら元画像なしでも作れる)
 s3 = sv._add_scene(s2, story.CUT)
