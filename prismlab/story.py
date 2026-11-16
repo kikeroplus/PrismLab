@@ -76,6 +76,9 @@ class Scene:
     source_kind: str = ""  # SOURCE_*
     source_from: str = ""  # 元画像を取った動画 (続き・コマのとき。採用が変わったら作り直すため)
     reference: str = ""  # リファレンス画像 (主に顔。シーンのフォルダの reference.png)。ワークフローが対応するときだけ使う
+    # 前のシーンのリファレンスを使う (自分の reference は残すが使わない)。動画を通して同じ顔にするため。
+    # 前のシーンも引き継いでいれば、さらに前へたどる。新しく足すシーンは初めから引き継ぐ
+    ref_inherit: bool = False
     # ラストフレーム (ファーストフレーム・ラストフレームを指定するワークフローのとき)。
     # last_kind が LAST_FILE なら last_frame (シーンのフォルダの last.png)、LAST_NEXT なら次のシーンの元画像を使う
     last_kind: str = ""
@@ -135,6 +138,7 @@ class Scene:
         sec = data.get("seconds")
         s.seconds = float(sec) if isinstance(sec, (int, float)) and not isinstance(sec, bool) and sec > 0 else None
         s.base_prompt = bool(data.get("base_prompt", True))
+        s.ref_inherit = bool(data.get("ref_inherit", False))
         try:
             s.count = max(1, min(9, int(data.get("count") or 3)))
         except (TypeError, ValueError):
@@ -219,7 +223,7 @@ class Story:
     def add_scene(self, after: Optional[Scene] = None, link: str = CONT) -> Scene:
         """シーンを足す (after のすぐあと、なければ最後)。最初のシーンでなければ、つなぎの初めは「続き」。"""
         index = len(self.scenes) if after is None else self.index_of(after) + 1
-        scene = Scene(link=link if index > 0 else CUT)  # 名前は空 (番号だけで見せる)
+        scene = Scene(link=link if index > 0 else CUT, ref_inherit=index > 0)  # 名前は空 (番号だけで見せる)
         prev = self.scenes[index - 1] if index > 0 else None
         if prev is not None:  # 生成の設定は前のシーンのものを引き継ぐ
             scene.workflow, scene.seconds = prev.workflow, prev.seconds
@@ -287,8 +291,23 @@ class Story:
         scene.link = CUT if self.index_of(scene) > 0 else scene.link
         scene.source, scene.source_kind, scene.source_from = str(dest), kind, from_video
 
+    def reference_from(self, scene: Scene) -> Scene:
+        """リファレンスを取ってくるシーン (引き継がなければ自分)。引き継ぐシーンは前のシーンへたどる
+        (最初のシーンは引き継げない)。"""
+        i = self.index_of(scene)
+        while i > 0 and self.scenes[i].ref_inherit:
+            i -= 1
+        return self.scenes[i]
+
+    def reference_of(self, scene: Scene) -> str:
+        """候補を作るときに使うリファレンスのパス (なければ空)。"""
+        ref = self.reference_from(scene).reference
+        return ref if ref and Path(ref).is_file() else ""
+
     def set_reference(self, scene: Scene, path: str) -> None:
-        """リファレンス画像 (主に顔) を決める (シーンのフォルダに PNG で写す)。空なら外す。"""
+        """リファレンス画像 (主に顔) を決める (シーンのフォルダに PNG で写す)。空なら外す。
+        どちらでも、このシーンは前のシーンから引き継ぐのをやめる (自分で決めたので)。"""
+        scene.ref_inherit = False
         if not path:
             scene.reference = ""
             return

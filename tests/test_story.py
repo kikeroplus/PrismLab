@@ -156,6 +156,30 @@ check(story.Scene.from_dict(o.to_dict()).original == o.original, "5d: 元のプ�
 st.set_reference(s3, str(src))
 check(Path(s3.reference) == st.scene_dir(s3) / story.REFERENCE_NAME and Path(s3.reference).is_file(),
       "5e: リファレンス画像はシーンのフォルダの reference.png に写す")
+# 5f. リファレンスを前のシーンから引き継ぐ (たどる・自分で選ぶと外れる・保存)
+rs = story.Story.create(str(TMP / "顔"), "顔")
+r1 = rs.scenes[0]
+r2 = rs.add_scene(r1, story.CUT)
+r3 = rs.add_scene(r2)
+check(not r1.ref_inherit and r2.ref_inherit and r3.ref_inherit, "5f: 新しく足すシーンは初めから引き継ぐ")
+check(rs.reference_of(r3) == "", "5f: 前にもなければ空")
+rs.set_reference(r1, str(src))
+check(rs.reference_of(r2) == r1.reference and rs.reference_of(r3) == r1.reference
+      and rs.reference_from(r3) is r1, "5f: 前へたどって最初のシーンの顔を使う")
+rs.set_reference(r2, str(src))
+check(not r2.ref_inherit and rs.reference_of(r3) == r2.reference and r2.reference != r1.reference,
+      "5f: 自分で選ぶと引き継ぎが外れ、次のシーンはその顔を使う")
+r2.ref_inherit = True
+check(rs.reference_of(r3) == r1.reference, "5f: 引き継ぎに戻すと、自分のものは残しても使わない")
+rs.move_scene(r3, -2)
+check(rs.index_of(r3) == 0 and rs.reference_of(r3) == "", "5f: 最初に動かしたら引き継げない")
+rs.move_scene(r3, 2)
+rs.save()
+again5 = story.Story.load(str(TMP / "顔"))
+check([s.ref_inherit for s in again5.scenes] == [False, True, True]
+      and again5.reference_of(again5.scenes[2]) == r1.reference, "5f: 保存して開き直しても同じ")
+check(not story.Scene.from_dict({"reference": "x"}).ref_inherit, "5f: 前に作った物語のシーンは引き継がない")
+
 c = story.Candidate(str(v1), "盛った文", 2.0, "元の文", s3.reference)
 c2 = story.Candidate.from_dict(c.to_dict())
 check((c2.original, c2.prompt, c2.reference) == ("元の文", "盛った文", s3.reference),

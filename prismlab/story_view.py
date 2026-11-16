@@ -727,16 +727,23 @@ class StoryView(QWidget):
             col.addWidget(view)
             col.addLayout(buttons)
             pair.addLayout(col)
-            return view, buttons
+            return view, buttons, col
 
-        self.ref_view, ref_buttons = column("リファレンス (顔)")
+        self.ref_view, ref_buttons, ref_col = column("リファレンス (顔)")
         self.ref_pick = QPushButton("選ぶ...")
         self.ref_pick.clicked.connect(self._choose_reference)
         self.ref_clear = QPushButton("外す")
         self.ref_clear.clicked.connect(self._clear_reference)
         ref_buttons.addWidget(self.ref_pick)
         ref_buttons.addWidget(self.ref_clear)
-        self.last_view, last_buttons = column("ラストフレーム")
+        self.ref_inherit = QCheckBox("前のシーンと同じ")
+        self.ref_inherit.setToolTip("前のシーンのリファレンス (顔) を使います (動画を通して同じ顔にする)。\n"
+                                    "前のシーンも「前のシーンと同じ」なら、さらに前へたどります。\n"
+                                    "新しく足すシーンは初めから入っています。「選ぶ...」で選ぶと外れます。")
+        self.ref_inherit.clicked.connect(self._toggle_ref_inherit)
+        ref_col.addWidget(self.ref_inherit)
+        self.last_view, last_buttons, last_col = column("ラストフレーム")
+        last_col.addStretch(1)  # リファレンスの側のチェックの分、上をそろえる
         self.last_pick = QToolButton()
         self.last_pick.setText("選ぶ")  # ボタンの矢印でメニューと分かる
         self.last_pick.setToolTip("手元の画像か、次のシーンの元画像 (追いかける) を選びます。")
@@ -1195,9 +1202,15 @@ class StoryView(QWidget):
         self._changed()
 
     def _clear_reference(self) -> None:
-        if self.scene is not None and self.scene.reference:
-            self.story.set_reference(self.scene, "")
+        if self.scene is not None and (self.scene.reference or self.scene.ref_inherit):
+            self.story.set_reference(self.scene, "")  # 引き継いでいたら、引き継ぐのもやめる
             self._changed()
+
+    def _toggle_ref_inherit(self, checked: bool) -> None:
+        if self.scene is None or self.story.index_of(self.scene) == 0:
+            return
+        self.scene.ref_inherit = checked
+        self._changed()
 
     def _choose_last_frame(self) -> None:
         if self.scene is None or self._busy_here(self.scene):
@@ -1566,8 +1579,7 @@ class StoryView(QWidget):
                 Path(source).write_text(s.send_text, encoding="utf-8")
             except OSError:
                 pass
-        reference = s.reference if s.reference and Path(s.reference).is_file() and kinds.has_reference(s.workflow) \
-            else ""
+        reference = self.story.reference_of(s) if kinds.has_reference(s.workflow) else ""
         last_frame = ""
         if kinds.has_last_frame(s.workflow):
             last_frame = self.story.last_frame_of(s)
@@ -2116,14 +2128,20 @@ class StoryView(QWidget):
                                      "画像を選ぶか、ここにドラッグ\n(T2I のワークフローなら元画像なしでも作れます)")
         self.source_note.setText(story.SOURCE_TITLES.get(s.source_kind, "") if s.source else "")
         can_ref = kinds.has_reference(s.workflow)
-        has_ref = bool(s.reference) and Path(s.reference).is_file()
+        inherit = s.ref_inherit and not first
+        ref = self.story.reference_of(s)
+        has_ref = bool(ref)
         self.ref_pick.setEnabled(can_ref)
-        self.ref_clear.setEnabled(has_ref)
-        self._put_small(self.ref_view, s.reference if has_ref else "", "なし" if can_ref else "対応なし")
-        ref_note = ("リファレンス用の LoadImage に入れます。" if has_ref else
+        self.ref_clear.setEnabled(bool(s.reference) or inherit)
+        self.ref_inherit.setEnabled(not first)
+        self.ref_inherit.setChecked(inherit)
+        src = self.story.reference_from(s)
+        self._put_small(self.ref_view, ref, ("前のシーンもなし" if inherit else "なし") if can_ref else "対応なし")
+        ref_note = ((f"シーン {src.label(self.story.index_of(src))} のリファレンスを使います。" if inherit
+                     else "リファレンス用の LoadImage に入れます。") if has_ref else
                     "リファレンスを選ばなければ、リファレンス用の LoadImage にも元画像を入れます。") if can_ref else \
             ("リファレンス: このワークフローは対応していません" + (" (選んだ画像は残っています)。" if has_ref else "。"))
-        self.ref_view.setToolTip((s.reference + "\n\n" if has_ref else "") +
+        self.ref_view.setToolTip((ref + "\n\n" if has_ref else "") +
                                  "LoadImage のタイトルに「face」「reference」「顔」「参照」などを入れたワークフローで使えます。")
         # ラストフレーム (ファーストフレーム・ラストフレームを指定するワークフロー)
         can_last = kinds.has_last_frame(s.workflow)

@@ -430,6 +430,25 @@ assert s1.last_kind == "" and sv.last_view.text() == "対応なし"
 s3 = sv._add_scene(s2, story.CUT)
 pump(0.3)
 assert s3.link == story.CUT and s3.source == "" and "元画像がまだ" in sv.scene_cards[2].state.text()
+# リファレンス (顔) は前のシーンと同じ: シーン 3 → 2 → 1 とたどって、シーン 1 の顔を使う
+old_wf = sv.workflow_box.currentData()
+sv.workflow_box.setCurrentIndex(sv.workflow_box.findData(str(wf_dir / "Wan I2V Face.json")))
+pump(0.6)
+assert s2.ref_inherit and s3.ref_inherit and sv.ref_inherit.isChecked() and sv.ref_inherit.isEnabled()
+assert sv.ref_view.pixmap() is not None and not sv.ref_view.pixmap().isNull(), "シーン 1 の顔を出す"
+assert "シーン 1 ホーム のリファレンス" in sv.ref_note.text(), sv.ref_note.text()
+window.grab().save(str(OUT / "story_ref_inherit.png"))
+sv.ref_inherit.click()
+pump(0.6)
+assert not s3.ref_inherit and sv.ref_view.text() == "なし", "外すと自分のもの (なし)"
+sv.ref_inherit.click()
+pump(0.6)
+assert s3.ref_inherit and sv.story.reference_of(s3) == s1.reference
+sv.workflow_box.setCurrentIndex(sv.workflow_box.findData(old_wf))
+pump(0.6)
+sv.select(s1)
+pump(0.3)
+assert not sv.ref_inherit.isEnabled() and not sv.ref_inherit.isChecked(), "最初のシーンは引き継げない"
 sv.select(s1)
 pump(0.5)
 window.grab().save(str(OUT / "story_board.png"))
