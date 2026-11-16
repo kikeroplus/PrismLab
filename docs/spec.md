@@ -199,6 +199,7 @@ PromptWordCrafter・ImageMimicArt・J-Rate の「作る」部分をまとめる�
 - 右クリックの **「PrismLab に送る ▸」**: 量産のレシピの一覧 (`%APPDATA%\PrismLab\recipes.json` を送る側が読む。PrismLab が動いていなくても出せる) と、物語に送る項目。
   - J-Rate (選んでいる画像。動画は送らない): レシピ / **物語: 新しいシーンにする (n 枚)** / 1 枚のときだけ **物語: 選んでいるシーンの 元画像に / リファレンス (顔) に / ラストフレームに**。
   - PWC (選んでいるテキスト): レシピ / 1 件のときだけ **物語: 選んでいるシーンの元のプロンプトに**。送る前に、編集中の本文を保存する (PrismLab はファイルを読むので)。
+  - PWC の生成結果の帯 (選んでいる画像。動画は送らない): J-Rate と同じ項目。帯は新しい順なので、作った順に並べて送る。
 - 受け渡し: PrismLab の 2 重起動を止めるパイプ (`\\.\pipe\PrismLab-(ユーザー名)`) に JSON を 1 行 (改行で終わる) 書き、PrismLab が読み終えて切るまで待つ (送る側が先に切ると、読まれずに落ちることがある。2026-11-16 のテストで分かった)。PrismLab は改行まで読んだら処理して切る。改行のないもの (2 重起動の `show`) は、切られたときに読む。PrismLab が動いていなければ、JSON を一時フォルダに書いて `PrismLab.exe --send (JSON のパス)` で起動する (PrismLab.exe はデスクトップの `Application`、なければ `AI_projects\PrismLab\dist`)。
   - JSON: `{"cmd": "send", "from": "J-Rate", "target": "recipe", "recipe": "★から動画", "index": 0, "files": [...]}` / `{"cmd": "send", "from": "J-Rate", "target": "story", "slot": "scenes" | "source" | "reference" | "last" | "original", "files": [...]}`。レシピは `index` の名前が `recipe` と同じならそれ、違えば同じ名前の最初のもの (送るまでに並べ替えたとき)。
   - それまでの `show` (2 つ目を起動したときに前に出す) はそのまま。`PrismLab.exe --send` で起動したものが 2 つ目だったときは、JSON を動いているほうに渡して終わる。
