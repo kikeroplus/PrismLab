@@ -1,4 +1,4 @@
-"""一覧のサムネールにカーソルを乗せると、横に大きく出す (量産ラインの「結果」)。
+"""一覧のサムネールにカーソルを乗せると、上に大きく出す (量産ラインの「結果」)。
 
 乗せて少し待つと出し、離れる・押す・ホイール・キー・ほかのウィンドウに移ると消す。
 大きい絵は別のサムネール (PREVIEW_SIZE) を裏で作る。出来るまでは小さいサムネールを伸ばして出す。
@@ -119,15 +119,15 @@ class HoverPreview(QObject):
         self.popup.raise_()
 
     def _place(self) -> None:
-        """項目の右に出す。入らなければ左、それでもだめなら画面の中に収める。"""
+        """項目の上に、左右は項目の真ん中にそろえて出す。上に入らなければ下、それでもだめなら画面の中に収める。"""
         item = QRect(self.view.viewport().mapToGlobal(self._rect.topLeft()), self._rect.size())
         screen = QGuiApplication.screenAt(item.center()) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
         w, h = self.popup.width(), self.popup.height()
-        x = item.right() + GAP
-        if x + w > area.right():
-            x = item.left() - GAP - w
+        x = item.center().x() - w // 2
         x = max(area.left(), min(x, area.right() - w))
-        y = item.center().y() - h // 2
+        y = item.top() - GAP - h
+        if y < area.top():
+            y = item.bottom() + GAP
         y = max(area.top(), min(y, area.bottom() - h))
         self.popup.move(x, y)

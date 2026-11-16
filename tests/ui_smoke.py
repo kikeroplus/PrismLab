@@ -272,7 +272,11 @@ popup = lv.hover.popup
 first = lv.results.item(0).data(Qt.ItemDataRole.UserRole)
 assert popup.isVisible() and Path(first).name in popup.caption.text(), popup.caption.text()
 assert popup.image.pixmap().width() > 200 or popup.image.pixmap().height() > 200, popup.image.pixmap().size()
-assert lv.results.item(0).toolTip() == "", "成功したものはツールチップを出さない (拡大と重ねない)"
+item_top = vp.mapToGlobal(lv.results.visualItemRect(lv.results.item(0)).topLeft()).y()
+top_room = item_top - window.screen().availableGeometry().top()
+if top_room > popup.height() + 8:  # 上に入るなら上 (画面の大きさしだい)
+    assert popup.geometry().bottom() < item_top, (popup.geometry(), item_top)
+assert lv.results.item(0).toolTip() == "","成功したものはツールチップを出さない (拡大と重ねない)"
 popup.grab().save(str(OUT / "prismlab_hover.png"))
 hover(1)
 pump(0.2)
