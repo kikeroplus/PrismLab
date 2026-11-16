@@ -82,6 +82,7 @@ class LineView(QWidget):
             self.recipes = recipes.default_recipes()
         self.index = min(max(recipes.last_index(), 0), len(self.recipes) - 1)
         self.thumbs = ThumbCache(160, self)
+        self.story_batch_busy = lambda: False  # 物語のバッチが動いているか (ウィンドウが入れる)
         self.thumbs.changed.connect(lambda _p: self._schedule())
         self._scanned_files: list = []  # 入口のフォルダの (パス, ★の数)
         self._scanned_folder = None  # _scanned_files を読んだフォルダ
@@ -912,6 +913,10 @@ class LineView(QWidget):
     # ------------------------------------------------------------------
     def _ready(self, title: str, need_folder: bool = True) -> bool:
         """始められるか (入口・ステップ・台)。だめなら理由を出して False。"""
+        if self.story_batch_busy():
+            QMessageBox.information(self, title, "物語をバッチで作っています (同じ台を使うので、同時には動かしません)。"
+                                    "終わるか止めてからにしてください。")
+            return False
         r = self.recipe
         if r.single:
             if not r.image or not Path(r.image).is_file():

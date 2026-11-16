@@ -14,14 +14,14 @@ from typing import Optional
 
 from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFrame, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem,
                                QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider,
                                QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from gencommon import comfy, enhancer, inserts, reader, store
 
-from . import engine, highlight, kinds, recipes, recycle, story, theme, translate
+from . import engine, highlight, kinds, recipes, recycle, story, story_batch, theme, translate
 from .dialogs import ask_text
 from .thumbs import ThumbCache
 from .widgets import AddButton
@@ -604,14 +604,35 @@ class StoryView(QWidget):
         self.pick_b.setToolTip("前に元画像などを選んだフォルダを J-Rate で開きます。画像を選んで右クリックの"
                                "「PrismLab に送る」で、新しいシーンや、選んでいるシーンの元画像などに入ります。")
         self.pick_b.clicked.connect(self._pick_in_jrate)
+        self.batch_b = QPushButton("バッチで作る...")
+        self.batch_b.setToolTip("最初の画像とカットごとのプロンプトから、物語をまとめて作ります (試し)。")
+        self.batch_b.clicked.connect(self._start_batch)
+        self.new_b, self.open_b = new_b, open_b
         top.addWidget(QLabel("物語"))
         top.addWidget(self.story_box)
         top.addWidget(new_b)
         top.addWidget(open_b)
+        top.addWidget(self.batch_b)
         top.addStretch(1)
         for b in (self.pick_b, self.play_b, self.adopted_b, self.jrate_b):
             top.addWidget(b)
         root.addLayout(top)
+
+        # バッチで作っているあいだの帯
+        self.batch_bar = QWidget()
+        bar = QHBoxLayout(self.batch_bar)
+        bar.setContentsMargins(8, 4, 8, 4)
+        self.batch_label = QLabel()
+        self.batch_label.setStyleSheet("color: black; font-weight: bold; background: transparent;")
+        self.batch_stop = QPushButton("バッチを止める")
+        self.batch_stop.clicked.connect(self._stop_batch)
+        bar.addWidget(self.batch_label, 1)
+        bar.addWidget(self.batch_stop)
+        self.batch_bar.setStyleSheet(f"background: {theme.ACCENT}; border-radius: 4px;")
+        self.batch_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.batch_bar.hide()
+        root.addWidget(self.batch_bar)
+        self.line_busy = lambda: False  # 量産ラインが動いているか (ウィンドウが入れる。バッチと同時に動かさない)
 
         # 絵コンテ
         self.board_host = QWidget()
@@ -651,6 +672,10 @@ class StoryView(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
         self._save_timer.timeout.connect(self._save)
+
+        self.batch = story_batch.BatchRunner(self)  # engine.finished は、この画面の _on_finished のあとに受ける
+        self.batch.progress.connect(self.batch_label.setText)
+        self.batch.done.connect(self._batch_done)
 
         self._fill_stories()
         recent = story.recent()
@@ -1530,26 +1555,31 @@ class StoryView(QWidget):
 
     def start_job(self, job, workflow: str, prompt: str, seconds, base: bool, count: int, source: str,
                   out_dir: str, reference: str = "", original: str = "", last_frame: str = "") -> bool:
-        """候補 (または T2I の元画像) を作り始める。一度に 1 つだけ。"""
+        """候補 (または T2I の元画像) を作り始める。一度に 1 つだけ。始められなければ窓で知らせる。"""
+        problem = self._try_start_job(job, workflow, prompt, seconds, base, count, source, out_dir,
+                                      reference, original, last_frame)
+        if problem:
+            QMessageBox.information(self, "候補を作る", problem)
+        return not problem
+
+    def _try_start_job(self, job, workflow: str, prompt: str, seconds, base: bool, count: int, source: str,
+                       out_dir: str, reference: str = "", original: str = "", last_frame: str = "") -> str:
+        """start_job の中身。始められなければ理由を返す (バッチは窓を出さずに止めるため)。"""
         run = self.engine.run
         if self.engine.active and run is not None and run.unfinished:
-            QMessageBox.information(self, "候補を作る", "ほかのシーンの候補を作っています。終わってからにしてください。")
-            return False
+            return "ほかのシーンの候補を作っています。終わってからにしてください。"
         machines = recipes.machines()
         if not machines:
-            QMessageBox.warning(self, "候補を作る", "使う台が決まっていません (量産ラインの「台の設定...」で選んでください)。")
-            return False
+            return "使う台が決まっていません (量産ラインの「台の設定...」で選んでください)。"
         if not workflow:
-            QMessageBox.warning(self, "候補を作る", "ワークフローを選んでください (「生成の設定」で登録します)。")
-            return False
+            return "ワークフローを選んでください (「生成の設定」で登録します)。"
         self.engine.set_machines(machines)
         recipe = recipes.Recipe(name=self.story.name, output_dir=out_dir, inherit=False,
                                 stages=[recipes.Stage(recipes.GEN, workflow=workflow, seconds=seconds, base_prompt=base)])
         try:
             new = engine.Run.create(recipe, [Path(source)] * count)
         except (ValueError, comfy.ComfyError) as exc:
-            QMessageBox.warning(self, "候補を作る", str(exc))
-            return False
+            return str(exc)
         for it in new.items:
             it.text = prompt or None  # 空ならワークフローに書かれたプロンプトのまま
             it.reference = reference
@@ -1558,19 +1588,25 @@ class StoryView(QWidget):
         self._job_original, self._job_reference, self._job_last = original, reference, last_frame
         self.engine.start(new)
         self.refresh()
-        return True
+        return ""
 
     def _make_candidates(self) -> None:
         s = self.scene
         if s is None:
             return
+        self._gen_settings_changed()
+        problem = self.make_candidates_for(s)
+        if problem:
+            QMessageBox.information(self, "候補を作る", problem)
+
+    def make_candidates_for(self, s: story.Scene) -> str:
+        """そのシーンの候補を、シーンに決めてある設定で作り始める。始められなければ理由を返す
+        (「候補を作る」とバッチから。欄の値は先にシーンに入れておく)。"""
         if not s.source or not Path(s.source).is_file():
             kind = kinds.kind_of(s.workflow)
             if kind.startswith("I") or not kind:
-                QMessageBox.information(self, "候補を作る", "先に元画像を決めてください" +
-                                        (" (「続き」は、前のシーンで採用すると入ります)。" if s.link == story.CONT else "。"))
-                return
-        self._gen_settings_changed()
+                return "先に元画像を決めてください" + \
+                    (" (「続き」は、前のシーンで採用すると入ります)。" if s.link == story.CONT else "。")
         folder = self.story.scene_dir(s)
         folder.mkdir(parents=True, exist_ok=True)
         source = s.source if s.source and Path(s.source).is_file() else str(folder / "prompt.txt")
@@ -1586,21 +1622,21 @@ class StoryView(QWidget):
             if not last_frame:  # 渡さないと始めも終わりも元画像になるので、作らずに知らせる
                 why = ("次のシーンの元画像がまだありません" if s.last_kind == story.LAST_NEXT
                        else "ラストフレームが決まっていません")
-                QMessageBox.information(self, "候補を作る",
-                                        f"このワークフローはラストフレームを指定するものですが、{why}。\n"
-                                        "左の「ラストフレーム」の「選ぶ」で、手元の画像か次のシーンの元画像を選んでください。")
-                return
+                return (f"このワークフローはラストフレームを指定するものですが、{why}。\n"
+                        "左の「ラストフレーム」の「選ぶ」で、手元の画像か次のシーンの元画像を選んでください。")
             if s.last_kind == story.LAST_NEXT:
                 # 次のシーンの元画像は書き直されることがあるので、作る時点の絵を写して使う (候補の記録もこれを指す)
                 try:
                     last_frame = self.story.freeze_last_frame(s, last_frame)
                 except story.StoryError as exc:
-                    QMessageBox.warning(self, "候補を作る", str(exc))
-                    return
-        if self.start_job(("cand", s.id), s.workflow, s.send_text, s.seconds, s.base_prompt, s.count, source,
-                          str(folder), reference=reference, original=s.original, last_frame=last_frame):
+                    return str(exc)
+        problem = self._try_start_job(("cand", s.id), s.workflow, s.send_text, s.seconds, s.base_prompt, s.count,
+                                      source, str(folder), reference=reference, original=s.original,
+                                      last_frame=last_frame)
+        if not problem:
             s.record("候補に送った文", s.send_text)
         self._save()
+        return problem
 
     def _stop_job(self) -> None:
         if self.engine.active:
@@ -1967,6 +2003,8 @@ class StoryView(QWidget):
 
     def receive(self, files: list, slot: str, sender: str = "") -> str:
         """ほかのアプリから送られたもの (spec 5 章)。入れられなければ理由を返す。"""
+        if self.batch.active:
+            return "物語をバッチで作っています。終わるか止めてから、もう一度送ってください。"
         if self.story is None:
             return "物語を開いていません。PrismLab の「物語」で物語を開いてから、もう一度送ってください。"
         found = [f for f in files if Path(f).is_file()]
@@ -2228,6 +2266,71 @@ class StoryView(QWidget):
                     item.setIcon(QIcon(_framed(pix, CAND_ICON, OK_COLOR if path == s.adopted else "")))
         self._show_candidate()
 
+    # ------------------------------------------------------------------
+    # バッチ (story_batch.py)
+    # ------------------------------------------------------------------
+    def _start_batch(self) -> None:
+        if self.batch.active:
+            return
+        if self.busy():
+            QMessageBox.information(self, "バッチ", "候補を作っています。終わってからにしてください。")
+            return
+        if self.line_busy():
+            QMessageBox.information(self, "バッチ", "量産ラインが動いています (同じ台を使うので、同時には動かしません)。"
+                                    "終わるか止めてからにしてください。")
+            return
+
+        def defaults(plan: story_batch.Plan) -> None:
+            if self.story is not None and not plan.parent:
+                plan.parent = str(Path(self.story.folder).parent)
+            if self.scene is not None and not plan.workflow:
+                plan.workflow = self.scene.workflow
+            if self.scene is not None and not plan.image and self.scene.source:
+                plan.image = self.scene.source
+
+        plan = story_batch.ask_plan(self, defaults)
+        if plan is None:
+            return
+        self._save()
+        self._lock_for_batch(True)
+        self.batch.start(plan)
+
+    def _stop_batch(self) -> None:
+        self.batch.stop()
+
+    def _lock_for_batch(self, on: bool) -> None:
+        """バッチのあいだは見るだけ (物語の切り替え・シーンの編集・候補の操作はしない)。"""
+        for w in (self.story_box, self.new_b, self.open_b, self.batch_b, self.board_host, self.detail):
+            w.setEnabled(not on)
+        self.batch_bar.setVisible(on)
+        if on:
+            self.batch_label.setText("バッチを始めます…")
+
+    def _batch_done(self, summary: str) -> None:
+        self._lock_for_batch(False)
+        self._fill_stories()
+        self.refresh(rebuild=True, load=True)
+        self.status.emit("バッチが終わりました。" + summary.replace("\n", " "))
+        window = self.window()
+        if not window.isActiveWindow():
+            QApplication.alert(window)
+        QMessageBox.information(self, "バッチが終わりました", summary)
+
+    def open_batch_story(self, folder: str) -> None:
+        """バッチが作った物語を開く (見せるだけ。編集はバッチが終わるまでさせない)。"""
+        self.open_folder(folder, quiet=True)
+
+    def scene_text_changed(self, scene: story.Scene) -> None:
+        """バッチがシーンの送るプロンプトを書いたとき。"""
+        self._save()
+        if scene is self.scene:
+            self.refresh(load=True)
+
+    def batch_adopted(self) -> None:
+        """バッチが候補を採用したとき (次のシーンの元画像も出来ている)。"""
+        self._save()
+        self.refresh(rebuild=True)
+
     def settings_changed(self) -> None:
         """生成・読み取り・エンハンサーの設定を変えたとき: 選ぶ欄を作り直す (選んでいたものは残す)。"""
         if self.story is not None:
@@ -2235,9 +2338,12 @@ class StoryView(QWidget):
 
     def busy(self) -> bool:
         run = self.engine.run
-        return self.engine.active and run is not None and run.unfinished > 0
+        return self.batch.active or (self.engine.active and run is not None and run.unfinished > 0)
 
     def shutdown(self) -> None:
+        if self.batch.active:
+            self.batch.done.disconnect(self._batch_done)  # 閉じるときは「終わりました」の窓を出さない
+            self.batch.stop()
         self._save()
         if self.busy():
             self.engine.discard()
