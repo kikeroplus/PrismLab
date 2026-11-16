@@ -287,6 +287,61 @@ while time.time() < end and proc.poll() is None:
 pump(0.3)
 check(proc.returncode == 0 and len(sv.story.scenes) == 9, "2 重起動 (show) は前に出すだけ")
 
+# 6. 量産ラインの結果を右クリックで物語の最後に足す
+from PySide6.QtWidgets import QMenu  # noqa: E402
+
+from prismlab import line_view  # noqa: E402
+
+menus = []
+
+
+class RecordMenu(QMenu):
+    def exec(self, *a, **k):  # 開かずに覚えるだけ
+        menus.append(self)
+
+
+line_view.QMenu = RecordMenu
+window.tabs.setCurrentWidget(lv)
+lv.refresh()
+pump(0.5)
+rows = [lv.results.item(i) for i in range(lv.results.count())]
+image_rows = [it for it in rows if str(it.data(Qt.ItemDataRole.UserRole)).lower().endswith(recipes.IMAGE_EXTS)]
+video_rows = [it for it in rows if not str(it.data(Qt.ItemDataRole.UserRole)).lower().endswith(recipes.IMAGE_EXTS)]
+check(len(image_rows) >= 2 and video_rows, f"(結果に画像 {len(image_rows)}・動画 {len(video_rows)})")
+lv.results.clearSelection()
+for it in (image_rows[0], image_rows[1], video_rows[0]):  # 新しいほうから選ぶ
+    it.setSelected(True)
+lv._result_menu(lv.results.visualItemRect(image_rows[0]).center())
+act = [a for a in menus[-1].actions() if "物語の最後" in a.text()][0]
+check(act.isEnabled() and "(2 枚)" in act.text(), act.text())
+for it, color in ((image_rows[0], "red"), (image_rows[1], "blue")):  # 偽の ComfyUI の画像は同じ絵なので塗り分ける
+    img = QImage(64, 64, QImage.Format.Format_RGB32)
+    img.fill(QColor(color))
+    img.save(str(it.data(Qt.ItemDataRole.UserRole)))
+warnings.clear()
+before = len(sv.story.scenes)
+act.trigger()
+pump(0.3)
+added = sv.story.scenes[before:]
+check(len(added) == 2 and all(s.link == story.CUT and s.source_kind == story.SOURCE_FILE for s in added),
+      "選んだ画像だけを、シーンチェンジ・手元の画像のシーンとして最後に足す")
+def pixels(path) -> bytes:
+    img = QImage(str(path)).convertToFormat(QImage.Format.Format_RGB32)
+    return bytes(img.constBits())
+
+
+expected = [pixels(it.data(Qt.ItemDataRole.UserRole)) for it in (image_rows[1], image_rows[0])]
+check(expected[0] != expected[1], "(2 枚の絵は違う)")
+check([pixels(s.source) for s in added] == expected, "作った順 (一覧の下から) に足す")
+check(window.tabs.currentWidget() is lv and "最後にシーンを 2 個" in window.statusBar().currentMessage(),
+      "タブは量産ラインのまま、ステータスバーで知らせる")
+check(not warnings, "警告は出ない")
+lv.results.clearSelection()
+video_rows[0].setSelected(True)
+lv._result_menu(lv.results.visualItemRect(video_rows[0]).center())
+act = [a for a in menus[-1].actions() if "物語の最後" in a.text()][0]
+check(not act.isEnabled(), "動画だけなら押せない")
+
 window.story.shutdown()
 window.engine.stop_threads()
 print(f"\nすべて OK ({len(ok)})  画像: {OUT}")

@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
 
         self.line.status.connect(self.show_status)
         self.story.status.connect(self.show_status)
+        self.line.to_story.connect(self._line_to_story)
         self.statusBar().showMessage(notice or "準備ができました。", 8000)
         settings.restore_geometry(self)
 
@@ -90,6 +91,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "PrismLab に送る", problem)
         else:
             self.tabs.setCurrentWidget(tab)
+
+    def _line_to_story(self, files: list) -> None:
+        """量産ラインの結果の画像を、開いている物語の最後にシーンとして足す。続けて足せるようにタブはそのまま。"""
+        opened = self.story.story
+        before = len(opened.scenes) if opened is not None else 0
+        problem = self.story.receive(files, "scenes", "量産ライン")
+        added = len(opened.scenes) - before if opened is not None else 0
+        if added:
+            self.show_status(f"物語「{opened.name}」の最後にシーンを {added} 個足しました (シーンチェンジ・手元の画像)。")
+        if problem:
+            QMessageBox.warning(self, "物語に足す", problem)
 
     # 設定の窓 (GenCommon のもの。3 つのアプリと共有の登録) ---------------------
     def _comfy_settings(self) -> None:

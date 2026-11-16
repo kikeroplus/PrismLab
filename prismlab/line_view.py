@@ -70,6 +70,7 @@ class _Scan:
 
 class LineView(QWidget):
     status = Signal(str)  # ステータスバーに出す文
+    to_story = Signal(list)  # 結果の画像を、開いている物語の最後にシーンとして足す
     _scanned = Signal(int, str, list)
 
     def __init__(self, eng: engine.Engine, parent=None):
@@ -196,6 +197,9 @@ class LineView(QWidget):
         self.results.setMovement(QListView.Movement.Static)
         self.results.setWordWrap(True)
         self.results.setUniformItemSizes(True)
+        self.results.setSelectionMode(QListView.SelectionMode.ExtendedSelection)  # Ctrl・Shift で複数
+        self.results.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results.customContextMenuRequested.connect(self._result_menu)
         self.results.itemDoubleClicked.connect(self._open_result)
         self.results.currentItemChanged.connect(lambda *_: self._refresh_prompt())
         self.prompt_view = QTextBrowser()  # 選んだ結果 (試作なら今の件) の元・読み取った文・盛った文
@@ -1056,6 +1060,29 @@ class LineView(QWidget):
         path = item.data(Qt.ItemDataRole.UserRole)
         if path and Path(path).exists():
             os.startfile(path)  # noqa: S606
+
+    def _result_menu(self, pos) -> None:
+        clicked = self.results.itemAt(pos)
+        if clicked is not None and not clicked.isSelected():
+            self.results.setCurrentItem(clicked)  # 選んでいないものの上なら、それだけを選び直す
+        picked = [i for i in self.results.selectedItems() if not i.data(Qt.ItemDataRole.UserRole + 1)]  # 失敗は除く
+        # 一覧は新しい順なので、下から (作った順に) 足す
+        picked.sort(key=self.results.row, reverse=True)
+        images = [str(i.data(Qt.ItemDataRole.UserRole)) for i in picked
+                  if str(i.data(Qt.ItemDataRole.UserRole)).lower().endswith(recipes.IMAGE_EXTS)]
+        menu = QMenu(self)
+        act = menu.addAction(f"物語の最後にシーンとして足す ({len(images)} 枚)" if images
+                             else "物語の最後にシーンとして足す (画像を選んでください)")
+        act.setEnabled(bool(images))
+        act.triggered.connect(lambda: self.to_story.emit(images))
+        menu.addSeparator()
+        current = clicked if clicked is not None and not clicked.data(Qt.ItemDataRole.UserRole + 1) else None
+        if current is not None:
+            path = str(current.data(Qt.ItemDataRole.UserRole))
+            menu.addAction("開く", lambda: self._open_result(current))
+            menu.addAction("エクスプローラーで表示",
+                           lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(path)]))  # noqa: S603,S607
+        menu.exec(self.results.mapToGlobal(pos))
 
     def _refresh_results(self, items: list) -> None:
         entries = []  # (時刻, パス, 失敗の理由, 見出し, (件の番号, 出力の番号 / -1 = 失敗))

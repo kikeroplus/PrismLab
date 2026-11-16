@@ -1927,8 +1927,9 @@ class StoryView(QWidget):
                 break
         QTimer.singleShot(0, lambda: self._add_image_scenes(paths, after))
 
-    def _add_image_scenes(self, paths: list, after: Optional[story.Scene] = None) -> str:
-        """画像を 1 枚ずつ、シーンチェンジ・手元の画像のシーンにして足す (after のあと、なければ最後)。"""
+    def _add_image_scenes(self, paths: list, after: Optional[story.Scene] = None, warn: bool = True) -> str:
+        """画像を 1 枚ずつ、シーンチェンジ・手元の画像のシーンにして足す (after のあと、なければ最後)。
+        足せなかった理由を返す。warn = その理由をここで知らせる (呼んだ側が知らせるなら False)。"""
         added = []
         error = ""
         for path in paths:
@@ -1948,7 +1949,7 @@ class StoryView(QWidget):
             self._changed(rebuild=True)
             self.refresh(load=True)
             self.status.emit(f"シーンを {len(added)} 個足しました (シーンチェンジ・手元の画像)。")
-        if error:
+        if error and warn:
             QMessageBox.warning(self, "シーンを足す", error)
         return error
 
@@ -1964,7 +1965,7 @@ class StoryView(QWidget):
             if not images:
                 return "送れるのは画像だけです。"
             self._save()
-            return self._add_image_scenes(images) or ""
+            return self._add_image_scenes(images, warn=False) or ""
         if self.scene is None:
             return "シーンを選んでいません。"
         if self.job is not None and self.job[1] == self.scene.id and self.engine.active:
