@@ -247,6 +247,40 @@ lv.mode_folder.click()
 pump(0.5)
 assert lv.inherit_box.isEnabled() and lv.inherit_box.isChecked()
 
+# 結果のサムネールに乗せると、横に大きく出す
+from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QMouseEvent  # noqa: E402
+
+window.activateWindow()
+pump(0.3)
+vp = lv.results.viewport()
+
+
+def hover(row):
+    center = QPointF(lv.results.visualItemRect(lv.results.item(row)).center())
+    QApplication.sendEvent(vp, QMouseEvent(QEvent.Type.MouseMove, center, vp.mapToGlobal(center),
+                                           Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                                           Qt.KeyboardModifier.NoModifier))
+
+
+assert lv.results.count() >= 2 and window.isActiveWindow()
+hover(0)
+pump(0.1)
+assert not lv.hover.popup.isVisible(), "すぐには出さない"
+pump(1.0)
+popup = lv.hover.popup
+first = lv.results.item(0).data(Qt.ItemDataRole.UserRole)
+assert popup.isVisible() and Path(first).name in popup.caption.text(), popup.caption.text()
+assert popup.image.pixmap().width() > 200 or popup.image.pixmap().height() > 200, popup.image.pixmap().size()
+assert lv.results.item(0).toolTip() == "", "成功したものはツールチップを出さない (拡大と重ねない)"
+popup.grab().save(str(OUT / "prismlab_hover.png"))
+hover(1)
+pump(0.2)
+assert Path(lv.results.item(1).data(Qt.ItemDataRole.UserRole)).name in popup.caption.text(), "出ているあいだは隣へすぐ移る"
+QApplication.sendEvent(vp, QEvent(QEvent.Type.Leave))
+pump(0.1)
+assert not popup.isVisible(), "離れたら消す"
+
 window.engine.stop_threads()
 for s in (a, b, llm):
     s.close()

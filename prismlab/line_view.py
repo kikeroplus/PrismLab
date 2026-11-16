@@ -23,6 +23,7 @@ from gencommon import comfy, inserts
 
 from . import engine, kinds, rating, recipes, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
+from .hover_preview import HoverPreview
 from .thumbs import MOVIE_EXTS, ThumbCache
 from .widgets import AddButton, Card, InsertArrow, MachineCard, io_html
 
@@ -201,6 +202,9 @@ class LineView(QWidget):
         self.results.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results.customContextMenuRequested.connect(self._result_menu)
         self.results.itemDoubleClicked.connect(self._open_result)
+        # 乗せると大きく出す (失敗の項目は出さない)
+        self.hover = HoverPreview(self.results, lambda index: "" if index.data(Qt.ItemDataRole.UserRole + 1)
+                                  else index.data(Qt.ItemDataRole.UserRole), self.thumbs)
         self.results.currentItemChanged.connect(lambda *_: self._refresh_prompt())
         self.prompt_view = QTextBrowser()  # 選んだ結果 (試作なら今の件) の元・読み取った文・盛った文
         self.prompt_view.setFixedWidth(380)
@@ -1095,6 +1099,7 @@ class LineView(QWidget):
         key = tuple((e[1], e[2]) for e in entries)
         if key != self._results_key:
             self._results_key = key
+            self.hover.hide()  # 並びが変わるので、出している拡大は消す
             self.results.clear()
             self._result_items = {}
             for _t, path, error, title, where in entries:
@@ -1102,7 +1107,7 @@ class LineView(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, path)
                 item.setData(Qt.ItemDataRole.UserRole + 1, error)
                 item.setData(Qt.ItemDataRole.UserRole + 2, where)
-                item.setToolTip(error or path)
+                item.setToolTip(error)  # 成功したものは、乗せると拡大に名前を出す (ツールチップと重ねない)
                 # 初めから枠の大きさを持たせる。アイコンなし (サムネールの読み込み中) で測られると、
                 # 文字だけの高さで並べたまま、あとから付いたアイコンの上の端しか見えなくなる
                 item.setSizeHint(self.results.gridSize())
