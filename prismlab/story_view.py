@@ -600,12 +600,16 @@ class StoryView(QWidget):
         self.jrate_b = QPushButton("J-Rate で開く")
         self.jrate_b.setToolTip("選んでいるシーンの候補のフォルダを J-Rate で開きます。")
         self.jrate_b.clicked.connect(self._open_jrate)
+        self.pick_b = QPushButton("J-Rate で選ぶ")
+        self.pick_b.setToolTip("前に元画像などを選んだフォルダを J-Rate で開きます。画像を選んで右クリックの"
+                               "「PrismLab に送る」で、新しいシーンや、選んでいるシーンの元画像などに入ります。")
+        self.pick_b.clicked.connect(self._pick_in_jrate)
         top.addWidget(QLabel("物語"))
         top.addWidget(self.story_box)
         top.addWidget(new_b)
         top.addWidget(open_b)
         top.addStretch(1)
-        for b in (self.play_b, self.adopted_b, self.jrate_b):
+        for b in (self.pick_b, self.play_b, self.adopted_b, self.jrate_b):
             top.addWidget(b)
         root.addLayout(top)
 
@@ -618,6 +622,12 @@ class StoryView(QWidget):
         scroll.setWidget(self.board_host)
         scroll.setWidgetResizable(True)
         scroll.setFixedHeight(190)
+        self.board_host.setAcceptDrops(True)
+        self.board_host.dragEnterEvent = self._board_drag
+        self.board_host.dragMoveEvent = self._board_drag
+        self.board_host.dropEvent = self._board_drop
+        self.board_host.setToolTip("画像をここにドロップすると、シーンチェンジのシーンを足します "
+                                   "(カードの上ならそのあと、ほかのところなら最後に。何枚でも)。")
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         root.addWidget(scroll)
 
@@ -1139,8 +1149,9 @@ class StoryView(QWidget):
         if self.scene is None:
             return
         exts = " ".join("*" + e for e in recipes.IMAGE_EXTS)
-        path, _ = QFileDialog.getOpenFileName(self, "元画像を選ぶ", "", f"画像 ({exts})")
+        path, _ = QFileDialog.getOpenFileName(self, "元画像を選ぶ", story.pick_folder(), f"画像 ({exts})")
         if path:
+            story.remember_pick(path)
             self._set_source(lambda: self.story.set_source_file(self.scene, path))
 
     def _choose_source_frame(self) -> None:
@@ -1168,8 +1179,10 @@ class StoryView(QWidget):
         if self.scene is None:
             return
         exts = " ".join("*" + e for e in recipes.IMAGE_EXTS)
-        path, _ = QFileDialog.getOpenFileName(self, "リファレンス画像 (主に顔) を選ぶ", "", f"画像 ({exts})")
+        path, _ = QFileDialog.getOpenFileName(self, "リファレンス画像 (主に顔) を選ぶ", story.pick_folder(),
+                                              f"画像 ({exts})")
         if path:
+            story.remember_pick(path)
             self._set_reference(path)
 
     def _set_reference(self, path: str) -> None:
@@ -1190,8 +1203,9 @@ class StoryView(QWidget):
         if self.scene is None or self._busy_here(self.scene):
             return
         exts = " ".join("*" + e for e in recipes.IMAGE_EXTS)
-        path, _ = QFileDialog.getOpenFileName(self, "ラストフレームを選ぶ", "", f"画像 ({exts})")
+        path, _ = QFileDialog.getOpenFileName(self, "ラストフレームを選ぶ", story.pick_folder(), f"画像 ({exts})")
         if path:
+            story.remember_pick(path)
             self._set_last_frame(path)
 
     def _set_last_frame(self, path: str = "", follow_next: bool = False) -> None:
@@ -1221,6 +1235,7 @@ class StoryView(QWidget):
         path = event.mimeData().urls()[0].toLocalFile()
         if self.scene is not None:
             event.acceptProposedAction()
+            story.remember_pick(path)
             self._set_source(lambda: self.story.set_source_file(self.scene, path))
 
     # ------------------------------------------------------------------
@@ -1877,6 +1892,128 @@ class StoryView(QWidget):
             os.startfile(str(folder))  # noqa: S606
         else:
             self.status.emit("まだ採用した動画がありません。")
+
+    def _pick_in_jrate(self) -> None:
+        """前に元画像などを選んだフォルダを J-Rate で開く (選んで「PrismLab に送る」で送り返してもらう)。"""
+        from .line_view import find_jrate
+        exe = find_jrate()
+        if exe is None:
+            self.status.emit("J-Rate が見つかりません (デスクトップの Application か、隣の J-Rate のフォルダに置いてください)。")
+            return
+        folder = story.pick_folder()
+        subprocess.Popen([str(exe), folder] if folder else [str(exe)])  # noqa: S603
+        self.status.emit("J-Rate で画像を選び、右クリックの「PrismLab に送る」で物語に送ってください。")
+
+    @staticmethod
+    def _image_urls(event) -> list[str]:
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        return [u.toLocalFile() for u in urls
+                if u.isLocalFile() and u.toLocalFile().lower().endswith(recipes.IMAGE_EXTS)]
+
+    def _board_drag(self, event) -> None:
+        if self.story is not None and self._image_urls(event):
+            event.acceptProposedAction()
+
+    def _board_drop(self, event) -> None:
+        paths = self._image_urls(event)
+        if self.story is None or not paths:
+            return
+        event.acceptProposedAction()
+        pos = event.position().toPoint()
+        after = None
+        for card, scene in zip(self.scene_cards, self.story.scenes):
+            if card.geometry().contains(pos):
+                after = scene
+                break
+        QTimer.singleShot(0, lambda: self._add_image_scenes(paths, after))
+
+    def _add_image_scenes(self, paths: list, after: Optional[story.Scene] = None) -> str:
+        """画像を 1 枚ずつ、シーンチェンジ・手元の画像のシーンにして足す (after のあと、なければ最後)。"""
+        added = []
+        error = ""
+        for path in paths:
+            scene = self.story.add_scene(after, story.CUT)
+            try:
+                self.story.set_source_file(scene, path)
+            except story.StoryError as exc:
+                self.story.remove_scene(scene)
+                error = str(exc)
+                break
+            added.append(scene)
+            after = scene
+        if paths:
+            story.remember_pick(paths[0])
+        if added:
+            self.scene = added[-1]
+            self._changed(rebuild=True)
+            self.refresh(load=True)
+            self.status.emit(f"シーンを {len(added)} 個足しました (シーンチェンジ・手元の画像)。")
+        if error:
+            QMessageBox.warning(self, "シーンを足す", error)
+        return error
+
+    def receive(self, files: list, slot: str, sender: str = "") -> str:
+        """ほかのアプリから送られたもの (spec 5 章)。入れられなければ理由を返す。"""
+        if self.story is None:
+            return "物語を開いていません。PrismLab の「物語」で物語を開いてから、もう一度送ってください。"
+        found = [f for f in files if Path(f).is_file()]
+        if not found:
+            return "送られたファイルが見つかりません。"
+        if slot == "scenes":
+            images = [f for f in found if f.lower().endswith(recipes.IMAGE_EXTS)]
+            if not images:
+                return "送れるのは画像だけです。"
+            self._save()
+            return self._add_image_scenes(images) or ""
+        if self.scene is None:
+            return "シーンを選んでいません。"
+        if self.job is not None and self.job[1] == self.scene.id and self.engine.active:
+            return "選んでいるシーンは候補を作っています。終わるか中止してから、もう一度送ってください。"
+        path = found[0]
+        label = self.scene.label(self.story.index_of(self.scene))
+        if slot == "original":
+            text = inserts.read_file(Path(path))
+            if not text:
+                return f"{Path(path).name} の中身が空です。"
+            old = self.original.toPlainText()
+            self.scene.record("元のプロンプト (送られる前)", old)
+            self._set_text(self.original, text)
+            self._save_timer.start()
+            self.status.emit(f"{sender or 'ほかのアプリ'} の {Path(path).name} を、シーン「{label}」の元のプロンプトに入れました"
+                             " (Ctrl+Z で戻せます)。")
+            return ""
+        if not path.lower().endswith(recipes.IMAGE_EXTS):
+            return "送れるのは画像だけです。"
+        story.remember_pick(path)
+        if slot == "source":
+            try:
+                self.story.set_source_file(self.scene, path)
+            except story.StoryError as exc:
+                return str(exc)
+            self.thumbs.forget(self.scene.source)
+            self._changed(rebuild=True)
+            what = "元画像"
+        elif slot == "reference":
+            try:
+                self.story.set_reference(self.scene, path)
+            except story.StoryError as exc:
+                return str(exc)
+            self.thumbs.forget(self.scene.reference)
+            self._changed()
+            what = "リファレンス (顔)"
+        elif slot == "last":
+            try:
+                self.story.set_last_frame(self.scene, path)
+            except story.StoryError as exc:
+                return str(exc)
+            if self.scene.last_frame:
+                self.thumbs.forget(self.scene.last_frame)
+            self._changed()
+            what = "ラストフレーム"
+        else:
+            return ""
+        self.status.emit(f"{Path(path).name} を、シーン「{label}」の{what}にしました。")
+        return ""
 
     def _open_jrate(self) -> None:
         from .line_view import find_jrate

@@ -1,5 +1,7 @@
 import getpass
+import json
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import QPointF, QTimer
 from PySide6.QtGui import QColor, QIcon, QLinearGradient, QPainter, QPixmap, QPolygonF
@@ -11,7 +13,9 @@ from .main_window import MainWindow
 
 # 2 つ目を起動したら、先に動いているほうを前に出して自分は終わる。
 # 同じ量産を 2 つのアプリが取り合わないようにするため。
+# J-Rate・PromptWordCrafter も、パイプ PrismLab-(ユーザー名) に JSON を書いて送ってくる (spec 5 章)。
 _SERVER_NAME = f"PrismLab-{getpass.getuser()}"
+SEND_ARG = "--send"  # PrismLab.exe --send (JSON のパス): 動いていないときに、送るものを持って起動する
 
 
 def make_icon() -> QIcon:
@@ -43,7 +47,27 @@ def make_icon() -> QIcon:
     return icon
 
 
-def _notify_running_instance() -> bool:
+def _send_arg() -> bytes:
+    """--send で渡された JSON (読めなければ空)。読んだら消す (一時フォルダに送る側が書いたもの)。"""
+    args = sys.argv[1:]
+    if SEND_ARG not in args:
+        return b""
+    i = args.index(SEND_ARG)
+    if i + 1 >= len(args):
+        return b""
+    path = Path(args[i + 1])
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return b""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return data
+
+
+def _notify_running_instance(payload: bytes = b"") -> bool:
     socket = QLocalSocket()
     socket.connectToServer(_SERVER_NAME)
     if not socket.waitForConnected(500):
@@ -52,10 +76,17 @@ def _notify_running_instance() -> bool:
         # 前面に出るのを Windows に拒まれないよう、こちらから許可しておく
         import ctypes
         ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
-    socket.write(b"show")
-    socket.flush()
-    socket.waitForBytesWritten(500)
-    socket.disconnectFromServer()
+    if payload:
+        # 送るものは 1 行 (改行で終わる)。受け側が読み終えて切るまで待つ (先に切ると、読まれずに落ちることがある)
+        socket.write(payload.rstrip(b"\r\n") + b"\n")
+        socket.flush()
+        socket.waitForBytesWritten(1000)
+        socket.waitForDisconnected(3000)
+    else:
+        socket.write(b"show")
+        socket.flush()
+        socket.waitForBytesWritten(500)
+        socket.disconnectFromServer()
     return True
 
 
@@ -67,17 +98,54 @@ def _start_server(window: MainWindow) -> QLocalServer:
 
     def on_connection():
         conn = server.nextPendingConnection()
-        if conn is not None:
-            conn.disconnected.connect(conn.deleteLater)
+        if conn is None:
+            window.bring_to_front()
+            return
+        buffer = bytearray()
+        handled = []
+
+        def finish():
+            if not handled:
+                handled.append(True)
+                handle(window, bytes(buffer))
+
+        def read():
+            buffer.extend(bytes(conn.readAll()))
+            if b"\n" in buffer:
+                # 送るものは 1 行。読み終えたらこちらから切る (送る側はそれを待っている)
+                finish()
+                conn.disconnectFromServer()
+
+        def gone():
+            buffer.extend(bytes(conn.readAll()))
+            finish()  # 改行のないもの ("show" など)
+            conn.deleteLater()
+
+        conn.readyRead.connect(read)
+        conn.disconnected.connect(gone)
         window.bring_to_front()
 
     server.newConnection.connect(on_connection)
     return server
 
 
+def handle(window: MainWindow, data: bytes) -> None:
+    """送られてきたもの: "show" (前に出すだけ) か、送る JSON (spec 5 章)。"""
+    text = data.decode("utf-8", "replace").strip()
+    if not text or text == "show":
+        return
+    try:
+        message = json.loads(text)
+    except ValueError:
+        return
+    if isinstance(message, dict) and message.get("cmd") == "send":
+        QTimer.singleShot(0, lambda: window.receive(message))
+
+
 def main():
     app = QApplication(sys.argv)
-    if _notify_running_instance():
+    payload = _send_arg()
+    if _notify_running_instance(payload):
         sys.exit(0)
     app.setApplicationName("PrismLab")
     app.setWindowIcon(make_icon())
@@ -87,7 +155,13 @@ def main():
     window = MainWindow(notice)
     _start_server(window)
     window.show()
-    QTimer.singleShot(0, window.offer_resume)
+
+    def first():
+        window.offer_resume()
+        if payload:
+            handle(window, payload)  # 続きから始めるかを聞いたあとで入れる
+
+    QTimer.singleShot(0, first)
     sys.exit(app.exec())
 
 

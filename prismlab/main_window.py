@@ -67,6 +67,30 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    # ほかのアプリから送られたもの (spec 5 章) ------------------------------------
+    def receive(self, message: dict) -> None:
+        """J-Rate・PromptWordCrafter の「PrismLab に送る」。入れたらそのタブに切り替え、入れられなければ理由を出す。"""
+        self.bring_to_front()
+        files = [str(f) for f in message.get("files") or [] if isinstance(f, str) and f]
+        sender = str(message.get("from") or "")
+        target = message.get("target")
+        if target == "recipe":
+            try:
+                index = int(message.get("index", -1))
+            except (TypeError, ValueError):
+                index = -1
+            problem = self.line.receive_picked(files, sender, str(message.get("recipe") or ""), index)
+            tab = self.line
+        elif target == "story":
+            problem = self.story.receive(files, str(message.get("slot") or ""), sender)
+            tab = self.story
+        else:
+            return
+        if problem:
+            QMessageBox.warning(self, "PrismLab に送る", problem)
+        else:
+            self.tabs.setCurrentWidget(tab)
+
     # 設定の窓 (GenCommon のもの。3 つのアプリと共有の登録) ---------------------
     def _comfy_settings(self) -> None:
         ComfySettingsDialog(self).exec()

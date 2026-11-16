@@ -28,6 +28,7 @@ REFERENCE_NAME = "reference.png"
 LAST_NAME = "last.png"  # ラストフレーム (手元の画像を写したもの)
 LAST_FILE, LAST_NEXT = "file", "next"  # ラストフレームの決め方: 手元の画像 / 次のシーンの元画像 (追いかける)
 RECENT_FILE = "stories.txt"  # 最近開いた物語のフォルダ (1 行に 1 つ、新しい順)
+PICK_FOLDER_FILE = "story_pick_folder.txt"  # 前に元画像などを選んだフォルダ (「J-Rate で選ぶ」で開く)
 MAX_RECENT = 10
 MAX_HISTORY = 60  # シーンごとのプロンプトの履歴 (いちばん最初のものは消さない)
 CONT, CUT = "cont", "cut"
@@ -503,6 +504,23 @@ def _write_png(src: str, dest: Path) -> None:
 def recent() -> list[str]:
     text = store.read_text(store.app_file(RECENT_FILE)) or ""
     return [line.strip() for line in text.splitlines() if line.strip() and (Path(line.strip()) / STORY_FILE).exists()]
+
+
+def pick_folder() -> str:
+    """前に元画像・リファレンス・ラストフレームを選んだフォルダ (なければ空)。"""
+    folder = (store.read_text(store.app_file(PICK_FOLDER_FILE)) or "").strip()
+    return folder if folder and Path(folder).is_dir() else ""
+
+
+def remember_pick(path: str) -> None:
+    """選んだ画像のフォルダを覚える (物語のフォルダの中のもの = 候補・コマは覚えない)。"""
+    folder = Path(path).parent
+    if any((d / STORY_FILE).exists() for d in [folder, *folder.parents][:4]):
+        return
+    try:
+        store.write_text(store.app_file(PICK_FOLDER_FILE), str(folder))
+    except OSError:
+        pass
 
 
 def remember(folder: str) -> None:

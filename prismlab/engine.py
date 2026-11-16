@@ -38,6 +38,7 @@ class Item:
     stage: int = 0  # 次にやるステップの番号
     state: str = WAITING
     text: Optional[str] = None  # 元のプロンプト (読み取った説明)。None = まだない
+    origin_text: Optional[str] = None  # テキストの入口: 始めたときのテキストの中身 (記録に残す。生成を通っても消さない)
     enhanced: Optional[str] = None  # 盛ったプロンプト
     read_name: str = ""  # 今の text を読み取った読み取りプリセットの名前
     # [{"stage": ステップ, "path": パス, "time": 時刻, "from": 元のファイル, "prompt": 読み取った文, "enhanced": 盛った文}]
@@ -69,7 +70,7 @@ class Item:
         for key in ("current", "error", "machine", "prompt_id", "read_name", "reference", "last_frame"):
             setattr(it, key, str(data.get(key) or ""))
         it.current = it.current or it.source
-        for key in ("text", "enhanced"):
+        for key in ("text", "enhanced", "origin_text"):
             value = data.get(key)
             setattr(it, key, value if isinstance(value, str) else None)
         try:
@@ -208,6 +209,7 @@ class Run:
                 if it.source not in texts:
                     texts[it.source] = inserts.read_file(Path(it.source))
                 it.text = texts[it.source] or None
+                it.origin_text = it.text
         pickers = []
         for i, snap in enumerate(stages):
             if snap["type"] != recipes.INSERT or snap.get("bypass"):
@@ -615,6 +617,10 @@ class Engine(QObject):
             reader={"name": it.read_name} if it.read_name else None,
             output_dir=run.output_dir,
         )
+        if self.run_file is not None:
+            # 量産・試作: 入口のファイルを記録に残す (PromptWordCrafter の生成結果の帯がテキストからたどる)
+            req.origin, req.origin_text = it.source, it.origin_text
+            req.recipe, req.step = run.name, it.stage + 1
         if it.enhanced is not None:
             names = [s.get("enhancer", {}).get("name", "") for s in run.stages[:it.stage]
                      if s["type"] == recipes.ENHANCE and not s.get("bypass")]

@@ -60,9 +60,10 @@ class Stage:
         return s
 
 
-# 入口: フォルダの画像 / 1 枚の画像 (LoadImage のように) / フォルダのテキスト (1 ファイル = 1 件の T2I)
-FOLDER, SINGLE, TEXTS = "folder", "single", "texts"
-SOURCES = (FOLDER, SINGLE, TEXTS)
+# 入口: フォルダの画像 / 1 枚の画像 (LoadImage のように) / フォルダのテキスト (1 ファイル = 1 件の T2I) /
+# ほかのアプリ (J-Rate・PromptWordCrafter) から送られたもの (画像か .txt。spec 5 章)
+FOLDER, SINGLE, TEXTS, PICKED = "folder", "single", "texts", "picked"
+SOURCES = (FOLDER, SINGLE, TEXTS, PICKED)
 TEXT_EXT = ".txt"
 MAX_REPEAT = 999
 
@@ -78,11 +79,15 @@ class Recipe:
     image: str = ""  # 1 枚のときの画像
     repeat: int = 1  # 回数 (同じ元を何回通すか。どの入口でも)
     inherit: bool = True  # 元の★を、出来たファイルに引き継ぐ (generation-standard 6 章のオプション。既定はオン)
+    picked: list = field(default_factory=list)  # 送られたファイル (画像だけか .txt だけ)。もう一度送ると置き換える
+    picked_from: str = ""  # 送ったアプリ (J-Rate / PromptWordCrafter)
+    picked_back: str = ""  # 送られる前の入口の種類 (「× 外す」で戻る)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "folder": self.folder, "min_stars": self.min_stars,
                 "output_dir": self.output_dir, "source": self.source, "image": self.image, "repeat": self.repeat,
-                "inherit": self.inherit,
+                "inherit": self.inherit, "picked": list(self.picked), "picked_from": self.picked_from,
+                "picked_back": self.picked_back,
                 "stages": [s.to_dict() for s in self.stages]}
 
     @property
@@ -91,7 +96,16 @@ class Recipe:
 
     @property
     def texts(self) -> bool:
-        return self.source == TEXTS
+        """テキストが入口 (フォルダのテキストか、送られた .txt)。"""
+        return entry_is_text(self.source, self.picked)
+
+    @property
+    def is_picked(self) -> bool:
+        return self.source == PICKED
+
+    def picked_files(self) -> list[Path]:
+        """送られたファイルのうち、今もあるもの (送られた順)。"""
+        return [Path(p) for p in self.picked if Path(p).is_file()]
 
     @staticmethod
     def from_dict(data: dict) -> "Recipe":
@@ -108,6 +122,12 @@ class Recipe:
         r.source = data.get("source") if data.get("source") in SOURCES else FOLDER
         r.inherit = bool(data.get("inherit", True))
         r.image = str(data.get("image") or "")
+        picked = data.get("picked")
+        r.picked = [str(p) for p in picked if p] if isinstance(picked, list) else []
+        r.picked_from = str(data.get("picked_from") or "")
+        r.picked_back = data.get("picked_back") if data.get("picked_back") in (FOLDER, SINGLE, TEXTS) else ""
+        if r.source == PICKED and not r.picked:
+            r.source = r.picked_back or FOLDER
         try:
             r.repeat = max(1, min(MAX_REPEAT, int(data.get("repeat") or 1)))
         except (TypeError, ValueError):
@@ -122,10 +142,21 @@ class Recipe:
     def resolved_output_dir(self) -> str:
         if self.output_dir:
             return self.output_dir
-        base = str(Path(self.image).parent) if self.single and self.image else ("" if self.single else self.folder)
+        if self.is_picked:
+            files = self.picked_files()
+            base = str(files[0].parent) if files else ""
+        else:
+            base = str(Path(self.image).parent) if self.single and self.image else ("" if self.single else self.folder)
         if not base:
             return ""
         return str(Path(base) / safe_name(self.name or "PrismLab"))
+
+
+def entry_is_text(source: str, picked: list) -> bool:
+    """その入口がテキストか (フォルダのテキスト・送られた .txt)。"""
+    if source == TEXTS:
+        return True
+    return source == PICKED and bool(picked) and all(str(p).lower().endswith(TEXT_EXT) for p in picked)
 
 
 def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set:

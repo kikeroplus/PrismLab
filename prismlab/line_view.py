@@ -388,7 +388,9 @@ class LineView(QWidget):
                 w.deleteLater()
         run = self.engine.run
         source = str(run.recipe.get("source") or recipes.FOLDER) if self.running() else self.recipe.source
-        single, texts = source == recipes.SINGLE, source == recipes.TEXTS
+        picked = list(run.recipe.get("picked") or []) if self.running() else self.recipe.picked
+        single, texts = source == recipes.SINGLE, recipes.entry_is_text(source, picked)
+        is_picked = source == recipes.PICKED
         self.entry = Card()
         self.entry.title.setText("入口")
         if texts:
@@ -408,6 +410,10 @@ class LineView(QWidget):
         self.mode_folder = QPushButton("フォルダ")
         self.mode_single = QPushButton("1 枚")
         self.mode_texts = QPushButton("テキスト")
+        self.mode_picked = QPushButton("選択")
+        self.mode_picked.setToolTip("J-Rate・PromptWordCrafter の右クリック「PrismLab に送る」で送られたもの。"
+                                    "[フォルダ] などを押すと前の入口に戻り、ここを押すとまた使えます。")
+        self.mode_picked.setVisible(bool(picked))
         self.mode_single.setToolTip("フォルダのかわりに 1 枚の画像から始めます。回数ぶん同じ画像を通します"
                                     " (差し込み・盛るで 1 本ずつ変わります)。")
         self.mode_texts.setToolTip("フォルダの .txt を 1 つずつ元の文にして始めます (T2I の量産)。"
@@ -415,7 +421,7 @@ class LineView(QWidget):
         mode_row = QHBoxLayout()
         mode_row.setSpacing(0)
         self.mode_group = QButtonGroup(self.entry)
-        self.mode_buttons = (self.mode_folder, self.mode_single, self.mode_texts)
+        self.mode_buttons = (self.mode_folder, self.mode_single, self.mode_texts, self.mode_picked)
         for n, b in enumerate(self.mode_buttons):
             b.setCheckable(True)
             b.setStyleSheet("QPushButton { padding: 2px 8px; font-size: 11px; }")
@@ -427,6 +433,7 @@ class LineView(QWidget):
         self.entry.box.insertLayout(1, mode_row)
         self.entry.setToolTip(
             "クリックかドラッグで画像を選ぶ。" if single else
+            "J-Rate・PromptWordCrafter から送られたもの。サムネールのクリックかドラッグで、試す 1 つを選ぶ。" if is_picked else
             "クリックでテキストのフォルダを選ぶ。.txt のドラッグで、試す 1 つを選ぶ。" if texts else
             "クリックでフォルダを選ぶ。サムネールのクリックか画像のドラッグで、試す 1 枚を選ぶ。")
         self.repeat_box = QSpinBox()
@@ -454,6 +461,11 @@ class LineView(QWidget):
         self.rate_button.clicked.connect(self._rate_in_jrate)
         self.rate_button.setVisible(source == recipes.FOLDER)
         self.entry.box.insertWidget(self.entry.box.count() - 1, self.rate_button)
+        self.unpick_button = QPushButton("× 外す")
+        self.unpick_button.setToolTip("送られたものを入口から外し、前の入口 (フォルダなど) に戻します。")
+        self.unpick_button.clicked.connect(self._unpick)
+        self.unpick_button.setVisible(is_picked and not self.running())
+        self.entry.box.insertWidget(self.entry.box.count() - 1, self.unpick_button)
         self.flow.addWidget(self.entry)
 
         self.stage_cards: list[Card] = []
@@ -664,7 +676,9 @@ class LineView(QWidget):
             self.refresh(rebuild=True)
 
     def _entry_clicked(self) -> None:
-        if self.recipe.single:
+        if self.recipe.is_picked:
+            self.status.emit("入口は送られたものです。フォルダを選ぶときは [フォルダ] に切り替えてください。")
+        elif self.recipe.single:
             self._choose_image()
         else:
             self._choose_folder()
@@ -684,11 +698,67 @@ class LineView(QWidget):
         if self.running():
             return
         source = recipes.SOURCES[mode] if 0 <= mode < len(recipes.SOURCES) else recipes.FOLDER
+        if source == recipes.PICKED and not self.recipe.picked:
+            return
         if source != self.recipe.source:
+            if source == recipes.PICKED:
+                self.recipe.picked_back = self.recipe.source
             self.recipe.source = source
             self.trial_source = None
             self._save_recipes()
             QTimer.singleShot(0, lambda: self.refresh(rebuild=True))  # 押したボタンも作り直すので、抜けてから
+
+    def _unpick(self) -> None:
+        """送られたものを外して、前の入口に戻す。"""
+        if self.running():
+            return
+        r = self.recipe
+        r.picked, r.picked_from = [], ""
+        r.source, r.picked_back = r.picked_back or recipes.FOLDER, ""
+        self.trial_source = None
+        self._save_recipes()
+        self.status.emit("送られたものを入口から外しました。")
+        QTimer.singleShot(0, lambda: self.refresh(rebuild=True))
+
+    def receive_picked(self, files: list, sender: str, name: str = "", index: int = -1) -> str:
+        """ほかのアプリから送られたファイルを、そのレシピの入口にする (spec 5 章)。入れられなければ理由を返す。"""
+        if self.running():
+            run = self.engine.run
+            return (f"量産「{run.name}」が動いているので、入口に入れられません。"
+                    "終わるか中止してから、もう一度送ってください。")
+        target = -1
+        if 0 <= index < len(self.recipes) and self.recipes[index].name == name:
+            target = index
+        else:
+            target = next((i for i, r in enumerate(self.recipes) if r.name == name), -1)
+        if target < 0:
+            return f"レシピ「{name}」が見つかりません (名前を変えたか、消したかもしれません)。"
+        paths = [str(Path(f)) for f in files if f]
+        found = [f for f in paths if Path(f).is_file()]
+        if not found:
+            return "送られたファイルが見つかりません。"
+        texts = [f for f in found if f.lower().endswith(recipes.TEXT_EXT)]
+        images = [f for f in found if f.lower().endswith(recipes.IMAGE_EXTS)]
+        if texts and images or not (texts or images):
+            return "送れるのは、画像だけか、テキスト (.txt) だけです。"
+        r = self.recipes[target]
+        r.picked, r.picked_from = texts or images, sender or "ほかのアプリ"
+        if r.source != recipes.PICKED:
+            r.picked_back = r.source
+        r.source = recipes.PICKED
+        self.index = target
+        self.trial_source = None
+        self._save_recipes()
+        button = self.recipe_group.button(target)
+        if button is not None:
+            button.setChecked(True)
+        self.refresh(rebuild=True)
+        unit = "件" if texts else "枚"
+        missing = len(paths) - len(found)
+        note = f" (見つからない {missing})" if missing else ""
+        self.status.emit(f"{r.picked_from} から {len(r.picked)} {unit}を「{r.name}」の入口に入れました{note}。"
+                         "確かめてから「開始」を押してください。")
+        return ""
 
     def _choose_image(self) -> None:
         if self.running():
@@ -718,6 +788,8 @@ class LineView(QWidget):
         """入口の対象 (読んである★で絞ったもの。1 枚のときはその画像、テキストのときは .txt)。"""
         if self.recipe.single:
             return [Path(self.recipe.image)] if self.recipe.image and Path(self.recipe.image).is_file() else []
+        if self.recipe.is_picked:
+            return self.recipe.picked_files()
         if self.recipe.texts:
             if self._texts_key != self.recipe.folder:
                 self._texts_key = self.recipe.folder
@@ -837,6 +909,10 @@ class LineView(QWidget):
             if not r.image or not Path(r.image).is_file():
                 QMessageBox.warning(self, title, "入口の画像を選んでください (入口をクリックするか、画像をドラッグ)。")
                 return False
+        elif r.is_picked:
+            if not r.picked_files():
+                QMessageBox.warning(self, title, "送られたファイルが見つかりません (動かしたか、消したかもしれません)。")
+                return False
         elif need_folder and (not r.folder or not Path(r.folder).is_dir()):
             QMessageBox.warning(self, title, "入口のフォルダを選んでください (入口のステップをクリック)。")
             return False
@@ -885,6 +961,8 @@ class LineView(QWidget):
         try:
             if r.single:
                 base = [Path(r.image)]
+            elif r.is_picked:
+                base = r.picked_files()
             elif r.texts:
                 base = recipes.list_texts(r.folder)
             else:
@@ -1110,14 +1188,17 @@ class LineView(QWidget):
 
         # 入口
         source = str(run.recipe.get("source") or recipes.FOLDER) if running else self.recipe.source
-        single, texts = source == recipes.SINGLE, source == recipes.TEXTS
+        picked = list(run.recipe.get("picked") or []) if running else self.recipe.picked
+        picked_from = str(run.recipe.get("picked_from") or "") if running else self.recipe.picked_from
+        single, texts = source == recipes.SINGLE, recipes.entry_is_text(source, picked)
+        is_picked = source == recipes.PICKED
         image = str(run.recipe.get("image", "")) if running else self.recipe.image
         repeat = int(run.recipe.get("repeat") or 1) if running else self.recipe.repeat
         if running:
             sources = list(dict.fromkeys(Path(i.source) for i in items))  # 回数ぶん重なったものは 1 つに
             folder = str(run.recipe.get("folder", ""))
             stars = int(run.recipe.get("min_stars") or 0)
-        elif single or texts:
+        elif single or texts or is_picked:
             folder, stars = self.recipe.folder, 0
             sources = self._entry_sources()
         else:
@@ -1131,6 +1212,9 @@ class LineView(QWidget):
         if texts:
             first = sources[0] if sources else None
             self.breakdown.setText(("先頭: " + html.escape(self._short(inserts.read_file(first), 80))) if first else "")
+        elif is_picked:
+            missing = sum(1 for f in picked if not Path(f).is_file())
+            self.breakdown.setText(f"見つからない {missing}" if missing and not running else "")
         else:
             self.breakdown.setText("" if running else self._star_breakdown(self._scanned_files))
         self.rate_button.setVisible(not running and source == recipes.FOLDER)
@@ -1152,6 +1236,15 @@ class LineView(QWidget):
             trial = None
             count = f"{repeat} 回通す" if image else ""
             sources = sources[:1]
+        elif is_picked:
+            unit = "件" if texts else "枚"
+            self.entry.detail.setText(f"{picked_from or 'ほかのアプリ'} から {len(picked)} {unit}")
+            self.entry.detail.setToolTip("\n".join(Path(f).name for f in picked[:30])
+                                         + ("\n…" if len(picked) > 30 else ""))
+            trial = None if running else self._trial_path()
+            count = f"対象 {len(sources)} {unit}{times}"
+            if trial is not None:
+                count += f"  ・ {'試す 1 つ' if texts else '試す 1 枚'}: {trial.name}"
         else:
             what = "テキストのフォルダ" if texts else "フォルダ"
             self.entry.detail.setText((f"{what}: " + (Path(folder).name or folder)) if folder
