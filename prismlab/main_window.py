@@ -44,10 +44,9 @@ class MainWindow(QMainWindow):
         self.story.status.connect(self.show_status)
         self.line.to_story.connect(self._line_to_story)
         self.line.to_batch.connect(self._line_to_batch)
-        self.line.machines_changed.connect(self.story._update_machines_button)
-        # 量産ラインと物語のバッチは、台が重なるときだけ同時には動かさない (物語の台は物語のタブで別に選べる)
-        self.story.line_busy = self.line.blocks_batch  # 一時停止して実行中のものがなければ待たない
-        self.line.story_batch_busy = lambda: self.story.batch.active
+        # 台は量産ラインと物語で共通。空きは engine.POOL で分け合い、両方が待っていれば物語が先 (同時に動いてよい)
+        self.line.machines_changed.connect(self.story.machines_changed)
+        self.story.edit_machines = self.line._edit_machines
         self.statusBar().showMessage(notice or "準備ができました。", 8000)
         settings.restore_geometry(self)
 

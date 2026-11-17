@@ -558,7 +558,8 @@ class StoryView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.engine = engine.Engine(self, run_file=None)  # 候補づくり (量産ラインとは別。続きからは書かない)
+        self.engine = engine.Engine(self, run_file=None, first=True)  # 候補づくり (量産ラインとは別。続きからは書かない。
+        # 台は量産ラインと分け合い、両方が待っていれば物語が先)
         self.engine.changed.connect(self._schedule)
         self.engine.finished.connect(self._on_finished)
         self.thumbs = ThumbCache(200, self)
@@ -612,7 +613,8 @@ class StoryView(QWidget):
         self.queue_b.setToolTip("物語のバッチの待ち行列 (順番・一時停止・外す)。")
         self.queue_b.clicked.connect(self._show_queue)
         self.machines_b = QPushButton("台の設定...")
-        self.machines_b.clicked.connect(self._edit_machines)
+        self.edit_machines = lambda: None  # 台の設定の窓 (ウィンドウが量産ラインのものを入れる。台は共通)
+        self.machines_b.clicked.connect(lambda: self.edit_machines())
         self._update_machines_button()
         self.new_b, self.open_b = new_b, open_b
         top.addWidget(QLabel("物語"))
@@ -648,7 +650,6 @@ class StoryView(QWidget):
         self.batch_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.batch_bar.hide()
         root.addWidget(self.batch_bar)
-        self.line_busy = lambda: False  # 量産ラインが動いているか (ウィンドウが入れる。バッチと同時に動かさない)
 
         # 絵コンテ
         self.board_host = QWidget()
@@ -1596,9 +1597,9 @@ class StoryView(QWidget):
         run = self.engine.run
         if self.engine.active and run is not None and run.unfinished:
             return "ほかのシーンの候補を作っています。終わってからにしてください。"
-        machines = recipes.story_machines()
+        machines = recipes.machines()
         if not machines:
-            return "使う台が決まっていません (物語のタブの「台の設定...」で選んでください)。"
+            return "使う台が決まっていません (「台の設定...」で選んでください)。"
         if not workflow:
             return "ワークフローを選んでください (「生成の設定」で登録します)。"
         self.engine.set_machines(machines)
@@ -2300,29 +2301,18 @@ class StoryView(QWidget):
     # バッチ (story_batch.py)
     # ------------------------------------------------------------------
     def _update_machines_button(self) -> None:
-        """「台の設定...」の札: 選んでいる台の名前と、量産ラインと重なるか。"""
+        """「台の設定...」の札: 使う台の名前 (量産ラインと共通)。"""
         names = {p.value.rstrip("/").lower(): p.name for p in comfy.connections() if p.value}
-        urls = recipes.story_machines()
-        shown = " · ".join(names.get(u.lower()) or u for u in urls) or "なし"
+        shown = " · ".join(names.get(u.lower()) or u for u in recipes.machines()) or "なし"
         self.machines_b.setText(f"台: {shown}")
-        self.machines_b.setToolTip(
-            "物語 (候補を作る・バッチ) で使う ComfyUI を選びます。"
-            + ("今は量産ラインと同じ台を含むので、物語のバッチと量産ラインは同時には動きません。"
-               if recipes.machines_overlap() else "量産ラインと別の台なので、物語のバッチと量産ラインを同時に動かせます。"))
+        self.machines_b.setToolTip("ComfyUI の台を 3 台まで選びます (量産ラインと共通)。台の空きは量産ラインと分け合い、"
+                                   "1 台に合わせて 2 件まで送ります。両方が待っているときは、物語 (候補・バッチ) が先です。")
 
-    def _edit_machines(self) -> None:
-        from .dialogs import MachinesDialog
-        dialog = MachinesDialog(recipes.story_machines(), self, "台の設定 (物語)",
-                                "物語 (候補を作る・バッチ) で使う ComfyUI を 3 台まで選びます。量産ラインの台と重ならなければ、"
-                                "物語のバッチと量産ラインを同時に動かせます (例: 物語は FALCON、量産ラインは CONDOR)。"
-                                "重なる台があるときは、今までどおり片方が終わるのを待ちます。")
-        if dialog.exec():
-            recipes.set_story_machines(dialog.urls())
-            if self.engine.active:
-                self.engine.set_machines(recipes.story_machines())
-            self._update_machines_button()
-            self.status.emit("物語の台を変えました。" + ("量産ラインと同じ台を含むので、バッチと量産は同時には動きません。"
-                                                    if recipes.machines_overlap() else "量産ラインと同時に動かせます。"))
+    def machines_changed(self) -> None:
+        """台の設定を変えたとき: 札を直し、動いている候補づくりにも新しい台を使わせる。"""
+        self._update_machines_button()
+        if self.engine.active:
+            self.engine.set_machines(recipes.machines())
 
     def _start_batch(self) -> None:
         """「バッチに足す...」: 設定の窓を出して待ち行列に足す。"""

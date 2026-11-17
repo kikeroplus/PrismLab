@@ -139,8 +139,6 @@ sv._start_batch()
 pump(0.3)
 check(sv.batch.active and not sv.detail.isEnabled() and not sv.story_box.isEnabled() and sv.batch_bar.isVisible(),
       "バッチのあいだは見るだけ (帯を出す)")
-check(not lv._ready("開始"), "(量産ラインは始めない)")
-check("同時には" in told[-1], "量産ラインを始めようとしたら知らせる")
 check(sv.receive([str(photo)], "scenes") and "バッチ" in sv.receive([str(photo)], "scenes"), "送られたものは入れない")
 pump(1.5)
 window.grab().save(str(OUT / "batch_running.png"))
@@ -198,7 +196,7 @@ while time.time() < end and sv.busy():
 check(sorted(p.name for p in parent.iterdir() if p.name.startswith("止める")) == ["止める_01"], "次の本は作らない")
 a.polls = 2
 
-# 6. 量産ラインが動いていれば、終わるのを待ってから始める
+# 6. 物語のタブの候補づくり (手で) が動いていれば、終わるのを待ってから始める
 def small_plan(name, cuts="a / b", runs=1):
     p = story_batch.Plan(name=name, parent=str(parent), image=str(photo), prompts=cuts,
                          workflow=str(wf_dir / "Wan I2V.json"), runs=runs)
@@ -206,18 +204,20 @@ def small_plan(name, cuts="a / b", runs=1):
     return p
 
 
-line_busy = [True]
-sv.line_busy = lambda: line_busy[0]
+hand_busy = [True]
+real_candidates_busy = sv.candidates_busy
+sv.candidates_busy = lambda: hand_busy[0]
 story_batch.ask_plans = lambda *_a, **_k: [small_plan("待つ", "a")]
 told.clear()
 sv._start_batch()
 pump(2.5)
-check(not sv.batch.active and len(sv.batch.waiting()) == 1 and "量産ライン" in sv.batch_label.text()
+check(not sv.batch.active and len(sv.batch.waiting()) == 1 and "候補づくり" in sv.batch_label.text()
       and sv.batch_bar.isVisible(), sv.batch_label.text())
 check(sv.detail.isEnabled(), "待っているあいだは物語のタブを使える")
-line_busy[0] = False
+hand_busy[0] = False
 pump(2.5)
-check(sv.batch.active or (parent / "待つ").exists(), "量産ラインが終わったら始める")
+check(sv.batch.active or (parent / "待つ").exists(), "候補づくりが終わったら始める")
+sv.candidates_busy = real_candidates_busy
 wait_batch()
 check(told and told[-1].startswith("出来た物語 1 本"), told[-1] if told else "")
 
@@ -353,38 +353,41 @@ pump(2.5)
 check(sv.batch.active or (parent / "読む").exists(), "終わったら始める")
 wait_batch()
 
-# 14. 量産ラインが一時停止 (実行中のものなし) なら待たない。バッチの最中は量産の再開・やり直しをさせない
-sv.line_busy = lv.blocks_batch
+# 14. 量産ラインとバッチは同時に動く。台の空きは分け合い (1 台に合わせて 2 件まで)、両方が待っていれば物語が先
+def is_story(wf):
+    return "STORY" in str(wf["2"]["inputs"]["text"])
+
+
 line_recipe = recipes.Recipe(name="量産", output_dir=str(TMP / "量産"), inherit=False,
                              stages=[recipes.Stage(recipes.GEN, workflow=str(wf_dir / "Wan I2V.json"))])
-lv.engine.set_machines([a.url])
-lv.engine.start(engine.Run.create(line_recipe, [photo, photo, photo]))
-lv.engine.set_paused(True)
-end = time.time() + 30
-while time.time() < end and any(i.state == engine.RUNNING for i in lv.engine.run.items):
-    pump(0.2)
-check(lv.running() and not lv.blocks_batch(), "一時停止して実行中のものがない量産は、バッチを待たせない")
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("夜中", "a / b")]
+engine.POOL.peak.clear()
 a.polls = 6
+sent = len(a.received)
+lv.engine.set_machines([a.url])
+lv.engine.start(engine.Run.create(line_recipe, [photo] * 5))
+end = time.time() + 20
+while time.time() < end and len(a.received) - sent < 2:
+    pump(0.2)
+pump(1.0)
+check(len(a.received) - sent == 2 and engine.POOL.used(a.url) == 2, "量産ラインが 1 台に 2 件 (残りは待機)")
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("夜中", "STORY1 / STORY2")]
+told.clear()
 sv._start_batch()
 pump(2.5)
-check(sv.batch.active, "一時停止の量産があってもバッチを始める")
-told.clear()
-lv._toggle_pause()
-check(lv.engine.run.paused and told and "同時には" in told[-1], "バッチの最中は量産を再開しない")
-with lv.engine._cond:
-    lv.engine.run.items[0].state, lv.engine.run.items[0].error = engine.FAILED, "テスト"
-told.clear()
-lv._retry()
-check(lv.engine.run.items[0].state == engine.FAILED and told and "同時には" in told[-1],
-      "バッチの最中は量産の失敗をやり直さない")
-a.polls = 2
-wait_batch()
-lv.engine.cancel_all()
-end = time.time() + 30
+check(sv.batch.active and lv.running() and not told, "量産ラインが動いていても、バッチはすぐ始まる (台の空きを待つ)")
+check(engine.POOL.used(a.url) == 2, "台が埋まっていれば、物語も空きを待つ (1 台に 3 件目は送らない)")
+wait_batch(180)
+end = time.time() + 120
 while time.time() < end and lv.running():
     pump(0.2)
-sv.line_busy = lambda: False
+order = ["物語" if is_story(w) else "量産" for w in a.received[sent:]]
+check(order[:2] == ["量産", "量産"] and "物語" in order[2:4], f"空きが出たら、物語のぶんを残す (物語が待たされない): {order}")
+check(order.count("物語") == 2 and order.count("量産") == 5, f"どちらも最後まで: {order}")
+check(engine.POOL.peak.get(a.url.lower(), 0) == 2, f"1 台に同時に送ったのは 2 件まで ({engine.POOL.peak})")
+told.clear()
+lv._retry()
+check(not told, "バッチがあっても、量産の操作は止めない")
+a.polls = 2
 
 # 15. 足したあとで最初の画像が消えたら、その件は 1 度だけ知らせて終える (空の物語のフォルダを残さない)
 gone = TMP / "消える.png"
@@ -400,43 +403,31 @@ check(told and told[-1].startswith("出来た物語 0 本") and told[-1].count("
       told[-1] if told else "")
 check(not any(n.name.startswith("消えた") for n in parent.iterdir()), "空の物語のフォルダを残さない")
 
-# 16. 物語の台を量産ラインと別にすれば、バッチと量産ラインを同時に動かす (例: 物語は FALCON、量産は CONDOR)
-check(recipes.story_machines() == recipes.machines() and recipes.machines_overlap(), "物語の台を選ぶ前は量産ラインと同じ台")
+# 16. 台が 2 台なら、量産ラインと物語が両方の台を分け合う (どちらの台も 2 件まで)
 b = FakeComfy(polls=6)
 b.video_bytes = clip.read_bytes()
 comfy.set_connections([comfy.Preset("FALCON", a.url), comfy.Preset("CONDOR", b.url)]
                       + [comfy.Preset() for _ in range(comfy.PRESET_COUNT - 2)])
-recipes.set_machines([b.url])
-lv.engine.set_machines([b.url])
-recipes.set_story_machines([a.url])
-sv._update_machines_button()
-check(not recipes.machines_overlap() and sv.machines_b.text() == "台: FALCON", sv.machines_b.text())
-sv.line_busy = lv.blocks_batch
+recipes.set_machines([a.url, b.url])
+lv.engine.set_machines([a.url, b.url])
+sv.machines_changed()
+check(sv.machines_b.text() == "台: FALCON · CONDOR", sv.machines_b.text())
+engine.POOL.peak.clear()
 a.polls = 6
 sent_a, sent_b = len(a.received), len(b.received)
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("別の台", "a / b")]
+lv.engine.start(engine.Run.create(line_recipe, [photo] * 6))
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("二台", "STORY1 / STORY2 / STORY3")]
 sv._start_batch()
-pump(1.0)
-told.clear()
-check(sv.batch.active and not lv._batch_blocks("開始") and not told, "バッチの最中でも、台が別なら量産ラインを始められる")
-lv.engine.start(engine.Run.create(line_recipe, [photo, photo]))
-pump(1.0)
-check(sv.batch.active and lv.running() and lv.blocks_batch() is False, "同時に動く")
-wait_batch()
-end = time.time() + 60
+wait_batch(180)
+end = time.time() + 120
 while time.time() < end and lv.running():
     pump(0.2)
-check(len(a.received) - sent_a == 2 and len(b.received) - sent_b == 2,
-      f"物語は FALCON だけ、量産は CONDOR だけに送る (FALCON {len(a.received) - sent_a} / CONDOR {len(b.received) - sent_b})")
-# 重なる台に戻すと、今までどおりバッチの最中は量産を始めない
-recipes.set_story_machines([a.url, b.url])
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("重なる", "a / b")]
-sv._start_batch()
-pump(1.0)
-told.clear()
-check(sv.batch.active and lv._batch_blocks("開始") and told and "台の設定" in told[-1], "台が重なれば同時には動かさない")
-a.polls = b.polls = 2
-wait_batch()
+got = a.received[sent_a:] + b.received[sent_b:]
+check(sum(1 for w in got if is_story(w)) == 3 and sum(1 for w in got if not is_story(w)) == 6,
+      "量産 6 件・物語 3 シーンとも出来る")
+check(len(a.received) > sent_a and len(b.received) > sent_b, "両方の台を使う")
+check(max(engine.POOL.peak.values()) <= 2, f"どちらの台も同時に 2 件まで ({engine.POOL.peak})")
+a.polls = 2
 b.close()
 
 window.story.shutdown()

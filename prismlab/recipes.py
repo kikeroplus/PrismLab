@@ -15,7 +15,6 @@ RECIPES_FILE = "recipes.json"
 LAST_FILE = "last_recipe.txt"
 MACHINES_FILE = "machines.txt"  # 台 (1 行に 1 つ、接続先の URL)。最大 3 台
 MAX_MACHINES = 3
-STORY_MACHINES_FILE = "story_machines.txt"  # 物語 (候補づくり・バッチ) の台。なければ量産ラインと同じ
 
 READ, ENHANCE, GEN = "read", "enhance", "gen"
 TEXT, INSERT = "text", "insert"  # 追加テキスト (入力した文を足す)・差し込み (フォルダの .txt を 1 枚ごとに順に足す)
@@ -262,30 +261,12 @@ def _read_machines(name: str) -> list[str]:
 
 
 def machines() -> list[str]:
-    """量産ラインの台の URL (最大 3 つ。小文字にはしない)。"""
+    """台の URL (最大 3 つ。小文字にはしない)。量産ラインと物語で共通 (空きは engine.POOL で分け合う)。"""
     return _read_machines(MACHINES_FILE)
 
 
 def set_machines(urls: list[str]) -> None:
     store.write_text(store.app_file(MACHINES_FILE), "\n".join(u.strip().rstrip("/") for u in urls[:MAX_MACHINES]))
-
-
-def story_machines() -> list[str]:
-    """物語 (手の候補づくり・バッチ) の台。まだ選んでいなければ、量産ラインと同じ台 (2026-11-17 までと同じ)。"""
-    if not store.app_file(STORY_MACHINES_FILE).exists():
-        return machines()
-    return _read_machines(STORY_MACHINES_FILE)
-
-
-def set_story_machines(urls: list[str]) -> None:
-    store.write_text(store.app_file(STORY_MACHINES_FILE),
-                     "\n".join(u.strip().rstrip("/") for u in urls[:MAX_MACHINES]))
-
-
-def machines_overlap() -> bool:
-    """量産ラインと物語が同じ台を使うか (使うなら同時には動かさない)。"""
-    line = {u.lower() for u in machines()}
-    return any(u.lower() in line for u in story_machines())
 
 
 def natural_key(text: str):

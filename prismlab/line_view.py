@@ -73,7 +73,7 @@ class LineView(QWidget):
     status = Signal(str)  # ステータスバーに出す文
     to_story = Signal(list)  # 結果の画像を、開いている物語の最後にシーンとして足す
     to_batch = Signal(list)  # 結果の画像を、物語のバッチの最初の画像にする (設定の窓を出す)
-    machines_changed = Signal()  # 台の設定を変えた (物語の台と重なるかが変わる)
+    machines_changed = Signal()  # 台の設定を変えた (物語のタブの札と、物語のエンジンの台を直す)
     _scanned = Signal(int, str, list)
 
     def __init__(self, eng: engine.Engine, parent=None):
@@ -84,7 +84,6 @@ class LineView(QWidget):
             self.recipes = recipes.default_recipes()
         self.index = min(max(recipes.last_index(), 0), len(self.recipes) - 1)
         self.thumbs = ThumbCache(160, self)
-        self.story_batch_busy = lambda: False  # 物語のバッチが動いているか (ウィンドウが入れる)
         self.thumbs.changed.connect(lambda _p: self._schedule())
         self._scanned_files: list = []  # 入口のフォルダの (パス, ★の数)
         self._scanned_folder = None  # _scanned_files を読んだフォルダ
@@ -237,22 +236,6 @@ class LineView(QWidget):
     def running(self) -> bool:
         run = self.engine.run
         return self.engine.active and run is not None and run.unfinished > 0
-
-    def blocks_batch(self) -> bool:
-        """物語のバッチを待たせるか。一時停止していて実行中のものがなければ待たせない
-        (一時停止のまま置いた量産で、夜中のバッチが止まったままにならないように。バッチの最中は再開させない)。"""
-        if not self.running() or not recipes.machines_overlap():
-            return False  # 物語と別の台なら、同時に動かしてよい
-        run = self.engine.run
-        return not (run.paused and not any(i.state == engine.RUNNING for i in run.items))
-
-    def _batch_blocks(self, title: str) -> bool:
-        """物語のバッチが同じ台で動いていれば知らせて True (台が重ならなければ同時に動かしてよい)。"""
-        if not self.story_batch_busy() or not recipes.machines_overlap():
-            return False
-        QMessageBox.information(self, title, "物語をバッチで作っています。量産ラインと物語が同じ台を使うので、同時には動かしません。"
-                                "終わるか止めてからにするか、物語のタブの「台の設定...」で物語の台を量産ラインと別にしてください。")
-        return True
 
     def _schedule(self) -> None:
         if not self._timer.isActive():
@@ -926,16 +909,12 @@ class LineView(QWidget):
             recipes.set_machines(urls)
             self.engine.set_machines(urls)
             self.machines_changed.emit()
-            if recipes.machines_overlap():
-                self.status.emit("物語と同じ台を含むので、物語のバッチとは同時に動かしません (物語のタブの「台の設定...」で分けられます)。")
 
     # ------------------------------------------------------------------
     # 開始・一時停止・中止
     # ------------------------------------------------------------------
     def _ready(self, title: str, need_folder: bool = True) -> bool:
         """始められるか (入口・ステップ・台)。だめなら理由を出して False。"""
-        if self._batch_blocks(title):
-            return False
         r = self.recipe
         if r.single:
             if not r.image or not Path(r.image).is_file():
@@ -1028,8 +1007,6 @@ class LineView(QWidget):
         run = self.engine.run
         if run is None:
             return
-        if run.paused and self._batch_blocks("再開"):
-            return
         self.engine.set_paused(not run.paused)
         if run.paused:
             self.status.emit("一時停止しました。実行中のものが終わったら止まります。")
@@ -1047,8 +1024,6 @@ class LineView(QWidget):
             self.engine.cancel_all()
 
     def _retry(self) -> None:
-        if self._batch_blocks("失敗したものをやり直す"):
-            return
         n = self.engine.retry_failed()
         if n:
             self.status.emit(f"失敗した {n} 件をやり直します。")

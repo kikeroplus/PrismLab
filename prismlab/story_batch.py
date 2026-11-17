@@ -3,11 +3,11 @@
 1 本ごとに新しい物語のフォルダを作り、プロンプトの数だけシーンを並べる (2 つ目からは「続き」・顔は前と同じ)。
 シーン 1 から順に、(英語に / 盛る) → 候補を 1 つ作る → 自動で採用 → その最後のコマが次のシーンの元画像、
 を最後まで繰り返す。失敗したらその物語はそこで止め、次の本へ進む。出来た物語は普通の物語 (手で直せる)。
-候補づくりは物語のタブのエンジン (一度に 1 つ) をそのまま使う。
+候補づくりは物語のタブのエンジン (一度に 1 つ) をそのまま使う。台は量産ラインと分け合う (engine.POOL。物語が先)。
 
 バッチは「待ち行列」に足して、上から 1 件ずつ進める (BatchQueue)。動いているあいだも足せる
-(物語のタブ・J-Rate・PromptWordCrafter・量産ラインの結果から)。量産ラインや物語のタブの候補づくりが
-動いているあいだは、終わるのを待ってから始める。待ち行列はファイルに残し、落ちても次の起動で続きから始める
+(物語のタブ・J-Rate・PromptWordCrafter・量産ラインの結果から)。物語のタブの候補づくり (手で) が
+動いているあいだは、終わるのを待ってから始める (量産ラインとは同時に動く)。待ち行列はファイルに残し、落ちても次の起動で続きから始める
 (作りかけの物語は、まだ採用していないシーンから)。
 """
 
@@ -34,7 +34,7 @@ from . import kinds, recipes, story, theme, translate
 PLAN_FILE = "story_batch.json"  # 前に使ったバッチの設定 (窓を開いたときに入れる)
 QUEUE_FILE = "story_batch_queue.json"  # 待ち行列 (落ちても続きから始める)
 MAX_RUNS = 20
-TICK_MS = 2000  # 待っている (量産ラインなど) ときに、始められるか見る間隔
+TICK_MS = 2000  # 待っている (手の候補づくり・開いている窓など) ときに、始められるか見る間隔
 
 WAITING, RUNNING, DONE, STOPPED = "waiting", "running", "done", "stopped"
 STATE_LABELS = {WAITING: "待機中", RUNNING: "実行中", DONE: "完了", STOPPED: "止めた"}
@@ -674,7 +674,7 @@ class BatchRunner(QObject):
 # 待ち行列
 # ----------------------------------------------------------------------
 class BatchQueue(QObject):
-    """バッチを上から 1 件ずつ進める。量産ラインや物語のタブの候補づくりが動いていれば、終わるまで待つ。"""
+    """バッチを上から 1 件ずつ進める。物語のタブの候補づくり (手で) が動いていれば、終わるまで待つ。"""
 
     changed = Signal()  # 中身や状態が変わった (待ち行列の窓・帯を作り直す)
     progress = Signal(str)  # 帯に出す文
@@ -795,9 +795,7 @@ class BatchQueue(QObject):
                 self.changed.emit()
             return
         reason = ""
-        if self.view.line_busy():
-            reason = "量産ラインが終わるのを待っています"
-        elif self.view.candidates_busy():
+        if self.view.candidates_busy():
             reason = "物語のタブの候補づくりが終わるのを待っています"
         elif self.view.llm_busy():
             reason = "物語のタブの読み取り・盛る・英語にが終わるのを待っています"

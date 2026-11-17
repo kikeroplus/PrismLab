@@ -267,6 +267,47 @@ def load_run() -> Optional[Run]:
         return None
 
 
+class SlotPool:
+    """台の空き (1 台に同時に SLOTS_PER_MACHINE 件まで) を、量産ラインと物語のエンジンで分け合う (2026-11-17 利用者の決定)。
+    両方が待っているときは、先にする側 (物語) に次の空きを渡す: 先にする側に生成を待っている件があるあいだは、
+    もう一方はその件数ぶんの空きを残す。追い出しはしない (動いているものは最後まで)。"""
+
+    def __init__(self, slots: int = SLOTS_PER_MACHINE):
+        self.slots = slots
+        self._lock = threading.Lock()
+        self._used: dict[str, int] = {}  # 台の URL の小文字 → 使っている数
+        self._first_demand = 0  # 先にする側で、生成を待っている件数 (先にする側のエンジンが知らせる)
+        self.peak: dict[str, int] = {}  # 台ごとの同時に使った最大の数 (テストで見る)
+
+    def set_demand(self, count: int) -> None:
+        with self._lock:
+            self._first_demand = max(0, count)
+
+    def take(self, url: str, first: bool) -> bool:
+        """空きをもらう。もらえなければ False。"""
+        key = url.lower()
+        with self._lock:
+            used = self._used.get(key, 0)
+            room = self.slots if first else self.slots - min(self._first_demand, self.slots)
+            if used >= room:
+                return False
+            self._used[key] = used + 1
+            self.peak[key] = max(self.peak.get(key, 0), used + 1)
+            return True
+
+    def put_back(self, url: str) -> None:
+        key = url.lower()
+        with self._lock:
+            self._used[key] = max(0, self._used.get(key, 0) - 1)
+
+    def used(self, url: str) -> int:
+        with self._lock:
+            return self._used.get(url.lower(), 0)
+
+
+POOL = SlotPool()  # アプリの中で 1 つ (量産ラインと物語のエンジンが共有する)
+
+
 def _cancellable(func: Callable[[], str], cancel: threading.Event) -> str:
     """LLM の呼び出し (最大 3 分かかる) を別のスレッドで動かし、待つ間もキャンセルを効かせる。"""
     box: dict = {}
@@ -293,9 +334,12 @@ class Engine(QObject):
     changed = Signal()
     finished = Signal()
 
-    def __init__(self, parent=None, run_file: Optional[str] = RUN_FILE):
+    def __init__(self, parent=None, run_file: Optional[str] = RUN_FILE, first: bool = False,
+                 pool: Optional[SlotPool] = None):
         super().__init__(parent)
         self.run_file = run_file  # 続きから始めるための書き出し先 (None = 書かない。物語の候補づくりなど)
+        self.first = first  # 台の空きを先にもらう側 (物語。量産ラインと両方が待っているとき)
+        self.pool = pool or POOL  # 台の空き (量産ラインと物語で共有)
         self.run: Optional[Run] = None
         self.machines: list[Machine] = []
         self.llm_status = ""
@@ -515,18 +559,27 @@ class Engine(QObject):
                     if m.state == DOWN and not m.checking and time.time() - m.last_check >= DOWN_RECHECK:
                         m.checking = check = True
                         break
+                    self._publish()
                     if m.state == UP:
                         it = self._pick(gen=True, url=url)
-                        if it is not None:
+                        # 台の空きは量産ラインと物語で分け合う (1 台に合わせて 2 件まで。物語が先)
+                        if it is not None and self.pool.take(url, self.first):
                             it.state = RUNNING
                             it.at = url
                             cancel = self._cancels.setdefault(id(it), threading.Event())
+                            self._publish()
                             break
                     self._cond.wait(1.0)
             if check:
                 self._recheck(m)
                 continue
-            self._run_gen(it, m, cancel)
+            try:
+                self._run_gen(it, m, cancel)
+            finally:
+                self.pool.put_back(url)
+                if self.first:
+                    with self._cond:
+                        self._publish()
 
     def _recheck(self, m: Machine) -> None:
         ok = comfy.test_connection(m.url) is None
@@ -737,8 +790,22 @@ class Engine(QObject):
             self._cond.notify_all()
         self.finished.emit()
 
+    def _demand(self) -> int:
+        """生成を待っている件数 (ロックを持って呼ぶ)。一時停止・止めるときは 0。"""
+        run = self.run
+        if run is None or run.paused or self._stop:
+            return 0
+        return sum(1 for it in run.items if it.state == WAITING and it.stage < len(run.stages)
+                   and run.stages[it.stage]["type"] == recipes.GEN)
+
+    def _publish(self) -> None:
+        """先にする側なら、生成を待っている件数を台の空きの置き場に知らせる (ロックを持って呼ぶ)。"""
+        if self.first:
+            self.pool.set_demand(self._demand())
+
     def _save(self) -> None:
         with self._cond:
+            self._publish()  # 状態が変わるたびに呼ばれるので、ここで知らせる
             if self.run is None or not self.run_file:
                 return
             text = json.dumps(self.run.to_dict(), ensure_ascii=False)
