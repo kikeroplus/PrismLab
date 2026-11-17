@@ -12,6 +12,7 @@
 """
 
 import json
+import shutil
 import threading
 import time
 import uuid
@@ -21,7 +22,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
@@ -108,12 +109,17 @@ def story_folder(parent: str, name: str, index: int, runs: int) -> Path:
 
 
 def create_story(plan: Plan, folder: Path, title: str) -> story.Story:
-    """物語を作り、カットの数だけシーンを並べる (1 つ目はシーンチェンジ・最初の画像、2 つ目からは続き)。"""
+    """物語を作り、カットの数だけシーンを並べる (1 つ目はシーンチェンジ・最初の画像、2 つ目からは続き)。
+    最初の画像・リファレンスを写せなければ、作りかけのフォルダを消して StoryError (空の物語を残さない)。"""
     st = story.Story.create(str(folder), title)
     first = st.scenes[0]
-    st.set_source_file(first, plan.image)
-    if plan.reference:
-        st.set_reference(first, plan.reference)
+    try:
+        st.set_source_file(first, plan.image)
+        if plan.reference:
+            st.set_reference(first, plan.reference)
+    except (story.StoryError, OSError) as exc:
+        shutil.rmtree(folder, ignore_errors=True)  # story_folder で決めた新しいフォルダなので、丸ごと消してよい
+        raise story.StoryError(str(exc)) from exc
     first.workflow, first.seconds, first.base_prompt, first.count = plan.workflow, plan.seconds, plan.base_prompt, 1
     first.original = plan.cuts[0]
     prev = first
@@ -516,6 +522,12 @@ class BatchRunner(QObject):
                 resumed = story.Story.load(entry.folder)
             except story.StoryError:
                 entry.folder = ""
+        if resumed is None and not Path(p.image).is_file():
+            # 足したあとで最初の画像を動かした・消した: 残りの本も作れないので、この件はここで終える
+            entry.failed.append(f"{p.name}: 最初の画像が見つかりません ({p.image})")
+            entry.run_index = p.runs
+            self._finish(DONE)
+            return
         try:
             if resumed is not None:
                 self.story = resumed
@@ -787,6 +799,11 @@ class BatchQueue(QObject):
             reason = "量産ラインが終わるのを待っています"
         elif self.view.candidates_busy():
             reason = "物語のタブの候補づくりが終わるのを待っています"
+        elif self.view.llm_busy():
+            reason = "物語のタブの読み取り・盛る・英語にが終わるのを待っています"
+        elif QApplication.activeModalWidget() is not None or QApplication.activePopupWidget() is not None:
+            # 窓 (ファイルを選ぶ・確かめるなど) の中で選んだものが、始めたバッチの物語に入らないように
+            reason = "開いている窓を閉じたら始めます"
         if reason:
             if reason != self.wait_reason:
                 self.wait_reason = reason
@@ -816,6 +833,9 @@ class BatchQueue(QObject):
             stopped = any(e.state == STOPPED for e in done)
             lines = [f"出来た物語 {total} 本 (バッチ {len(done)} 件)" + (" (止めました)" if stopped else "")]
             lines += [e.summary() for e in done]
+            places = sorted({e.plan.parent for e in done if e.made})
+            if places:  # バッチの物語は「最近開いた物語」に入れないので、場所を知らせる (「開く...」で開く)
+                lines.append("作った場所: " + " / ".join(places))
             self.all_done.emit("\n".join(lines))
         else:
             self.progress.emit(self.headline())

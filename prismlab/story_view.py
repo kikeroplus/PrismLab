@@ -694,6 +694,7 @@ class StoryView(QWidget):
         self.batch.entry_done.connect(lambda text: self.status.emit("バッチが 1 件終わりました。" + text))
         self.batch.all_done.connect(self._batch_done)
         self._batch_dialog = None  # 開いている「バッチに足す」の窓 (送られた画像をここに足す)
+        self._before_batch: Optional[str] = None  # バッチを始める前に開いていた物語 (待ち行列が止まったら戻す)
         self._queue_window = None
 
         self._fill_stories()
@@ -1022,10 +1023,14 @@ class StoryView(QWidget):
             self.story_box.addItem(f"{Path(folder).name}   ({folder})", folder)
         if self.story is not None:
             index = self.story_box.findData(self.story.folder)
-            self.story_box.setCurrentIndex(max(index, 0))
+            if index < 0:  # 最近開いた物語に入れていないもの (バッチが作っている物語)
+                self.story_box.insertItem(0, f"{self.story.name}   (バッチ · {self.story.folder})", self.story.folder)
+                index = 0
+            self.story_box.setCurrentIndex(index)
         self.story_box.blockSignals(False)
 
-    def open_folder(self, folder: str, quiet: bool = False) -> bool:
+    def open_folder(self, folder: str, quiet: bool = False, remember: bool = True) -> bool:
+        """物語を開く。remember = 最近開いた物語に入れる (バッチが開くものは入れない)。"""
         try:
             st = story.Story.load(folder)
         except story.StoryError as exc:
@@ -1035,7 +1040,8 @@ class StoryView(QWidget):
         self._save()
         self.story = st
         self.scene = st.scenes[0]
-        story.remember(folder)
+        if remember:
+            story.remember(folder)
         self._fill_stories()
         self.refresh(rebuild=True, load=True)  # シーンの中身 (プロンプト・ワークフロー・プリセットの欄) を入れる
         self.status.emit(f"物語「{st.name}」を開きました。")
@@ -2340,6 +2346,10 @@ class StoryView(QWidget):
     def _stop_batch(self) -> None:
         self.batch.stop_current()
 
+    def llm_busy(self) -> bool:
+        """読み取る・盛る・英語に (手で) を待っているか (バッチが物語を開くと、結果の入れ先がなくなるので待つ)。"""
+        return bool(self._llm_busy)
+
     def candidates_busy(self) -> bool:
         """物語のタブで (手で) 候補を作っているか。"""
         run = self.engine.run
@@ -2349,6 +2359,9 @@ class StoryView(QWidget):
         """待ち行列が 1 件を始める前: 編集中のものを保存する。"""
         self._save_timer.stop()
         self._save()
+        if self._before_batch is None:  # 待ち行列が止まったら、この物語に戻す (自分で開いたもの = 最近開いた物語のときだけ)
+            mine = self.story is not None and any(Path(f) == Path(self.story.folder) for f in story.recent())
+            self._before_batch = self.story.folder if mine else ""
 
     def _lock_for_batch(self, on: bool) -> None:
         """バッチのあいだは見るだけ (物語の切り替え・シーンの編集・候補の操作はしない)。足すのはできる。"""
@@ -2357,8 +2370,12 @@ class StoryView(QWidget):
         if on:
             self.batch_label.setText("バッチを始めます…")
         else:
-            self._fill_stories()
-            self.refresh(rebuild=True, load=True)
+            back, self._before_batch = self._before_batch, None
+            # バッチの前に開いていた物語に戻す (バッチの物語は最近開いた物語に入れていないので。結果の場所はまとめで知らせる)
+            if not (back and self.story is not None and Path(back) != Path(self.story.folder)
+                    and self.open_folder(back, quiet=True)):
+                self._fill_stories()
+                self.refresh(rebuild=True, load=True)
         self._batch_changed()
 
     def _batch_progress(self, text: str) -> None:
@@ -2412,7 +2429,7 @@ class StoryView(QWidget):
 
     def open_batch_story(self, folder: str) -> None:
         """バッチが作った物語を開く (見せるだけ。編集はバッチが終わるまでさせない)。"""
-        self.open_folder(folder, quiet=True)
+        self.open_folder(folder, quiet=True, remember=False)  # 最近開いた物語を、バッチの物語で埋めない
 
     def scene_text_changed(self, scene: story.Scene) -> None:
         """バッチがシーンの送るプロンプトを書いたとき。"""

@@ -23,11 +23,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from PySide6.QtGui import QColor, QImage  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox  # noqa: E402
 
 from fakes import FakeComfy, FakeLLM, make_video, workflow_flf, workflow_i2v, workflow_i2v_ref  # noqa: E402
 from gencommon import comfy, enhancer, settings, store  # noqa: E402
-from prismlab import profile, recipes, story, story_batch, theme  # noqa: E402
+from prismlab import engine, profile, recipes, story, story_batch, theme  # noqa: E402
 from prismlab.main_window import MainWindow  # noqa: E402
 
 app = QApplication(sys.argv)
@@ -310,6 +310,94 @@ window.receive({"cmd": "send", "from": "PWC", "target": "story", "slot": "batch"
 check(sv._batch_dialog.added == [str(face)] and window.tabs.currentWidget() is sv, "窓を開いているときは、その窓に足す")
 sv._batch_dialog = None
 check("画像だけ" in sv.receive([str(TMP / "clip.mp4")], "batch"), "画像がなければ理由を返す")
+
+# 11. 最近開いた物語をバッチの物語で埋めない。終わったら、前に開いていた物語に戻す (場所はまとめで知らせる)
+batch_names = {p.name for p in parent.iterdir()}
+check(not any(Path(f).name in batch_names for f in story.recent()), "バッチの物語は最近開いた物語に入れない")
+mine = story.Story.create(str(TMP / "自分" / "自分の物語"), "自分の物語")
+sv.open_folder(mine.folder)
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("戻る", "a")]
+told.clear()
+sv._start_batch()
+pump(0.5)
+check(sv.batch.active and "バッチ" in sv.story_box.currentText(), "作っている物語は上の欄に (バッチ) と出す")
+wait_batch()
+check(sv.story is not None and sv.story.name == "自分の物語", "終わったら前に開いていた物語に戻す")
+check(told and f"作った場所: {parent}" in told[-1], told[-1] if told else "")
+check(story.recent()[0] == mine.folder, "次に起動したときも自分の物語を開く")
+
+# 12. 窓 (ファイルを選ぶ・確かめるなど) を開いているあいだは始めない (選んだものがバッチの物語に入らないように)
+modal = QDialog(window)
+modal.setModal(True)
+modal.show()
+pump(0.2)
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("窓", "a")]
+sv._start_batch()
+pump(2.5)
+check(not sv.batch.active and "窓を閉じたら" in sv.batch_label.text(), sv.batch_label.text())
+modal.close()
+pump(2.5)
+check(sv.batch.active or (parent / "窓").exists(), "窓を閉じたら始める")
+wait_batch()
+check(sv.story.name == "自分の物語" and not sv.scene.source, "自分の物語には何も入っていない")
+
+# 13. 読み取る・盛る・英語に (手で) を待っているあいだは始めない (結果の入れ先がなくなるので)
+sv._llm_busy = "読み取り"
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("読む", "a")]
+sv._start_batch()
+pump(2.5)
+check(not sv.batch.active and "読み取り" in sv.batch_label.text(), sv.batch_label.text())
+sv._llm_busy = ""
+pump(2.5)
+check(sv.batch.active or (parent / "読む").exists(), "終わったら始める")
+wait_batch()
+
+# 14. 量産ラインが一時停止 (実行中のものなし) なら待たない。バッチの最中は量産の再開・やり直しをさせない
+sv.line_busy = lv.blocks_batch
+line_recipe = recipes.Recipe(name="量産", output_dir=str(TMP / "量産"), inherit=False,
+                             stages=[recipes.Stage(recipes.GEN, workflow=str(wf_dir / "Wan I2V.json"))])
+lv.engine.set_machines([a.url])
+lv.engine.start(engine.Run.create(line_recipe, [photo, photo, photo]))
+lv.engine.set_paused(True)
+end = time.time() + 30
+while time.time() < end and any(i.state == engine.RUNNING for i in lv.engine.run.items):
+    pump(0.2)
+check(lv.running() and not lv.blocks_batch(), "一時停止して実行中のものがない量産は、バッチを待たせない")
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("夜中", "a / b")]
+a.polls = 6
+sv._start_batch()
+pump(2.5)
+check(sv.batch.active, "一時停止の量産があってもバッチを始める")
+told.clear()
+lv._toggle_pause()
+check(lv.engine.run.paused and told and "同時には" in told[-1], "バッチの最中は量産を再開しない")
+with lv.engine._cond:
+    lv.engine.run.items[0].state, lv.engine.run.items[0].error = engine.FAILED, "テスト"
+told.clear()
+lv._retry()
+check(lv.engine.run.items[0].state == engine.FAILED and told and "同時には" in told[-1],
+      "バッチの最中は量産の失敗をやり直さない")
+a.polls = 2
+wait_batch()
+lv.engine.cancel_all()
+end = time.time() + 30
+while time.time() < end and lv.running():
+    pump(0.2)
+sv.line_busy = lambda: False
+
+# 15. 足したあとで最初の画像が消えたら、その件は 1 度だけ知らせて終える (空の物語のフォルダを残さない)
+gone = TMP / "消える.png"
+shutil.copy2(photo, gone)
+p = small_plan("消えた", "a", runs=3)
+p.image = str(gone)
+gone.unlink()
+story_batch.ask_plans = lambda *_a, **_k: [p]
+told.clear()
+sv._start_batch()
+wait_batch()
+check(told and told[-1].startswith("出来た物語 0 本") and told[-1].count("最初の画像が見つかりません") == 1,
+      told[-1] if told else "")
+check(not any(n.name.startswith("消えた") for n in parent.iterdir()), "空の物語のフォルダを残さない")
 
 window.story.shutdown()
 window.engine.stop_threads()

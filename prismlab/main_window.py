@@ -45,7 +45,7 @@ class MainWindow(QMainWindow):
         self.line.to_story.connect(self._line_to_story)
         self.line.to_batch.connect(self._line_to_batch)
         # 量産ラインと物語のバッチは同じ台を使うので、同時には動かさない
-        self.story.line_busy = self.line.running
+        self.story.line_busy = self.line.blocks_batch  # 一時停止して実行中のものがなければ待たない
         self.line.story_batch_busy = lambda: self.story.batch.active
         self.statusBar().showMessage(notice or "準備ができました。", 8000)
         settings.restore_geometry(self)

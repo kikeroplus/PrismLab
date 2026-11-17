@@ -56,13 +56,16 @@ python tests\test_engine.py   # 量産の中心部分
 python tests\ui_smoke.py      # 画面を回して、途中と終わったときの画面を PNG に撮る
 python tests\test_story.py    # 物語のデータ (本物の短い mp4 を作って最後のコマなどを確かめる)
 python tests\story_smoke.py   # 物語の画面 (シーン 2 つを作ってつなぐ)
+python tests\test_send.py     # J-Rate・PromptWordCrafter からの「PrismLab に送る」(受ける側。別のプロセスから送るものも)
+python tests\test_batch.py    # 物語のバッチと待ち行列 (量産ラインとの取り合い・一時停止・続きから)
+python tests\test_hover_video.py  # 結果の「乗せると拡大」の動画再生
 ```
 
 物語のコマを読むのに OpenCV (`opencv-python`) を使います (`pip install -r requirements.txt`)。
 
 ## 設定の保存先
 
-`%APPDATA%\PrismLab\` (レシピ `recipes.json`、台 `machines.txt`、量産の状態 `line_run.json`、生成の記録 `comfy_history.txt`、窓の位置)。共有するものは `%APPDATA%\GenCommon\`。
+`%APPDATA%\PrismLab\` (レシピ `recipes.json`、台 `machines.txt`、量産の状態 `line_run.json`、生成の記録 `comfy_history.txt`、窓の位置、最近開いた物語 `stories.txt`、物語のバッチの前の設定 `story_batch.json` と待ち行列 `story_batch_queue.json`、元画像などを選んだフォルダ `story_pick_folder.txt`)。共有するものは `%APPDATA%\GenCommon\`。物語そのものは物語のフォルダの `story.json`。
 
 ## 物語
 

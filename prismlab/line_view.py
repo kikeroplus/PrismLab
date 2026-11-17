@@ -237,6 +237,22 @@ class LineView(QWidget):
         run = self.engine.run
         return self.engine.active and run is not None and run.unfinished > 0
 
+    def blocks_batch(self) -> bool:
+        """物語のバッチを待たせるか。一時停止していて実行中のものがなければ待たせない
+        (一時停止のまま置いた量産で、夜中のバッチが止まったままにならないように。バッチの最中は再開させない)。"""
+        if not self.running():
+            return False
+        run = self.engine.run
+        return not (run.paused and not any(i.state == engine.RUNNING for i in run.items))
+
+    def _batch_blocks(self, title: str) -> bool:
+        """物語のバッチが動いていれば知らせて True (同じ台を使うので、量産と同時には動かさない)。"""
+        if not self.story_batch_busy():
+            return False
+        QMessageBox.information(self, title, "物語をバッチで作っています (同じ台を使うので、同時には動かしません)。"
+                                "終わるか止めてからにしてください。")
+        return True
+
     def _schedule(self) -> None:
         if not self._timer.isActive():
             self._timer.start()
@@ -914,9 +930,7 @@ class LineView(QWidget):
     # ------------------------------------------------------------------
     def _ready(self, title: str, need_folder: bool = True) -> bool:
         """始められるか (入口・ステップ・台)。だめなら理由を出して False。"""
-        if self.story_batch_busy():
-            QMessageBox.information(self, title, "物語をバッチで作っています (同じ台を使うので、同時には動かしません)。"
-                                    "終わるか止めてからにしてください。")
+        if self._batch_blocks(title):
             return False
         r = self.recipe
         if r.single:
@@ -1010,6 +1024,8 @@ class LineView(QWidget):
         run = self.engine.run
         if run is None:
             return
+        if run.paused and self._batch_blocks("再開"):
+            return
         self.engine.set_paused(not run.paused)
         if run.paused:
             self.status.emit("一時停止しました。実行中のものが終わったら止まります。")
@@ -1027,6 +1043,8 @@ class LineView(QWidget):
             self.engine.cancel_all()
 
     def _retry(self) -> None:
+        if self._batch_blocks("失敗したものをやり直す"):
+            return
         n = self.engine.retry_failed()
         if n:
             self.status.emit(f"失敗した {n} 件をやり直します。")
