@@ -158,6 +158,28 @@ warnings.clear()
 send({"cmd": "send", "from": "J-Rate", "target": "recipe", "recipe": "★から動画", "index": 0,
       "files": [str(pics / "pick_4.png")]})
 check(warnings and "動いている" in warnings[-1] and lv.recipe.picked == files, "量産中は入れずに知らせる")
+check(lv.locked() and not lv.stage_cards[0].bypass.isVisible(), "動いている量産のレシピは直せない")
+# ほかのレシピは量産中も直せる (送る・切り替える・ステップを足す)
+running_chip = lv.recipe_group.button(0)
+warnings.clear()
+send({"cmd": "send", "from": "PromptWordCrafter", "target": "recipe", "recipe": "テキストから", "index": 1,
+      "files": [str(prompts / "a.txt")]})
+check(not warnings and lv.index == 1 and lv.recipe.is_picked and lv.running() and not lv.locked(),
+      "量産中でも、ほかのレシピには送れる (そのレシピを見せる)")
+check(running_chip.text().startswith("▶ ") and all(b.isEnabled() for b in lv.recipe_group.buttons()),
+      "動いている量産のレシピに ▶ を付け、ほかのレシピにも切り替えられる")
+before = len(lv.recipe.stages)
+import prismlab.line_view as line_view_module  # noqa: E402
+real_dialog = line_view_module.StageDialog
+line_view_module.StageDialog = lambda _stage, _parent: type("OK", (), {"exec": lambda _self: 1})()  # 設定の窓は OK
+lv._add_stage(recipes.TEXT)
+line_view_module.StageDialog = real_dialog
+check(len(lv.recipe.stages) == before + 1 and lv.stage_cards[0].count.text() == "", "ほかのレシピのステップを足せる (量産の進み具合は出さない)")
+check(not lv.start_button.isEnabled() and "動いています" in lv.start_button.toolTip(), "始めるのは量産が終わってから")
+lv.recipe.stages.pop()
+lv._save_recipes()
+lv._select_recipe(0)
+check(lv.locked(), "量産のレシピに戻ると、また直せない (進み具合を出す)")
 wait_run()
 
 # 3. PWC からテキスト 2 件をレシピ「テキストから」へ (並べ替えたあと: index が違っても名前で探す)

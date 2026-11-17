@@ -3,12 +3,12 @@
 1 本ごとに新しい物語のフォルダを作り、プロンプトの数だけシーンを並べる (2 つ目からは「続き」・顔は前と同じ)。
 シーン 1 から順に、(英語に / 盛る) → 候補を 1 つ作る → 自動で採用 → その最後のコマが次のシーンの元画像、
 を最後まで繰り返す。失敗したらその物語はそこで止め、次の本へ進む。出来た物語は普通の物語 (手で直せる)。
-候補づくりは物語のタブのエンジン (一度に 1 つ) をそのまま使う。台は量産ラインと分け合う (engine.POOL。物語が先)。
 
-バッチは「待ち行列」に足して、上から 1 件ずつ進める (BatchQueue)。動いているあいだも足せる
-(物語のタブ・J-Rate・PromptWordCrafter・量産ラインの結果から)。物語のタブの候補づくり (手で) が
-動いているあいだは、終わるのを待ってから始める (量産ラインとは同時に動く)。待ち行列はファイルに残し、落ちても次の起動で続きから始める
-(作りかけの物語は、まだ採用していないシーンから)。
+バッチは「待ち行列」に足す (BatchQueue)。物語 1 本は順にしか作れない (次のシーンは前のシーンの最後のコマから) ので、
+別々の物語 (別の件・同じ件の何本目) を、台の数 (最大 MAX_PARALLEL 本) まで並べて作る (StoryWorker。2026-11-17 案 A)。
+物語 1 本ごとに自分の生成の窓口を持ち、画面 (物語のタブ) は使わない。台の空きは量産ラインと分け合う (engine.POOL。物語が先)。
+動いているあいだも足せる (物語のタブ・J-Rate・PromptWordCrafter・量産ラインの結果から)。
+待ち行列はファイルに残し、落ちても次の起動で続きから始める (作りかけの物語は、まだ採用していないシーンから)。
 """
 
 import json
@@ -22,19 +22,20 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from gencommon import comfy, enhancer, store
 
-from . import kinds, recipes, story, theme, translate
+from . import engine, kinds, recipes, story, theme, translate
 
 PLAN_FILE = "story_batch.json"  # 前に使ったバッチの設定 (窓を開いたときに入れる)
 QUEUE_FILE = "story_batch_queue.json"  # 待ち行列 (落ちても続きから始める)
 MAX_RUNS = 20
-TICK_MS = 2000  # 待っている (手の候補づくり・開いている窓など) ときに、始められるか見る間隔
+TICK_MS = 2000  # 空いた枠に次の物語を入れられるか見る間隔
+MAX_PARALLEL = 3  # 同時に作る物語の本数の上限 (実際は台の数まで)
 
 WAITING, RUNNING, DONE, STOPPED = "waiting", "running", "done", "stopped"
 STATE_LABELS = {WAITING: "待機中", RUNNING: "実行中", DONE: "完了", STOPPED: "止めた"}
@@ -151,8 +152,8 @@ class Entry:
     plan: Plan
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     state: str = WAITING
-    run_index: int = 0  # 今 (次) 作る本の番号
-    folder: str = ""  # 作りかけの物語 (続きから始めるときはここから)
+    run_index: int = 0  # 始めた本の数 (作りかけも含む。次に新しく作るのは run_index 本目)
+    folders: list = field(default_factory=list)  # 作りかけの物語 (一時停止・落ちたあとは、ここから続きを作る)
     made: list = field(default_factory=list)  # 最後まで出来た物語の名前
     failed: list = field(default_factory=list)  # 途中で止まった物語 (名前: 理由)
     added: float = field(default_factory=time.time)
@@ -170,9 +171,13 @@ class Entry:
         if not isinstance(data, dict) or not isinstance(data.get("plan"), dict):
             return None
         entry = Entry(Plan.from_dict(data["plan"]))
-        for key in ("id", "state", "run_index", "folder", "made", "failed", "added", "ended"):
+        for key in ("id", "state", "run_index", "folders", "made", "failed", "added", "ended"):
             if key in data:
                 setattr(entry, key, data[key])
+        if data.get("folder") and not data.get("folders"):  # 2026-11-17 までの形: 作りかけは 1 本、run_index はその本
+            entry.folders = [str(data["folder"])]
+            entry.run_index = int(entry.run_index or 0) + 1
+        entry.folders = [str(f) for f in entry.folders if f]
         if not entry.plan.cuts:
             entry.plan.cuts = split_prompts(entry.plan.prompts)
         return entry
@@ -443,158 +448,125 @@ def check_plan(p: Plan) -> str:
 
 
 # ----------------------------------------------------------------------
-# 1 件を進める役
+# 物語 1 本を作る役 (画面に出さずに裏で進める。何本も並べて動かす)
 # ----------------------------------------------------------------------
-class BatchRunner(QObject):
-    """物語のタブ (view) の候補づくりを使って、1 件のバッチのシーンを順に作る。"""
+MADE, FAILED, HALTED, STOPPED_ONE = "made", "failed", "halted", "stopped"
 
-    progress = Signal(str)  # 今していること (物語のタブの帯に出す)
-    ended = Signal(object)  # 1 件が終わった・止めた・一時停止で待機に戻した (Entry。state で分かる)
-    changed = Signal()  # 進んだ (待ち行列を書き直す)
+
+class StoryWorker(QObject):
+    """物語 1 本のシーンを順に作る。自分の生成の窓口 (Engine) を持ち、台の空きは量産ラインと分け合う (物語が先)。
+    ended(自分, 結果, 理由): 結果は MADE / FAILED / HALTED (一時停止・閉じる。作りかけは残す) / STOPPED_ONE。"""
+
+    ended = Signal(object, str, str)
+    changed = Signal()  # 進んだ (帯・待ち行列の窓を描き直す)
     _llm = Signal(int, str, str)  # (頼んだ番号, 文, 失敗の理由)
 
-    def __init__(self, view):
-        super().__init__(view)
-        self.view = view
+    def __init__(self, parent, should_pause: Callable[[], bool]):
+        super().__init__(parent)
+        self.engine = engine.Engine(self, run_file=None, first=True)
+        self.engine.finished.connect(self._on_finished)
+        self.should_pause = should_pause
         self.entry: Optional[Entry] = None
         self.plan: Optional[Plan] = None
-        self.active = False
         self.story: Optional[story.Story] = None
+        self.folder = ""
         self.scene_index = 0
-        self.should_pause: Callable[[], bool] = lambda: False  # 待ち行列が一時停止なら、次のシーンへ進まない
+        self.status = ""
+        self.active = False
         self._waiting = False  # 候補の出来上がりを待っている
-        self._known: set = set()  # 頼む前の候補
         self._ticket = 0  # LLM の頼みの番号 (止めたあとに届いたものは捨てる)
+        self._job = ("", "", "")  # (送った文, 元のプロンプト, リファレンス)
         self._llm.connect(self._on_llm)
-        view.engine.finished.connect(self._on_finished)  # 物語のタブが候補を受け取ったあとに呼ばれる
+
+    @property
+    def winding_down(self) -> bool:
+        """止めた候補づくりが、まだ片付いていない (この役はまだ次に使えない)。"""
+        run = self.engine.run
+        return self.engine.active and run is not None and run.unfinished > 0
 
     # 始める・止める ---------------------------------------------------------
-    def start(self, entry: Entry) -> None:
+    def start(self, entry: Entry, folder: str, index: int) -> None:
+        """folder があればその作りかけの物語の続きから、なければ index 本目の物語を新しく作る。"""
         self.entry, self.plan, self.active = entry, entry.plan, True
-        entry.state = RUNNING
+        self.story, self.folder, self.status = None, folder, "始めています…"
+        p = self.plan
+        if folder:
+            try:
+                self.story = story.Story.load(folder)
+            except story.StoryError as exc:
+                self._end(FAILED, str(exc))
+                return
+        else:
+            title = p.name if p.runs == 1 else f"{p.name} {index + 1:02}"
+            target = story_folder(p.parent, p.name, index, p.runs)
+            try:
+                self.story = create_story(p, target, title)
+            except story.StoryError as exc:
+                self.folder = str(target)
+                self._end(FAILED, str(exc))
+                return
+            self.folder = str(target)
+            entry.folders.append(self.folder)  # 作りかけ (落ちても続きから作れるように、すぐ書く)
+        st = self.story
+        self.scene_index = next((i for i, s in enumerate(st.scenes)
+                                 if not (s.adopted and Path(s.adopted).is_file())), len(st.scenes))
         self.changed.emit()
-        self._next_story()
+        QTimer.singleShot(0, self._next_scene)
 
     def _cancel(self) -> None:
         self._ticket += 1
-        if self._waiting and self.view.engine.active:
-            self.view.engine.cancel_all()  # 出来上がり (取り消し) は _on_finished で受けるが、_waiting でないので何もしない
+        if self._waiting and self.engine.active:
+            self.engine.cancel_all()  # 出来上がり (取り消し) は _on_finished で受けるが、_waiting でないので何もしない
         self._waiting = False
 
-    def stop(self) -> None:
-        """この件をやめる (作っている物語は途中で止まったものにする)。"""
-        if not self.active:
-            return
-        self._cancel()
-        if self.story is not None:
-            self.entry.failed.append(f"{self.story.name}: 止めました")
-        self.entry.folder = ""
-        self._finish(STOPPED)
-
     def halt(self) -> None:
-        """待機に戻す (一時停止・アプリを閉じるとき)。作りかけの物語は、次に始めたときにまだ採用していないシーンから続ける。"""
-        if not self.active:
-            return
-        self._cancel()
-        self._finish(WAITING)
+        """一時停止・閉じるとき: 今の候補はやめ、作りかけの物語は残す (次はまだ採用していないシーンから)。"""
+        if self.active:
+            self._cancel()
+            self._end(HALTED)
 
-    def _finish(self, state: str) -> None:
-        entry = self.entry
-        entry.state = state
-        if state != WAITING:
-            entry.ended = time.time()
+    def stop(self) -> None:
+        """この物語をやめる (途中で止まったものにする)。"""
+        if self.active:
+            self._cancel()
+            self._end(STOPPED_ONE, "止めました")
+
+    def _end(self, outcome: str, reason: str = "") -> None:
         self.active = False
-        self.story = None
-        self.ended.emit(entry)
+        self.status = ""
+        self.ended.emit(self, outcome, reason)
 
-    # 物語 ------------------------------------------------------------------
-    def _next_story(self) -> None:
-        p, entry = self.plan, self.entry
-        if not self.active:
-            return
-        if entry.run_index >= p.runs:
-            self._finish(DONE)
-            return
-        title = p.name if p.runs == 1 else f"{p.name} {entry.run_index + 1:02}"
-        resumed = None
-        if entry.folder:  # 作りかけ (一時停止・落ちたあと): 続きから
-            try:
-                resumed = story.Story.load(entry.folder)
-            except story.StoryError:
-                entry.folder = ""
-        if resumed is None and not Path(p.image).is_file():
-            # 足したあとで最初の画像を動かした・消した: 残りの本も作れないので、この件はここで終える
-            entry.failed.append(f"{p.name}: 最初の画像が見つかりません ({p.image})")
-            entry.run_index = p.runs
-            self._finish(DONE)
-            return
+    @property
+    def name(self) -> str:
+        return self.story.name if self.story is not None else (Path(self.folder).name if self.folder else "")
+
+    def _save(self) -> bool:
         try:
-            if resumed is not None:
-                self.story = resumed
-            else:
-                folder = story_folder(p.parent, p.name, entry.run_index, p.runs)
-                self.story = create_story(p, folder, title)
-                entry.folder = str(folder)
+            self.story.save()
+            return True
         except story.StoryError as exc:
-            entry.failed.append(f"{title}: {exc}")
-            entry.run_index += 1
-            self.changed.emit()
-            self._next_story()
-            return
-        self.changed.emit()
-        self.view.open_batch_story(self.story.folder)
-        st = self.view.story
-        self.scene_index = 0
-        if resumed is not None and st is not None:
-            self.scene_index = next((i for i, s in enumerate(st.scenes)
-                                     if not (s.adopted and Path(s.adopted).is_file())), len(st.scenes))
-        self._next_scene()
+            self._end(FAILED, str(exc))
+            return False
 
-    def _story_done(self, made: bool, reason: str = "") -> None:
-        entry = self.entry
-        name = self.story.name if self.story is not None else entry.plan.name
-        if made:
-            entry.made.append(name)
-        else:
-            entry.failed.append(f"{name}: {reason}")
-        entry.folder = ""
-        entry.run_index += 1
+    def _set_status(self, what: str) -> None:
+        n = len(self.story.scenes) if self.story is not None else 0
+        self.status = f"{self.name} · シーン {self.scene_index + 1} / {n} · {what}"
         self.changed.emit()
-        self._next_story()
-
-    def _story_failed(self, reason: str) -> None:
-        self._story_done(False, reason)
 
     # シーン ----------------------------------------------------------------
-    def _status(self, what: str) -> None:
-        p = self.plan
-        head = (f"{p.name} · {self.entry.run_index + 1} / {p.runs} 本目 · "
-                f"シーン {self.scene_index + 1} / {len(p.cuts)}")
-        self.progress.emit(f"{head} · {what}")
-
-    def _scene(self) -> Optional[story.Scene]:
-        st = self.view.story
-        if st is None or self.story is None or Path(st.folder) != Path(self.story.folder):
-            return None  # 物語のタブで別の物語に替わった (バッチ中は替えられないはず)
-        return st.scenes[self.scene_index] if self.scene_index < len(st.scenes) else None
-
     def _next_scene(self) -> None:
         if not self.active:
             return
-        st = self.view.story
-        if st is None or self.story is None or Path(st.folder) != Path(self.story.folder):
-            self._story_failed("物語が替わりました")
-            return
+        st = self.story
         if self.scene_index >= len(st.scenes):
-            self._story_done(True)
+            self._end(MADE)
             return
         if self.should_pause():
             self.halt()
             return
-        scene = self._scene()
-        self.view.select(scene)
+        scene = st.scenes[self.scene_index]
         if not scene.source or not Path(scene.source).is_file():
-            self._story_failed(f"シーン {self.scene_index + 1} の元画像がありません (前のシーンの最後のコマが取れません)")
+            self._end(FAILED, f"シーン {self.scene_index + 1} の元画像がありません (前のシーンの最後のコマが取れません)")
             return
         p = self.plan
         if p.english or p.enhance:
@@ -603,7 +575,7 @@ class BatchRunner(QObject):
             snap_en = translate.snapshot() if p.english else None
             found = [x for x in enhancer.load_presets() if not x.is_empty and x.name == p.enhancer]
             snap_enh = enhancer.snapshot(found[0]) if p.enhance and found else None
-            self._status("英語に直しています…" if p.english else "盛っています…")
+            self._set_status("英語に直しています…" if p.english else "盛っています…")
 
             def work():
                 try:
@@ -623,24 +595,50 @@ class BatchRunner(QObject):
     def _on_llm(self, ticket: int, text: str, error: str) -> None:
         if ticket != self._ticket or not self.active:
             return
-        scene = self._scene()
-        if scene is None:
-            self._story_failed("物語が替わりました")
-            return
         if error or not text:
-            self._story_failed(f"シーン {self.scene_index + 1} の LLM に失敗: {error or '返事が空'}")
+            self._end(FAILED, f"シーン {self.scene_index + 1} の LLM に失敗: {error or '返事が空'}")
             return
+        scene = self.story.scenes[self.scene_index]
         scene.prompt = text
         scene.record("バッチで送る文 (英語に / 盛る)", text)
-        self.view.scene_text_changed(scene)
-        self._make(scene)
+        if self._save():
+            self._make(scene)
 
     def _make(self, scene: story.Scene) -> None:
-        self._known = {c.path for c in scene.candidates}
-        self._status("候補を作っています…")
-        problem = self.view.make_candidates_for(scene)
-        if problem:
-            self._story_failed(f"シーン {self.scene_index + 1}: {problem}")
+        """候補を 1 つ作り始める (物語のタブの「候補を作る」と同じ中身。画面は使わない)。"""
+        st = self.story
+        if kinds.has_last_frame(scene.workflow):
+            self._end(FAILED, "ラストフレームを指定するワークフローはバッチでは使えません")
+            return
+        machines = recipes.machines()
+        if not machines:
+            self._end(FAILED, "使う台が決まっていません (「台の設定...」で選んでください)")
+            return
+        folder = st.scene_dir(scene)
+        folder.mkdir(parents=True, exist_ok=True)
+        reference = st.reference_of(scene) if kinds.has_reference(scene.workflow) else ""
+        recipe = recipes.Recipe(name=st.name, output_dir=str(folder), inherit=False,
+                                stages=[recipes.Stage(recipes.GEN, workflow=scene.workflow, seconds=scene.seconds,
+                                                      base_prompt=scene.base_prompt)])
+        try:
+            run = engine.Run.create(recipe, [Path(scene.source)])
+        except (ValueError, comfy.ComfyError) as exc:
+            self._end(FAILED, f"シーン {self.scene_index + 1}: {exc}")
+            return
+        text = scene.send_text
+        for it in run.items:
+            it.text = text or None  # 空ならワークフローに書かれたプロンプトのまま
+            it.reference = reference
+        self._job = (text, scene.original, reference)
+        scene.record("候補に送った文", text)
+        if not self._save():
+            return
+        self._set_status("候補を作っています…")
+        self.engine.set_machines(machines)
+        try:
+            self.engine.start(run)
+        except RuntimeError as exc:
+            self._end(FAILED, str(exc))
             return
         self._waiting = True
 
@@ -648,24 +646,29 @@ class BatchRunner(QObject):
         if not self.active or not self._waiting:
             return
         self._waiting = False
-        scene = self._scene()
-        if scene is None:
-            self._story_failed("物語が替わりました")
-            return
-        new = sorted((c for c in scene.candidates if c.path not in self._known and Path(c.path).is_file()),
-                     key=lambda c: c.time)
+        st = self.story
+        scene = st.scenes[self.scene_index]
+        _run, items, _m = self.engine.snapshot()
+        prompt, original, reference = self._job
+        known = {c.path for c in scene.candidates}
+        new = []
+        for it in items:
+            for o in it.outputs:
+                if o["path"] not in known and Path(o["path"]).is_file():
+                    c = story.Candidate(o["path"], prompt, float(o.get("time") or time.time()), original, reference, "")
+                    scene.candidates.append(c)
+                    new.append(c)
         if not new:
-            _r, items, _m = self.view.engine.snapshot()
             errors = [it.error.splitlines()[0] for it in items if it.error]
-            self._story_failed(f"シーン {self.scene_index + 1} の候補が出来ませんでした"
-                               + (f" ({errors[0]})" if errors else ""))
+            self._end(FAILED, f"シーン {self.scene_index + 1} の候補が出来ませんでした" + (f" ({errors[0]})" if errors else ""))
             return
         try:
-            self.view.story.adopt(scene, new[0].path)  # 次の「続き」のシーンの元画像 (最後のコマ) もここで作る
+            st.adopt(scene, new[0].path)  # 次の「続き」のシーンの元画像 (最後のコマ) もここで作る
         except story.StoryError as exc:
-            self._story_failed(f"シーン {self.scene_index + 1} を採用できません: {exc}")
+            self._end(FAILED, f"シーン {self.scene_index + 1} を採用できません: {exc}")
             return
-        self.view.batch_adopted()
+        if not self._save():
+            return
         self.scene_index += 1
         self._next_scene()
 
@@ -674,11 +677,11 @@ class BatchRunner(QObject):
 # 待ち行列
 # ----------------------------------------------------------------------
 class BatchQueue(QObject):
-    """バッチを上から 1 件ずつ進める。物語のタブの候補づくり (手で) が動いていれば、終わるまで待つ。"""
+    """バッチの物語を、台の数 (最大 MAX_PARALLEL 本) まで並べて作る。上の件から順に、1 件の何本目も並べる。"""
 
     changed = Signal()  # 中身や状態が変わった (待ち行列の窓・帯を作り直す)
     progress = Signal(str)  # 帯に出す文
-    running = Signal(bool)  # 1 件を動かし始めた / 止まった (物語のタブを見るだけにする・戻す)
+    running = Signal(bool)  # 作り始めた / すべて止まった
     entry_done = Signal(str)  # 1 件が終わった (ステータスバー)
     all_done = Signal(str)  # 待ち行列が空になった (この回に終わったもののまとめ)
 
@@ -690,12 +693,8 @@ class BatchQueue(QObject):
         self.restoring: list[Entry] = []  # 前回の残り (起動したときに続きからにするか聞くまで、書くときに残す)
         self._restoring_paused = False
         self._session: list[Entry] = []  # この回に終わったもの (まとめに出す)
-        self.wait_reason = ""
-        self.runner = BatchRunner(view)
-        self.runner.should_pause = lambda: self.paused
-        self.runner.progress.connect(self.progress)
-        self.runner.changed.connect(self._save_and_notify)
-        self.runner.ended.connect(self._ended)
+        self.workers: list[StoryWorker] = []
+        self._was_active = False
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
         self._timer.timeout.connect(self.tick)
@@ -704,10 +703,18 @@ class BatchQueue(QObject):
     # 様子 ------------------------------------------------------------------
     @property
     def active(self) -> bool:
-        return self.runner.active
+        return any(w.active for w in self.workers)
 
-    def current(self) -> Optional[Entry]:
-        return self.runner.entry if self.runner.active else None
+    def busy_workers(self) -> list[StoryWorker]:
+        return [w for w in self.workers if w.active]
+
+    def working_ids(self) -> set:
+        return {w.entry.id for w in self.busy_workers()}
+
+    def is_working(self, folder: str) -> bool:
+        """その物語をバッチが作っている (作りかけで待っているものも)。"""
+        key = str(Path(folder)).lower()
+        return any(str(Path(f)).lower() == key for e in self.entries + self.restoring if e.unfinished for f in e.folders)
 
     def waiting(self) -> list[Entry]:
         return [e for e in self.entries if e.state == WAITING]
@@ -715,21 +722,30 @@ class BatchQueue(QObject):
     def unfinished(self) -> int:
         return sum(1 for e in self.entries if e.unfinished)
 
+    @staticmethod
+    def capacity() -> int:
+        """同時に作る物語の本数 (台の数。台の空きは量産ラインと分け合う)。"""
+        return max(1, min(MAX_PARALLEL, len(recipes.machines())))
+
     def headline(self) -> str:
         """帯と待ち行列の窓の上に出す文。"""
-        n = len(self.waiting())
-        if self.runner.active:
-            tail = f" · ほかに待機 {n} 件" if n else ""
+        busy = self.busy_workers()
+        n = sum(1 for e in self.entries if e.unfinished and e.id not in self.working_ids())
+        if busy:
+            text = f"物語のバッチ: {len(busy)} 本を作っています"
             if self.paused:
-                return f"一時停止: 今のシーンが終わったら止まります{tail}"
-            return ""  # 進み具合 (progress) を出す
+                text += " · 一時停止: 今のシーンが終わったら止まります"
+            if n:
+                text += f" · ほかに待機 {n} 件"
+            return text + "  —  " + " / ".join(w.status for w in busy if w.status)
         if not n:
             return ""
         if self.paused:
             return f"一時停止中 (待機 {n} 件)。「再開」で続けます。"
-        if self.wait_reason:
-            return f"待機 {n} 件 · {self.wait_reason}"
         return f"待機 {n} 件 · まもなく始めます"
+
+    def _emit_progress(self) -> None:
+        self.progress.emit(self.headline())
 
     # 足す・外す・並べ替え --------------------------------------------------
     def add(self, plans: list[Plan]) -> list[Entry]:
@@ -740,13 +756,13 @@ class BatchQueue(QObject):
         return new
 
     def remove(self, ids: list[str]) -> None:
-        """待機中・終わったものは外す。実行中のものは止める (止めた、として残す)。"""
-        cur = self.current()
-        # 先に外してから止める (止めると次のものが始まるので、外すものが始まらないように)
-        self.entries = [e for e in self.entries if e.id not in ids or e is cur]
+        """待機中・終わったものは外す。作っているものは止める (止めた、として残す)。"""
+        working = self.working_ids()
+        stop = [e for e in self.entries if e.id in ids and e.id in working]
+        self.entries = [e for e in self.entries if e.id not in ids or e.id in working]
         self._save_and_notify()
-        if cur is not None and cur.id in ids:
-            self.runner.stop()
+        for e in stop:
+            self._stop_entry(e)
 
     def move(self, entry_id: str, delta: int) -> None:
         i = next((k for k, e in enumerate(self.entries) if e.id == entry_id), -1)
@@ -764,79 +780,163 @@ class BatchQueue(QObject):
     def set_paused(self, on: bool) -> None:
         self.paused = on
         self._save_and_notify()
-        if on and self.runner.active:
-            self.progress.emit(self.headline())
+        self._emit_progress()
         if not on:
             QTimer.singleShot(0, self.tick)
 
     def stop_current(self) -> None:
-        self.runner.stop()
+        """作っているものをすべて止める (その件は「止めた」にして、次の件へ)。"""
+        for e in [e for e in self.entries if e.id in self.working_ids()]:
+            self._stop_entry(e)
+
+    def _stop_entry(self, entry: Entry) -> None:
+        entry.state = STOPPED
+        entry.ended = time.time()
+        for w in self.busy_workers():
+            if w.entry is entry:
+                w.stop()
+        for f in entry.folders:  # 一時停止で残っていた作りかけも、止めたものにする
+            entry.failed.append(f"{Path(f).name}: 止めました")
+        entry.folders = []
+        self._entry_finished(entry)
+        self._save_and_notify()
 
     def shutdown(self) -> None:
-        """閉じるとき: 動いているものは待機に戻して残す (次に起動したときに続きから)。"""
+        """閉じるとき: 作っているものは作りかけとして残す (次に起動したときに続きから)。"""
         self._timer.stop()
-        for signal in (self.runner.ended, self.runner.changed):
+        for w in self.workers:
             try:
-                signal.disconnect()
+                w.ended.disconnect()
             except (RuntimeError, TypeError):
                 pass
-        if self.runner.active:
-            self.runner.halt()
+            w.halt()
+            if w.winding_down:
+                w.engine.discard()  # 頼み済みのものは ComfyUI の待ち行列から外す (受け取れないので)
+            else:
+                w.engine.stop_threads()
+        for e in self.entries:
+            if e.state == RUNNING:
+                e.state = WAITING
         self._save()
 
     # 進める ----------------------------------------------------------------
-    def tick(self) -> None:
-        if self.runner.active or self.paused:
-            return
-        waiting = self.waiting()
-        if not waiting:
-            if self.wait_reason:
-                self.wait_reason = ""
-                self.changed.emit()
-            return
-        reason = ""
-        if self.view.candidates_busy():
-            reason = "物語のタブの候補づくりが終わるのを待っています"
-        elif self.view.llm_busy():
-            reason = "物語のタブの読み取り・盛る・英語にが終わるのを待っています"
-        elif QApplication.activeModalWidget() is not None or QApplication.activePopupWidget() is not None:
-            # 窓 (ファイルを選ぶ・確かめるなど) の中で選んだものが、始めたバッチの物語に入らないように
-            reason = "開いている窓を閉じたら始めます"
-        if reason:
-            if reason != self.wait_reason:
-                self.wait_reason = reason
-                self.changed.emit()
-                self.progress.emit(self.headline())
-            return
-        self.wait_reason = ""
-        entry = waiting[0]
-        self.view.prepare_for_batch()
-        self.running.emit(True)
-        self.runner.start(entry)
+    def _next_job(self) -> Optional[tuple]:
+        """次に作る物語: (件, 作りかけのフォルダ, 本の番号)。上の件から、作りかけ → 新しい本の順。"""
+        taken = {str(Path(w.folder)).lower() for w in self.busy_workers() if w.folder}
+        for e in self.entries:
+            if not e.unfinished:
+                continue
+            for f in e.folders:
+                if str(Path(f)).lower() not in taken:
+                    return e, f, -1
+            if e.run_index < e.plan.runs:
+                if not Path(e.plan.image).is_file():
+                    # 足したあとで最初の画像を動かした・消した: 残りの本も作れないので、この件はここで終える
+                    e.failed.append(f"{e.plan.name}: 最初の画像が見つかりません ({e.plan.image})")
+                    e.run_index = e.plan.runs
+                    self._update_state(e)
+                    continue
+                e.run_index += 1
+                return e, "", e.run_index - 1
+        return None
 
-    def _ended(self, entry: Entry) -> None:
-        if entry.state != WAITING:
-            self._session.append(entry)
-            self.entry_done.emit(entry.summary())
+    def _idle_worker(self) -> Optional[StoryWorker]:
+        for w in self.workers:
+            if not w.active and not w.winding_down:
+                return w
+        if len(self.workers) < MAX_PARALLEL:
+            w = StoryWorker(self, lambda: self.paused)
+            w.ended.connect(self._ended)
+            w.changed.connect(self._emit_progress)
+            w.changed.connect(self.changed)
+            self.workers.append(w)
+            return w
+        return None
+
+    def tick(self) -> None:
+        if self.paused:
+            return
+        if not recipes.machines():
+            if self.waiting():
+                self.progress.emit(f"待機 {len(self.waiting())} 件 · 台が決まっていません (「台の設定...」で選んでください)")
+            return
+        started = False
+        while len(self.busy_workers()) < self.capacity():
+            worker = self._idle_worker()
+            if worker is None:
+                break  # 止めた候補づくりの片付けを待つ
+            job = self._next_job()
+            if job is None:
+                break
+            entry, folder, index = job
+            if folder:
+                self.view.release_story(folder)  # 物語のタブで開いていたら閉じる (同じ物語を両方が書かないように)
+            entry.state = RUNNING
+            started = True
+            worker.start(entry, folder, index)
+        if started:
+            self._save_and_notify()
+            self._emit_progress()
+            if not self._was_active and self.active:
+                self._was_active = True
+                self.running.emit(True)
+        self._check_all_done()
+
+    def _ended(self, worker: StoryWorker, outcome: str, reason: str) -> None:
+        e = worker.entry
+        if e is None:
+            return
+        name = worker.name or e.plan.name
+        if outcome != HALTED and worker.folder:
+            key = str(Path(worker.folder)).lower()
+            e.folders = [f for f in e.folders if str(Path(f)).lower() != key]
+        if outcome == MADE:
+            e.made.append(name)
+        elif outcome in (FAILED, STOPPED_ONE):
+            e.failed.append(f"{name}: {reason}")
+        self._update_state(e)
+        self._save_and_notify()
+        self._emit_progress()
+        QTimer.singleShot(0, self.tick)  # 次があれば続けて始める
+
+    def _update_state(self, e: Entry) -> None:
+        if e.state == STOPPED:
+            return
+        if any(w.entry is e for w in self.busy_workers()):
+            e.state = RUNNING
+        elif e.run_index >= e.plan.runs and not e.folders:
+            e.state = DONE
+            e.ended = time.time()
+            self._entry_finished(e)
+        else:
+            e.state = WAITING
+
+    def _entry_finished(self, e: Entry) -> None:
+        if e not in self._session:
+            self._session.append(e)
+            self.entry_done.emit(e.summary())
+
+    def _check_all_done(self) -> None:
+        if self.active:
+            return
+        if self._was_active:
+            self._was_active = False
+            self.running.emit(False)
         if not any(e.unfinished for e in self.entries):
             self.paused = False  # 終わっていないものがなくなったら、一時停止は解く
-        self._save_and_notify()
-        self.tick()  # 次があれば続けて始める (帯を出したまま)
-        if self.runner.active:
-            return
-        self.running.emit(False)
-        if not self.waiting() and self._session:
-            done, self._session = self._session, []
-            total = sum(len(e.made) for e in done)
-            stopped = any(e.state == STOPPED for e in done)
-            lines = [f"出来た物語 {total} 本 (バッチ {len(done)} 件)" + (" (止めました)" if stopped else "")]
-            lines += [e.summary() for e in done]
-            places = sorted({e.plan.parent for e in done if e.made})
-            if places:  # バッチの物語は「最近開いた物語」に入れないので、場所を知らせる (「開く...」で開く)
-                lines.append("作った場所: " + " / ".join(places))
-            self.all_done.emit("\n".join(lines))
-        else:
-            self.progress.emit(self.headline())
+            if self._session:
+                done, self._session = self._session, []
+                total = sum(len(e.made) for e in done)
+                stopped = any(e.state == STOPPED for e in done)
+                lines = [f"出来た物語 {total} 本 (バッチ {len(done)} 件)" + (" (止めました)" if stopped else "")]
+                lines += [e.summary() for e in done]
+                places = sorted({e.plan.parent for e in done if e.made})
+                if places:  # バッチの物語は「最近開いた物語」に入れないので、場所を知らせる (「開く...」で開く)
+                    lines.append("作った場所: " + " / ".join(places))
+                self._save_and_notify()
+                self.all_done.emit("\n".join(lines))
+                return
+        self._emit_progress()
 
     # 保存・続きから --------------------------------------------------------
     def _save(self) -> None:
@@ -851,7 +951,7 @@ class BatchQueue(QObject):
         entries, paused = load_queue()
         self.restoring = [e for e in entries if e.unfinished]
         for e in self.restoring:
-            e.state = WAITING  # 実行中だったものも、待機から続ける
+            e.state = WAITING  # 作っていたものも、待機から続ける (作りかけの物語は続きから)
         self._restoring_paused = paused
         return len(self.restoring), paused
 
@@ -928,11 +1028,12 @@ class QueueWindow(QDialog):
         keep = set(self._selected_ids())
         entries = self.queue.entries
         self.table.setRowCount(len(entries))
-        cur = self.queue.current()
+        working = self.queue.working_ids()
         for r, e in enumerate(entries):
             p = e.plan
-            if e.state == RUNNING and cur is e:
-                state = f"実行中 ({e.run_index + 1} / {p.runs} 本目)"
+            if e.id in working:
+                k = sum(1 for w in self.queue.busy_workers() if w.entry is e)
+                state = f"実行中 ({k} 本を作っています · {e.run_index} / {p.runs} 本目まで)"
             elif e.state == WAITING and self.queue.paused:
                 state = "一時停止"
             else:
@@ -942,15 +1043,15 @@ class QueueWindow(QDialog):
                 result = f"出来た {len(e.made)} 本"
                 if e.failed:
                     result += " · 止まった: " + " / ".join(e.failed)
-            elif e.folder:
-                result = f"作りかけ: {Path(e.folder).name}"
+            if e.folders:
+                result += (" · " if result else "") + "作りかけ: " + " / ".join(Path(f).name for f in e.folders)
             cells = [state, p.name, Path(p.image).name, f"{len(p.cuts)} カット × {p.runs} 本", result]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setToolTip(p.image if c == 2 else text)
                 if c == 0:
                     item.setData(Qt.ItemDataRole.UserRole, e.id)
-                if e is cur:  # 実行中の行は色付きの太字 (生成の標準のジョブ一覧と同じ)
+                if e.id in working:  # 実行中の行は色付きの太字 (生成の標準のジョブ一覧と同じ)
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
@@ -965,14 +1066,11 @@ class QueueWindow(QDialog):
         self._update_buttons()
 
     def _update_head(self) -> None:
-        cur = self.queue.current()
-        n = len(self.queue.waiting())
+        busy = self.queue.active
         text = self.queue.headline()
-        if cur is not None and not text:
-            text = f"実行中: {cur.plan.name}" + (f" · 待機 {n} 件" if n else "")
         if not text:
             text = "待ち行列は空です。" if not self.queue.entries else "動いているものはありません。"
-        color = "#f0a030" if self.queue.paused else theme.ACCENT if cur is not None else theme.TEXT_DIM
+        color = "#f0a030" if self.queue.paused else theme.ACCENT if busy else theme.TEXT_DIM
         self.head.setText(text)
         self.head.setStyleSheet(f"color: {color}; font-weight: bold;")
 
@@ -996,10 +1094,9 @@ class QueueWindow(QDialog):
         ids = self._selected_ids()
         if not ids:
             return
-        cur = self.queue.current()
         chosen = [e for e in self.queue.entries if e.id in ids]
         text = (f"「{chosen[0].plan.name}」を外しますか?" if len(chosen) == 1 else f"{len(chosen)} 件を外しますか?")
-        if cur is not None and cur.id in ids:
+        if any(i in self.queue.working_ids() for i in ids):
             text += "\n実行中のものは止めます (ComfyUI に中止を送ります。出来た物語はそのまま残ります)。"
         if QMessageBox.question(self, "外す", text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:

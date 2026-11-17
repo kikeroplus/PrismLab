@@ -83,6 +83,7 @@ class LineView(QWidget):
         if not self.recipes:
             self.recipes = recipes.default_recipes()
         self.index = min(max(recipes.last_index(), 0), len(self.recipes) - 1)
+        self._run_recipe: Optional[recipes.Recipe] = None  # 今の (最後の) 量産のレシピ (それだけを量産中は直せなくする)
         self.thumbs = ThumbCache(160, self)
         self.thumbs.changed.connect(lambda _p: self._schedule())
         self._scanned_files: list = []  # 入口のフォルダの (パス, ★の数)
@@ -237,6 +238,20 @@ class LineView(QWidget):
         run = self.engine.run
         return self.engine.active and run is not None and run.unfinished > 0
 
+    def run_recipe(self) -> Optional[recipes.Recipe]:
+        """今の (最後の) 量産のレシピ。始めたときのものを覚えておき、なければ (続きから始めたときなど) 名前で探す。"""
+        run = self.engine.run
+        if run is None:
+            return None
+        if self._run_recipe is not None and any(r is self._run_recipe for r in self.recipes):
+            return self._run_recipe
+        self._run_recipe = next((r for r in self.recipes if r.name == run.name), None)
+        return self._run_recipe
+
+    def locked(self) -> bool:
+        """見ているレシピが、動いている量産のものか (それだけは直せない。ほかのレシピは量産中も直せる)。"""
+        return self.running() and self.run_recipe() is self.recipe
+
     def _schedule(self) -> None:
         if not self._timer.isActive():
             self._timer.start()
@@ -276,15 +291,11 @@ class LineView(QWidget):
         self.recipe_row.addWidget(add)
 
     def _select_recipe(self, index: int) -> None:
-        if self.running():
-            return
         self.index = index
         recipes.set_last_index(index)
         self.refresh(rebuild=True)
 
     def _recipe_menu(self, index: int, pos) -> None:
-        if self.running():
-            return
         menu = QMenu(self)
         rename = menu.addAction("名前を変える...")
         dup = menu.addAction("複製する")
@@ -295,7 +306,10 @@ class LineView(QWidget):
         right.setEnabled(index < len(self.recipes) - 1)
         menu.addSeparator()
         delete = menu.addAction("削除する...")
-        delete.setEnabled(len(self.recipes) > 1)
+        busy = self.running() and self.run_recipe() is self.recipes[index]
+        delete.setEnabled(len(self.recipes) > 1 and not busy)  # 動いている量産のレシピは消さない
+        if busy:
+            delete.setText("削除する... (量産中は消せません)")
         chosen = menu.exec(pos)
         if chosen is rename:
             name = ask_text(self, "名前を変える", "レシピの名前", self.recipes[index].name)
@@ -324,8 +338,6 @@ class LineView(QWidget):
         self.refresh(rebuild=True)
 
     def _add_recipe(self) -> None:
-        if self.running():
-            return
         name = ask_text(self, "レシピを足す", "レシピの名前")
         if not name:
             return
@@ -339,8 +351,8 @@ class LineView(QWidget):
     # ステップの並び
     # ------------------------------------------------------------------
     def _stage_views(self) -> list[dict]:
-        """見せるステップ: 動いている量産なら始めたときの写し、そうでなければ選んでいるレシピ。"""
-        if self.running():
+        """見せるステップ: 動いている量産のレシピなら始めたときの写し、そうでなければ選んでいるレシピ。"""
+        if self.locked():
             views = []
             for s in self.engine.run.stages:
                 v = {"type": s["type"], "bypass": bool(s.get("bypass"))}
@@ -397,8 +409,9 @@ class LineView(QWidget):
                 w.hide()  # 消えるまでのあいだも描かない (新しい並びと重ならないように)
                 w.deleteLater()
         run = self.engine.run
-        source = str(run.recipe.get("source") or recipes.FOLDER) if self.running() else self.recipe.source
-        picked = list(run.recipe.get("picked") or []) if self.running() else self.recipe.picked
+        showing = self.locked()
+        source = str(run.recipe.get("source") or recipes.FOLDER) if showing else self.recipe.source
+        picked = list(run.recipe.get("picked") or []) if showing else self.recipe.picked
         single, texts = source == recipes.SINGLE, recipes.entry_is_text(source, picked)
         is_picked = source == recipes.PICKED
         self.entry = Card()
@@ -474,13 +487,13 @@ class LineView(QWidget):
         self.unpick_button = QPushButton("× 外す")
         self.unpick_button.setToolTip("送られたものを入口から外し、前の入口 (フォルダなど) に戻します。")
         self.unpick_button.clicked.connect(self._unpick)
-        self.unpick_button.setVisible(is_picked and not self.running())
+        self.unpick_button.setVisible(is_picked and not showing)
         self.entry.box.insertWidget(self.entry.box.count() - 1, self.unpick_button)
         self.flow.addWidget(self.entry)
 
         self.stage_cards: list[Card] = []
         views = self._stage_views()
-        running_now = self.running()
+        running_now = showing
         problems = set() if running_now else recipes.line_problems(self.recipe.stages, text_entry=texts)
         prev_out = ("文字", kinds.TEXT_COLOR) if texts else ("画像", kinds.IMAGE_COLOR)
         has_text = texts  # テキストの入口は、初めから文がある
@@ -567,12 +580,13 @@ class LineView(QWidget):
         """index の位置 (0 = 入口のすぐあと) にステップを挿入する矢印。"""
         button = InsertArrow()
         button.set_menu(self._type_menu(button, lambda t: self._add_stage(t, index)))
-        button.setEnabled(not self.running())
+        button.setEnabled(not self.locked())
         return button
 
     def _edit_stage(self, index: int) -> None:
-        if self.running():
-            self.status.emit("量産が動いているあいだはステップを直せません (一時停止しても、始めたときの中身で続けます)。")
+        if self.locked():
+            self.status.emit("動いている量産のレシピは直せません (一時停止しても、始めたときの中身で続けます)。"
+                             "ほかのレシピは量産中も直せます。")
             return
         stage = self.recipe.stages[index]
         edited = recipes.Stage.from_dict(stage.to_dict())
@@ -582,7 +596,7 @@ class LineView(QWidget):
             self.refresh(rebuild=True)
 
     def _stage_menu(self, index: int, pos) -> None:
-        if self.running():
+        if self.locked():
             return
         stages = self.recipe.stages
         menu = QMenu(self)
@@ -640,7 +654,7 @@ class LineView(QWidget):
     def _set_bypass(self, index: int, on: bool) -> None:
         """バイパスを入れる・切る。入れるのは、入れてもラインが成り立つステップだけ。"""
         stages = self.recipe.stages
-        if self.running() or index >= len(stages) or stages[index].bypass == on:
+        if self.locked() or index >= len(stages) or stages[index].bypass == on:
             return
         if on and not recipes.can_bypass(stages, index, self.recipe.texts):
             self.status.emit(recipes.bypass_reason(stages, index, self.recipe.texts))
@@ -653,7 +667,7 @@ class LineView(QWidget):
 
     def _add_stage(self, stage_type: str, index: Optional[int] = None) -> None:
         """ステップを足す (index なしは末尾)。設定の窓で OK したときだけ入れる。"""
-        if self.running():
+        if self.locked():
             return
         stage = recipes.Stage(stage_type)
         if StageDialog(stage, self).exec():
@@ -664,7 +678,7 @@ class LineView(QWidget):
 
     def _change_stage_type(self, index: int, stage_type: str) -> None:
         """ステップの種類を変える。新しい種類の設定の窓で OK したときだけ置き換える (位置はそのまま)。"""
-        if self.running():
+        if self.locked():
             return
         stage = recipes.Stage(stage_type)
         if StageDialog(stage, self).exec():
@@ -676,7 +690,7 @@ class LineView(QWidget):
     # 入口・出力
     # ------------------------------------------------------------------
     def _choose_folder(self) -> None:
-        if self.running():
+        if self.locked():
             return
         folder = QFileDialog.getExistingDirectory(self, "入口のフォルダを選ぶ", self.recipe.folder or "")
         if folder:
@@ -705,7 +719,7 @@ class LineView(QWidget):
             self._drop_trial(path)
 
     def _source_changed(self, mode: int) -> None:
-        if self.running():
+        if self.locked():
             return
         source = recipes.SOURCES[mode] if 0 <= mode < len(recipes.SOURCES) else recipes.FOLDER
         if source == recipes.PICKED and not self.recipe.picked:
@@ -720,7 +734,7 @@ class LineView(QWidget):
 
     def _unpick(self) -> None:
         """送られたものを外して、前の入口に戻す。"""
-        if self.running():
+        if self.locked():
             return
         r = self.recipe
         r.picked, r.picked_from = [], ""
@@ -732,10 +746,6 @@ class LineView(QWidget):
 
     def receive_picked(self, files: list, sender: str, name: str = "", index: int = -1) -> str:
         """ほかのアプリから送られたファイルを、そのレシピの入口にする (spec 5 章)。入れられなければ理由を返す。"""
-        if self.running():
-            run = self.engine.run
-            return (f"量産「{run.name}」が動いているので、入口に入れられません。"
-                    "終わるか中止してから、もう一度送ってください。")
         target = -1
         if 0 <= index < len(self.recipes) and self.recipes[index].name == name:
             target = index
@@ -743,6 +753,9 @@ class LineView(QWidget):
             target = next((i for i, r in enumerate(self.recipes) if r.name == name), -1)
         if target < 0:
             return f"レシピ「{name}」が見つかりません (名前を変えたか、消したかもしれません)。"
+        if self.running() and self.run_recipe() is self.recipes[target]:
+            return (f"レシピ「{name}」で量産が動いているので、入口に入れられません。"
+                    "終わるか中止してから送るか、ほかのレシピに送ってください。")
         paths = [str(Path(f)) for f in files if f]
         found = [f for f in paths if Path(f).is_file()]
         if not found:
@@ -771,7 +784,7 @@ class LineView(QWidget):
         return ""
 
     def _choose_image(self) -> None:
-        if self.running():
+        if self.locked():
             return
         start = self.recipe.image or self.recipe.folder or ""
         exts = " ".join("*" + e for e in recipes.IMAGE_EXTS)
@@ -780,7 +793,7 @@ class LineView(QWidget):
             self._set_image(path)
 
     def _set_image(self, path: str) -> None:
-        if self.running():
+        if self.locked():
             return
         self.recipe.image = str(Path(path))
         self._save_recipes()
@@ -788,7 +801,7 @@ class LineView(QWidget):
         self.refresh()
 
     def _repeat_changed(self, value: int) -> None:
-        if self.running():
+        if self.locked():
             return
         self.recipe.repeat = value
         self._save_recipes()
@@ -818,7 +831,7 @@ class LineView(QWidget):
         return sources[0] if sources else None
 
     def _pick_trial(self, index: int) -> None:
-        if self.running() or self.recipe.single:
+        if self.locked() or self.recipe.single:
             return
         sources = self._entry_sources()
         if index < len(sources):
@@ -827,7 +840,7 @@ class LineView(QWidget):
             self.refresh()
 
     def _drop_trial(self, path: str) -> None:
-        if self.running():
+        if self.locked():
             return
         self.trial_source = str(Path(path))
         what = "試す 1 つ" if self.recipe.texts else "試す 1 枚"
@@ -835,7 +848,7 @@ class LineView(QWidget):
         self.refresh()
 
     def _stars_changed(self, index: int) -> None:
-        if self.running():
+        if self.locked():
             return
         self.recipe.min_stars = index
         self._save_recipes()
@@ -863,7 +876,7 @@ class LineView(QWidget):
 
     def rescan(self) -> None:
         """入口の★を読み直す (J-Rate から戻ったときなど)。動いている量産の入口は変えない。"""
-        if self.running():
+        if self.locked():
             return
         self._input_key = None
         self._texts_key = None  # テキストの入口も読み直す (ほかのアプリで .txt を直したかもしれない)
@@ -894,7 +907,7 @@ class LineView(QWidget):
 
     def _output_dir(self) -> str:
         run = self.engine.run
-        if run is not None and (self.running() or not self.recipe.folder
+        if run is not None and (self.locked() or not self.recipe.folder
                                 or (run.trial and run.name == self.recipe.name)):  # 試作のあとは 試作 のフォルダ
             return run.output_dir
         return self.recipe.resolved_output_dir()
@@ -960,6 +973,7 @@ class LineView(QWidget):
             QMessageBox.warning(self, "1 枚で試す", str(exc))
             return
         self.engine.start(run)
+        self._run_recipe = self.recipe
         self.results.setCurrentItem(None)
         self.status.emit(f"「{r.name}」を 1 枚で試しています: {source.name}")
         self.refresh(rebuild=True)
@@ -1000,6 +1014,7 @@ class LineView(QWidget):
                                     QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
                 return
         self.engine.start(run)
+        self._run_recipe = self.recipe
         self.status.emit(f"「{r.name}」を始めました ({len(files)} 件)。")
         self.refresh(rebuild=True)
 
@@ -1216,25 +1231,29 @@ class LineView(QWidget):
     def refresh(self, rebuild: bool = False) -> None:
         run, items, machines = self.engine.snapshot()
         running = self.running()
-        mode = (running, id(run), self.index)
+        showing = self.locked()  # 見ているレシピが動いている量産のもの (入口・ステップは量産の写しを見せる)
+        mode = (showing, id(run), self.index)
         if rebuild or mode != getattr(self, "_flow_mode", None):
             self._flow_mode = mode
             self._rebuild_flow()
         # ステップに数を出すのは、動いている量産か、見ているレシピで最後に回した量産のとき
-        show_stats = running or (run is not None and run.name == self.recipe.name
+        show_stats = showing or (not running and run is not None and self.run_recipe() is self.recipe
                                  and len(run.stages) == len(self.stage_cards))
+        busy_recipe = self.run_recipe() if running else None
         for b in self.recipe_group.buttons():
-            b.setEnabled(not running or self.recipe_group.id(b) == self.index)
+            r = self.recipes[self.recipe_group.id(b)] if self.recipe_group.id(b) < len(self.recipes) else None
+            b.setText(("▶ " if r is not None and r is busy_recipe else "") + ((r.name if r else "") or "(名前なし)"))
+            b.setToolTip("量産中 (このレシピは直せません。ほかのレシピは直せます)" if r is not None and r is busy_recipe else "")
 
         # 入口
-        source = str(run.recipe.get("source") or recipes.FOLDER) if running else self.recipe.source
-        picked = list(run.recipe.get("picked") or []) if running else self.recipe.picked
-        picked_from = str(run.recipe.get("picked_from") or "") if running else self.recipe.picked_from
+        source = str(run.recipe.get("source") or recipes.FOLDER) if showing else self.recipe.source
+        picked = list(run.recipe.get("picked") or []) if showing else self.recipe.picked
+        picked_from = str(run.recipe.get("picked_from") or "") if showing else self.recipe.picked_from
         single, texts = source == recipes.SINGLE, recipes.entry_is_text(source, picked)
         is_picked = source == recipes.PICKED
-        image = str(run.recipe.get("image", "")) if running else self.recipe.image
-        repeat = int(run.recipe.get("repeat") or 1) if running else self.recipe.repeat
-        if running:
+        image = str(run.recipe.get("image", "")) if showing else self.recipe.image
+        repeat = int(run.recipe.get("repeat") or 1) if showing else self.recipe.repeat
+        if showing:
             sources = list(dict.fromkeys(Path(i.source) for i in items))  # 回数ぶん重なったものは 1 つに
             folder = str(run.recipe.get("folder", ""))
             stars = int(run.recipe.get("min_stars") or 0)
@@ -1254,21 +1273,21 @@ class LineView(QWidget):
             self.breakdown.setText(("先頭: " + html.escape(self._short(inserts.read_file(first), 80))) if first else "")
         elif is_picked:
             missing = sum(1 for f in picked if not Path(f).is_file())
-            self.breakdown.setText(f"見つからない {missing}" if missing and not running else "")
+            self.breakdown.setText(f"見つからない {missing}" if missing and not showing else "")
         else:
-            self.breakdown.setText("" if running else self._star_breakdown(self._scanned_files))
-        self.rate_button.setVisible(not running and source == recipes.FOLDER)
+            self.breakdown.setText("" if showing else self._star_breakdown(self._scanned_files))
+        self.rate_button.setVisible(not showing and source == recipes.FOLDER)
         self.inherit_box.blockSignals(True)
-        self.inherit_box.setChecked(bool(run.recipe.get("inherit", True)) if running else self.recipe.inherit)
-        self.inherit_box.setEnabled(not running and not texts)  # テキストには★がない
+        self.inherit_box.setChecked(bool(run.recipe.get("inherit", True)) if showing else self.recipe.inherit)
+        self.inherit_box.setEnabled(not showing and not texts)  # テキストには★がない
         self.inherit_box.blockSignals(False)
         self.star_box.blockSignals(True)
         self.star_box.setCurrentIndex(stars)
-        self.star_box.setEnabled(not running)
+        self.star_box.setEnabled(not showing)
         self.star_box.blockSignals(False)
         for b in self.mode_buttons:
-            b.setEnabled(not running)
-        self.repeat_box.setEnabled(not running)
+            b.setEnabled(not showing)
+        self.repeat_box.setEnabled(not showing)
         times = f" × {repeat} 回" if repeat > 1 else ""
         if single:
             self.entry.detail.setText(("画像: " + Path(image).name) if image else "クリックして画像を選ぶ (ドラッグも)")
@@ -1281,7 +1300,7 @@ class LineView(QWidget):
             self.entry.detail.setText(f"{picked_from or 'ほかのアプリ'} から {len(picked)} {unit}")
             self.entry.detail.setToolTip("\n".join(Path(f).name for f in picked[:30])
                                          + ("\n…" if len(picked) > 30 else ""))
-            trial = None if running else self._trial_path()
+            trial = None if showing else self._trial_path()
             count = f"対象 {len(sources)} {unit}{times}"
             if trial is not None:
                 count += f"  ・ {'試す 1 つ' if texts else '試す 1 枚'}: {trial.name}"
@@ -1290,7 +1309,7 @@ class LineView(QWidget):
             self.entry.detail.setText((f"{what}: " + (Path(folder).name or folder)) if folder
                                       else f"クリックして{what}を選ぶ")
             self.entry.detail.setToolTip(folder)
-            trial = None if running else self._trial_path()
+            trial = None if showing else self._trial_path()
             count = (f"対象 {len(sources)} {'件' if texts else '枚'}{times}") if folder else ""
             if trial is not None:
                 count += ("  ・ " if count else "") + f"{'試す 1 つ' if texts else '試す 1 枚'}: {trial.name}"
@@ -1298,7 +1317,7 @@ class LineView(QWidget):
         self.entry.count.setToolTip(str(trial) if trial else "")
         shown = [Path(p) for p in sources[:3]]
         selected = shown.index(trial) if trial is not None and self.trial_source and trial in shown else -1
-        self.entry.thumbs.clickable = not running and not single and not texts
+        self.entry.thumbs.clickable = not showing and not single and not texts
         self.entry.thumbs.set([self.thumbs.get(str(p)) for p in shown], selected=selected)
 
         # ステップ
@@ -1339,9 +1358,9 @@ class LineView(QWidget):
         # 出力
         out = self._output_dir()
         self.out_label.setText("出力フォルダ: " + (out or "(入口のフォルダを選ぶと決まります)")
-                               + ("" if self.recipe.output_dir or running else "   (既定: 入口のフォルダ\\レシピ名)"))
-        self.out_change.setEnabled(not running)
-        self.out_reset.setEnabled(not running and bool(self.recipe.output_dir))
+                               + ("" if self.recipe.output_dir or showing else "   (既定: 入口のフォルダ\\レシピ名)"))
+        self.out_change.setEnabled(not showing)
+        self.out_reset.setEnabled(not showing and bool(self.recipe.output_dir))
 
         # 台
         for n, card in enumerate(self.machine_cards):
@@ -1372,6 +1391,10 @@ class LineView(QWidget):
         # 開始・一時停止・中止
         self.start_button.setEnabled(not running)
         self.trial_button.setEnabled(not running)
+        why = f"量産「{run.name}」が動いています。始めるのは終わってからです (このレシピは今も直せます)。" \
+            if running and not showing and run is not None else ""
+        self.start_button.setToolTip(why)
+        self.trial_button.setToolTip(why or "今のレシピで 1 枚だけ通します。")
         self.pause_button.setEnabled(running)
         self.pause_button.setText("再開" if run is not None and run.paused else "一時停止")
         self.cancel_button.setEnabled(running)

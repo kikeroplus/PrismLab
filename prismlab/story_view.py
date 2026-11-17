@@ -637,8 +637,8 @@ class StoryView(QWidget):
         self.batch_pause = QPushButton("一時停止")
         self.batch_pause.setToolTip("今のシーンが終わったら止めます。再開すると、作りかけの物語の続きから作ります。")
         self.batch_pause.clicked.connect(lambda: self.batch.set_paused(not self.batch.paused))
-        self.batch_stop = QPushButton("今のバッチを止める")
-        self.batch_stop.setToolTip("動いているバッチをやめて、待ち行列の次へ進みます (ComfyUI に中止を送ります)。")
+        self.batch_stop = QPushButton("作っているものを止める")
+        self.batch_stop.setToolTip("作っているバッチの件をやめて (「止めた」にして)、待ち行列の次へ進みます (ComfyUI に中止を送ります)。")
         self.batch_stop.clicked.connect(self._stop_batch)
         self.batch_queue_b = QPushButton("待ち行列...")
         self.batch_queue_b.clicked.connect(self._show_queue)
@@ -693,12 +693,11 @@ class StoryView(QWidget):
         # 物語のバッチの待ち行列 (engine.finished は、この画面の _on_finished のあとに受ける)
         self.batch = story_batch.BatchQueue(self)
         self.batch.progress.connect(self._batch_progress)
-        self.batch.running.connect(self._lock_for_batch)
+        self.batch.running.connect(lambda _on: self._batch_changed())
         self.batch.changed.connect(self._batch_changed)
         self.batch.entry_done.connect(lambda text: self.status.emit("バッチが 1 件終わりました。" + text))
         self.batch.all_done.connect(self._batch_done)
         self._batch_dialog = None  # 開いている「バッチに足す」の窓 (送られた画像をここに足す)
-        self._before_batch: Optional[str] = None  # バッチを始める前に開いていた物語 (待ち行列が止まったら戻す)
         self._queue_window = None
 
         self._fill_stories()
@@ -1034,7 +1033,11 @@ class StoryView(QWidget):
         self.story_box.blockSignals(False)
 
     def open_folder(self, folder: str, quiet: bool = False, remember: bool = True) -> bool:
-        """物語を開く。remember = 最近開いた物語に入れる (バッチが開くものは入れない)。"""
+        """物語を開く。remember = 最近開いた物語に入れる。バッチが作っている物語は開かない (同じ物語を両方が書かないように)。"""
+        if hasattr(self, "batch") and self.batch.is_working(folder):
+            if not quiet:
+                QMessageBox.information(self, "物語を開く", "この物語はバッチで作っています。出来上がるか、待ち行列で止めてから開いてください。")
+            return False
         try:
             st = story.Story.load(folder)
         except story.StoryError as exc:
@@ -2034,8 +2037,6 @@ class StoryView(QWidget):
         """ほかのアプリから送られたもの (spec 5 章)。入れられなければ理由を返す。"""
         if slot == "batch":  # 物語のバッチに足す: 設定の窓を出す (バッチが動いていても足せる)
             return self.queue_images(files)
-        if self.batch.active:
-            return "物語をバッチで作っています。終わるか止めてから、もう一度送ってください。"
         if self.story is None:
             return "物語を開いていません。PrismLab の「物語」で物語を開いてから、もう一度送ってください。"
         found = [f for f in files if Path(f).is_file()]
@@ -2364,40 +2365,24 @@ class StoryView(QWidget):
     def _stop_batch(self) -> None:
         self.batch.stop_current()
 
-    def llm_busy(self) -> bool:
-        """読み取る・盛る・英語に (手で) を待っているか (バッチが物語を開くと、結果の入れ先がなくなるので待つ)。"""
-        return bool(self._llm_busy)
-
     def candidates_busy(self) -> bool:
         """物語のタブで (手で) 候補を作っているか。"""
         run = self.engine.run
         return self.engine.active and run is not None and run.unfinished > 0
 
-    def prepare_for_batch(self) -> None:
-        """待ち行列が 1 件を始める前: 編集中のものを保存する。"""
-        self._save_timer.stop()
-        self._save()
-        if self._before_batch is None:  # 待ち行列が止まったら、この物語に戻す (自分で開いたもの = 最近開いた物語のときだけ)
-            mine = self.story is not None and any(Path(f) == Path(self.story.folder) for f in story.recent())
-            self._before_batch = self.story.folder if mine else ""
-
-    def _lock_for_batch(self, on: bool) -> None:
-        """バッチのあいだは見るだけ (物語の切り替え・シーンの編集・候補の操作はしない)。足すのはできる。"""
-        for w in (self.story_box, self.new_b, self.open_b, self.board_host, self.detail):
-            w.setEnabled(not on)
-        if on:
-            self.batch_label.setText("バッチを始めます…")
-        else:
-            back, self._before_batch = self._before_batch, None
-            # バッチの前に開いていた物語に戻す (バッチの物語は最近開いた物語に入れていないので。結果の場所はまとめで知らせる)
-            if not (back and self.story is not None and Path(back) != Path(self.story.folder)
-                    and self.open_folder(back, quiet=True)):
-                self._fill_stories()
-                self.refresh(rebuild=True, load=True)
-        self._batch_changed()
+    def release_story(self, folder: str) -> None:
+        """バッチが作りかけの物語の続きを作る前: この画面で開いていたら閉じる (同じ物語を両方が書かないように)。"""
+        if self.story is not None and Path(self.story.folder) == Path(folder):
+            self._save_timer.stop()
+            self._save()
+            self.story, self.scene = None, None
+            self._fill_stories()
+            self.refresh(rebuild=True)
+            self.status.emit(f"物語「{Path(folder).name}」はバッチが続きを作るので閉じました。")
 
     def _batch_progress(self, text: str) -> None:
-        self.batch_label.setText(text or self.batch.headline())
+        self.batch_label.setText(text)
+        self.batch_label.setToolTip("\n".join(w.status for w in self.batch.busy_workers() if w.status))
 
     def _batch_changed(self) -> None:
         unfinished = self.batch.unfinished()
@@ -2405,10 +2390,7 @@ class StoryView(QWidget):
         self.batch_bar.setVisible(unfinished > 0 or self.batch.active)
         self.batch_pause.setText("再開" if self.batch.paused else "一時停止")
         self.batch_stop.setVisible(self.batch.active)
-        if not self.batch.active:
-            self.batch_label.setText(self.batch.headline())
-        elif self.batch.paused:
-            self.batch_label.setText(self.batch.headline())
+        self.batch_label.setText(self.batch.headline())
 
     def offer_batch_resume(self) -> None:
         """起動したとき: 前回の待ち行列が残っていれば、続きから始めるか聞く (Esc は続きから)。"""
@@ -2444,21 +2426,6 @@ class StoryView(QWidget):
         if not window.isActiveWindow():
             QApplication.alert(window)
         QMessageBox.information(self, "バッチが終わりました", summary)
-
-    def open_batch_story(self, folder: str) -> None:
-        """バッチが作った物語を開く (見せるだけ。編集はバッチが終わるまでさせない)。"""
-        self.open_folder(folder, quiet=True, remember=False)  # 最近開いた物語を、バッチの物語で埋めない
-
-    def scene_text_changed(self, scene: story.Scene) -> None:
-        """バッチがシーンの送るプロンプトを書いたとき。"""
-        self._save()
-        if scene is self.scene:
-            self.refresh(load=True)
-
-    def batch_adopted(self) -> None:
-        """バッチが候補を採用したとき (次のシーンの元画像も出来ている)。"""
-        self._save()
-        self.refresh(rebuild=True)
 
     def settings_changed(self) -> None:
         """生成・読み取り・エンハンサーの設定を変えたとき: 選ぶ欄を作り直す (選んでいたものは残す)。"""

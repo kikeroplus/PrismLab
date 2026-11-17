@@ -25,6 +25,7 @@ TRIAL_DIR = "試作"  # 1 枚で試すときの出力 (出力フォルダの下)
 SLOTS_PER_MACHINE = 2  # 1 台に同時に送る件数 (generation-standard 6 章)
 FAIL_LIMIT = 3  # ある台でだけ、これだけ続けて失敗したら、その台を外す
 DOWN_RECHECK = 30.0  # 繋がらない台を確かめ直す間隔 (秒)
+SEEN_SECONDS = 3.0  # これより前に空きを求められていない台は、譲る先にしない (繋がらない・外した台)
 
 WAITING, RUNNING, DONE, FAILED, CANCELED = "waiting", "running", "done", "failed", "canceled"
 STATE_TEXT = {WAITING: "待機中", RUNNING: "実行中", DONE: "完了", FAILED: "失敗", CANCELED: "取り消し"}
@@ -277,23 +278,36 @@ class SlotPool:
         self._lock = threading.Lock()
         self._used: dict[str, int] = {}  # 台の URL の小文字 → 使っている数
         self._first_demand = 0  # 先にする側で、生成を待っている件数 (先にする側のエンジンが知らせる)
+        self._seen: dict[str, float] = {}  # 台 → 最後に空きを求められた時刻 (その台は動いている)
         self.peak: dict[str, int] = {}  # 台ごとの同時に使った最大の数 (テストで見る)
 
     def set_demand(self, count: int) -> None:
         with self._lock:
             self._first_demand = max(0, count)
 
-    def take(self, url: str, first: bool) -> bool:
-        """空きをもらう。もらえなければ False。"""
+    def take(self, url: str, first: bool, balance: bool = True) -> bool:
+        """空きをもらう。もらえなければ False。
+        balance: 使っている数がもっと少ない台が動いていれば (ここ数秒、その台に空きを求めてきた)、そちらに譲る
+        (2 台あるのに 1 台に 2 件たまり、もう 1 台が遊ぶことがないように)。頼み済みの件 (その台で続きを待つ) は譲らない。"""
         key = url.lower()
+        now = time.monotonic()
         with self._lock:
+            self._seen[key] = now
             used = self._used.get(key, 0)
             room = self.slots if first else self.slots - min(self._first_demand, self.slots)
             if used >= room:
                 return False
+            if balance and any(self._used.get(k, 0) < used for k, t in self._seen.items()
+                               if k != key and now - t <= SEEN_SECONDS):
+                return False
             self._used[key] = used + 1
             self.peak[key] = max(self.peak.get(key, 0), used + 1)
             return True
+
+    def alive(self, url: str) -> None:
+        """その台は動いている (エンジンのスレッドが見回るたびに知らせる。譲る先を決めるため)。"""
+        with self._lock:
+            self._seen[url.lower()] = time.monotonic()
 
     def put_back(self, url: str) -> None:
         key = url.lower()
@@ -561,9 +575,10 @@ class Engine(QObject):
                         break
                     self._publish()
                     if m.state == UP:
+                        self.pool.alive(url)
                         it = self._pick(gen=True, url=url)
                         # 台の空きは量産ラインと物語で分け合う (1 台に合わせて 2 件まで。物語が先)
-                        if it is not None and self.pool.take(url, self.first):
+                        if it is not None and self.pool.take(url, self.first, balance=not it.machine):
                             it.state = RUNNING
                             it.at = url
                             cancel = self._cancels.setdefault(id(it), threading.Event())

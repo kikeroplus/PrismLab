@@ -1,5 +1,5 @@
 """物語のバッチ (story_batch.py) のテスト: 偽の ComfyUI (本物の短い mp4 を返す) と偽の LLM で、
-物語を 2 本まとめて作る・失敗したら次の本へ・途中で止める・量産ラインが終わるのを待つ・
+物語を 2 本まとめて作る・失敗したら次の本へ・途中で止める・台の数まで並べて作る・量産ラインと台を分け合う・
 待ち行列 (順に進める・一時停止して続き・前回の残りから続ける・送られた画像で窓を出す)、を見る。
 
     python tests\\test_batch.py (撮った画像の置き場所)
@@ -131,22 +131,39 @@ multi._accept()
 check([x.name for x in multi.plans] == ["駅_最初", "駅_顔"] and [x.image for x in multi.plans] == [str(photo), str(face)],
       "画像ごとに 1 件 (名前は 名前_画像の名前)")
 
-# 3. 2 本作る (英語にしてから盛る・顔は全部のシーンに)
+# 3. 2 本作る (英語にしてから盛る・顔は全部のシーンに)。台が 1 台なら 1 本ずつ
+def small_plan(name, cuts="a / b", runs=1):
+    p = story_batch.Plan(name=name, parent=str(parent), image=str(photo), prompts=cuts,
+                         workflow=str(wf_dir / "Wan I2V.json"), runs=runs)
+    p.cuts = story_batch.split_prompts(p.prompts)
+    return p
+
+
+def most_busy(seconds):
+    """seconds のあいだに、同時に作っていた物語の本数の最大。"""
+    peak = 0
+    end = time.time() + seconds
+    while time.time() < end:
+        peak = max(peak, len(sv.batch.busy_workers()))
+        pump(0.1)
+    return peak
+
+
 story_batch.ask_plans = lambda *_a, **_k: [plan]
 before_sent = len(a.received)
 told.clear()
 sv._start_batch()
 pump(0.3)
-check(sv.batch.active and not sv.detail.isEnabled() and not sv.story_box.isEnabled() and sv.batch_bar.isVisible(),
-      "バッチのあいだは見るだけ (帯を出す)")
-check(sv.receive([str(photo)], "scenes") and "バッチ" in sv.receive([str(photo)], "scenes"), "送られたものは入れない")
-pump(1.5)
+check(sv.batch.active and sv.batch_bar.isVisible() and "物語のバッチ: 1 本を作っています" in sv.batch_label.text(),
+      sv.batch_label.text())
+check(sv.detail.isEnabled() and sv.story_box.isEnabled() and sv.new_b.isEnabled(), "バッチのあいだも物語のタブを使える")
+check(most_busy(1.5) == 1, "台が 1 台なら、物語は 1 本ずつ")
 window.grab().save(str(OUT / "batch_running.png"))
 wait_batch()
-check(not sv.batch.active and sv.detail.isEnabled() and not sv.batch_bar.isVisible(), "終わったら元に戻す")
-check(told and told[-1].startswith("出来た物語 2 本") and "途中" not in told[-1], told[-1] if told else "")
-check(sv.batch.entries[-1].state == story_batch.DONE and sv.batch.unfinished() == 0 and not sv.batch_bar.isVisible(),
-      "待ち行列の 1 件が完了")
+check(not sv.batch.active and not sv.batch_bar.isVisible(), "終わったら帯を消す")
+check(told and told[-1].startswith("出来た物語 2 本") and "途中" not in told[-1] and f"作った場所: {parent}" in told[-1],
+      told[-1] if told else "")
+check(sv.batch.entries[-1].state == story_batch.DONE and sv.batch.unfinished() == 0, "待ち行列の 1 件が完了")
 folders = sorted(p.name for p in parent.iterdir())
 check(folders == ["駅_01", "駅_02"], str(folders))
 for name in folders:
@@ -157,19 +174,18 @@ for name in folders:
           and all(s.source_kind == story.SOURCE_LAST for s in st.scenes[1:]), f"{name}: 2 つ目からは続き (最後のコマ)")
     check([s.original for s in st.scenes] == ["歩いてくる", "振り返る", "走り去る"]
           and st.scenes[1].prompt == "振り返る in English enhanced", f"{name}: 英語にしてから盛った文を送る")
-    check(all(len(s.candidates) == 1 for s in st.scenes) and len(list(st.adopted_dir().glob("0*.mp4"))) == 3,
-          f"{name}: 採用のフォルダに 3 本")
+    check(all(len(s.candidates) == 1 and s.candidates[0].prompt == s.prompt for s in st.scenes)
+          and len(list(st.adopted_dir().glob("0*.mp4"))) == 3, f"{name}: 候補の記録と採用のフォルダに 3 本")
     check(st.reference_of(st.scenes[2]) == st.scenes[0].reference != "", f"{name}: 顔は最初のシーンのもの")
 sent = a.received[before_sent:]
 check(len(sent) == 6 and all(w["6"]["inputs"]["image"] != w["1"]["inputs"]["image"] for w in sent),
       "6 本とも、顔の LoadImage に元画像とは別の画像を送る")
-check(sv.story is not None and sv.story.name == "駅 02", "最後に作った物語を開いている")
+check(sv.story is None and not any(Path(f).parent == parent for f in story.recent()),
+      "バッチは物語のタブで物語を開かない (最近開いた物語にも入れない)")
 window.grab().save(str(OUT / "batch_done.png"))
 
 # 4. 失敗したらその物語は止め、次の本へ
-plan2 = story_batch.Plan(name="失敗", parent=str(parent), image=str(photo), prompts="a / b",
-                         workflow=str(wf_dir / "Wan I2V.json"), runs=2)
-plan2.cuts = story_batch.split_prompts(plan2.prompts)
+plan2 = small_plan("失敗", "a / b", runs=2)
 story_batch.ask_plans = lambda *_a, **_k: [plan2]
 a.fail = True
 sv._start_batch()
@@ -179,49 +195,45 @@ check(told[-1].startswith("出来た物語 0 本") and told[-1].count("候補が
 st = story.Story.load(str(parent / "失敗_02"))
 check(not st.scenes[0].adopted and not st.scenes[1].source, "失敗したシーンで止まる (次のシーンは元画像なし)")
 
-# 5. 途中で止める
-plan3 = story_batch.Plan(name="止める", parent=str(parent), image=str(photo), prompts="a / b / c",
-                         workflow=str(wf_dir / "Wan I2V.json"), runs=3)
-plan3.cuts = story_batch.split_prompts(plan3.prompts)
-story_batch.ask_plans = lambda *_a, **_k: [plan3]
+# 5. 作っているものを止める
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("止める", "a / b / c", runs=3)]
 a.polls = 6
 sv._start_batch()
 pump(1.0)
 sv._stop_batch()
 pump(0.3)
-check(not sv.batch.active and "止めました" in told[-1] and sv.detail.isEnabled(), told[-1])
+check(not sv.batch.active and "止めました" in told[-1], told[-1])
 end = time.time() + 30
-while time.time() < end and sv.busy():
+while time.time() < end and any(w.winding_down for w in sv.batch.workers):
     pump(0.2)
 check(sorted(p.name for p in parent.iterdir() if p.name.startswith("止める")) == ["止める_01"], "次の本は作らない")
 a.polls = 2
 
-# 6. 物語のタブの候補づくり (手で) が動いていれば、終わるのを待ってから始める
-def small_plan(name, cuts="a / b", runs=1):
-    p = story_batch.Plan(name=name, parent=str(parent), image=str(photo), prompts=cuts,
-                         workflow=str(wf_dir / "Wan I2V.json"), runs=runs)
-    p.cuts = story_batch.split_prompts(p.prompts)
-    return p
-
-
-hand_busy = [True]
-real_candidates_busy = sv.candidates_busy
-sv.candidates_busy = lambda: hand_busy[0]
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("待つ", "a")]
-told.clear()
+# 6. バッチが作っている物語は、物語のタブで開かない。作りかけの続きを作るときは、開いていれば閉じる
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("開かない", "a / b")]
+a.polls = 4
 sv._start_batch()
-pump(2.5)
-check(not sv.batch.active and len(sv.batch.waiting()) == 1 and "候補づくり" in sv.batch_label.text()
-      and sv.batch_bar.isVisible(), sv.batch_label.text())
-check(sv.detail.isEnabled(), "待っているあいだは物語のタブを使える")
-hand_busy[0] = False
-pump(2.5)
-check(sv.batch.active or (parent / "待つ").exists(), "候補づくりが終わったら始める")
-sv.candidates_busy = real_candidates_busy
+pump(0.5)
+working = sv.batch.busy_workers()[0].folder
+told.clear()
+check(not sv.open_folder(working) and told and "バッチで作っています" in told[-1], "作っている物語は開けない")
+sv.batch.set_paused(True)
+end = time.time() + 60
+while time.time() < end and sv.batch.active:
+    pump(0.2)
+check(sv.batch.is_working(working) and not sv.open_folder(working, quiet=True), "一時停止中の作りかけも開けない")
+sv.batch.entries[-1].folders = []  # (確かめるため) 作りかけの印を外して開き、また印を付ける
+sv.open_folder(working)
+sv.batch.entries[-1].folders = [working]
+check(sv.story is not None and Path(sv.story.folder) == Path(working), "(物語のタブで開いた)")
+a.polls = 2
+sv.batch.set_paused(False)
+pump(0.5)
+check(sv.story is None, "続きを作る前に、物語のタブで開いていたものを閉じる")
 wait_batch()
-check(told and told[-1].startswith("出来た物語 1 本"), told[-1] if told else "")
+check(all(s.adopted for s in story.Story.load(working).scenes), "続きから最後まで作る")
 
-# 7. 待ち行列: 動いているあいだに足したものは、前のものが終わってから順に
+# 7. 待ち行列: 動いているあいだに足したものは、前のものが終わってから順に (台 1 台)
 story_batch.ask_plans = lambda *_a, **_k: [small_plan("順1")]
 sv._start_batch()
 pump(0.5)
@@ -236,7 +248,6 @@ pump(0.3)
 check(qw.table.rowCount() >= 3 and qw.table.item(qw.table.rowCount() - 3, 0).text().startswith("実行中"),
       "待ち行列の窓: 実行中と待機中を並べる")
 qw.grab().save(str(OUT / "batch_queue.png"))
-# 並べ替え: 順3 を 順2 の前へ
 last = sv.batch.entries[-1]
 sv.batch.move(last.id, -1)
 check([e.plan.name for e in sv.batch.entries[-2:]] == ["順3", "順2"], "上へ・下へで並べ替える")
@@ -261,11 +272,11 @@ while time.time() < end and sv.batch.active:
     pump(0.2)
 entry = sv.batch.entries[-1]
 st = story.Story.load(str(parent / "休む"))
-check(entry.state == story_batch.WAITING and entry.folder and Path(entry.folder).name == "休む"
+check(entry.state == story_batch.WAITING and [Path(f).name for f in entry.folders] == ["休む"]
       and st.scenes[0].adopted and not st.scenes[1].adopted, "一時停止: シーン 1 を採用して止まる (待機に戻る)")
-check(sv.detail.isEnabled() and sv.batch_bar.isVisible() and sv.batch_pause.text() == "再開", "止まると物語のタブを使える")
+check(sv.batch_bar.isVisible() and sv.batch_pause.text() == "再開", "止まっても帯を出す (再開)")
 saved = json.loads((Path(os.environ["APPDATA"]) / "PrismLab" / story_batch.QUEUE_FILE).read_text(encoding="utf-8"))
-check(saved["paused"] and saved["entries"][-1]["folder"] == entry.folder, "待ち行列をファイルに残す")
+check(saved["paused"] and saved["entries"][-1]["folders"] == entry.folders, "待ち行列をファイルに残す")
 window.grab().save(str(OUT / "batch_paused.png"))
 
 # 9. 前回の残りから続ける (アプリを閉じて開き直したとき。一時停止のまま閉じたら聞かずに一時停止で戻す)
@@ -281,6 +292,10 @@ wait_batch()
 st = story.Story.load(str(parent / "休む"))
 check(all(s.adopted for s in st.scenes) and not (parent / "休む (2)").exists(), "同じ物語の、まだ採用していないシーンから作る")
 check(told and told[-1].startswith("出来た物語 1 本"), told[-1] if told else "")
+# 前の形 (作りかけ 1 本の folder) も読める
+old = story_batch.Entry.from_dict({"plan": json.loads(small_plan("前の形").to_json()), "state": "running",
+                                   "run_index": 1, "folder": str(parent / "前の形_02")})
+check(old.folders == [str(parent / "前の形_02")] and old.run_index == 2, "前の形の待ち行列も続きから読める")
 # 実行中のまま落ちたもの: 待機から続ける。捨てると消える
 dropped = story_batch.Entry(small_plan("捨てる"), state=story_batch.RUNNING)
 story_batch.save_queue([dropped], False)
@@ -312,48 +327,24 @@ check(sv._batch_dialog.added == [str(face)] and window.tabs.currentWidget() is s
 sv._batch_dialog = None
 check("画像だけ" in sv.receive([str(TMP / "clip.mp4")], "batch"), "画像がなければ理由を返す")
 
-# 11. 最近開いた物語をバッチの物語で埋めない。終わったら、前に開いていた物語に戻す (場所はまとめで知らせる)
-batch_names = {p.name for p in parent.iterdir()}
-check(not any(Path(f).name in batch_names for f in story.recent()), "バッチの物語は最近開いた物語に入れない")
+# 11. バッチのあいだも、物語のタブで自分の物語を直せる・送られたものを入れられる
 mine = story.Story.create(str(TMP / "自分" / "自分の物語"), "自分の物語")
 sv.open_folder(mine.folder)
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("戻る", "a")]
-told.clear()
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("裏で", "a / b")]
 sv._start_batch()
 pump(0.5)
-check(sv.batch.active and "バッチ" in sv.story_box.currentText(), "作っている物語は上の欄に (バッチ) と出す")
-wait_batch()
-check(sv.story is not None and sv.story.name == "自分の物語", "終わったら前に開いていた物語に戻す")
-check(told and f"作った場所: {parent}" in told[-1], told[-1] if told else "")
-check(story.recent()[0] == mine.folder, "次に起動したときも自分の物語を開く")
-
-# 12. 窓 (ファイルを選ぶ・確かめるなど) を開いているあいだは始めない (選んだものがバッチの物語に入らないように)
+check(sv.batch.active and sv.receive([str(face)], "scenes") == "" and len(sv.story.scenes) == 2,
+      "バッチのあいだも、送られた画像をシーンにできる")
 modal = QDialog(window)
 modal.setModal(True)
-modal.show()
-pump(0.2)
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("窓", "a")]
-sv._start_batch()
-pump(2.5)
-check(not sv.batch.active and "窓を閉じたら" in sv.batch_label.text(), sv.batch_label.text())
+modal.show()  # 窓を開いていても、バッチは裏で進む (物語のタブを使わないので)
+wait_batch()
 modal.close()
-pump(2.5)
-check(sv.batch.active or (parent / "窓").exists(), "窓を閉じたら始める")
-wait_batch()
-check(sv.story.name == "自分の物語" and not sv.scene.source, "自分の物語には何も入っていない")
+check(sv.story.name == "自分の物語" and len(sv.story.scenes) == 2 and Path(sv.story.scenes[1].source).is_file(),
+      "自分の物語はそのまま")
+check(all(s.adopted for s in story.Story.load(str(parent / "裏で")).scenes), "窓を開いていてもバッチは最後まで")
 
-# 13. 読み取る・盛る・英語に (手で) を待っているあいだは始めない (結果の入れ先がなくなるので)
-sv._llm_busy = "読み取り"
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("読む", "a")]
-sv._start_batch()
-pump(2.5)
-check(not sv.batch.active and "読み取り" in sv.batch_label.text(), sv.batch_label.text())
-sv._llm_busy = ""
-pump(2.5)
-check(sv.batch.active or (parent / "読む").exists(), "終わったら始める")
-wait_batch()
-
-# 14. 量産ラインとバッチは同時に動く。台の空きは分け合い (1 台に合わせて 2 件まで)、両方が待っていれば物語が先
+# 12. 量産ラインとバッチは同時に動く。台の空きは分け合い (1 台に合わせて 2 件まで)、両方が待っていれば物語が先
 def is_story(wf):
     return "STORY" in str(wf["2"]["inputs"]["text"])
 
@@ -384,12 +375,9 @@ order = ["物語" if is_story(w) else "量産" for w in a.received[sent:]]
 check(order[:2] == ["量産", "量産"] and "物語" in order[2:4], f"空きが出たら、物語のぶんを残す (物語が待たされない): {order}")
 check(order.count("物語") == 2 and order.count("量産") == 5, f"どちらも最後まで: {order}")
 check(engine.POOL.peak.get(a.url.lower(), 0) == 2, f"1 台に同時に送ったのは 2 件まで ({engine.POOL.peak})")
-told.clear()
-lv._retry()
-check(not told, "バッチがあっても、量産の操作は止めない")
 a.polls = 2
 
-# 15. 足したあとで最初の画像が消えたら、その件は 1 度だけ知らせて終える (空の物語のフォルダを残さない)
+# 13. 足したあとで最初の画像が消えたら、その件は 1 度だけ知らせて終える (空の物語のフォルダを残さない)
 gone = TMP / "消える.png"
 shutil.copy2(photo, gone)
 p = small_plan("消えた", "a", runs=3)
@@ -403,7 +391,7 @@ check(told and told[-1].startswith("出来た物語 0 本") and told[-1].count("
       told[-1] if told else "")
 check(not any(n.name.startswith("消えた") for n in parent.iterdir()), "空の物語のフォルダを残さない")
 
-# 16. 台が 2 台なら、量産ラインと物語が両方の台を分け合う (どちらの台も 2 件まで)
+# 14. 台が 2 台なら、別々の物語を 2 本並べて作る (同じ件の何本目も・別の件も)。量産ラインとも分け合う
 b = FakeComfy(polls=6)
 b.video_bytes = clip.read_bytes()
 comfy.set_connections([comfy.Preset("FALCON", a.url), comfy.Preset("CONDOR", b.url)]
@@ -412,20 +400,29 @@ recipes.set_machines([a.url, b.url])
 lv.engine.set_machines([a.url, b.url])
 sv.machines_changed()
 check(sv.machines_b.text() == "台: FALCON · CONDOR", sv.machines_b.text())
+check(sv.batch.capacity() == 2, "台が 2 台なら 2 本まで並べる")
 engine.POOL.peak.clear()
 a.polls = 6
 sent_a, sent_b = len(a.received), len(b.received)
-lv.engine.start(engine.Run.create(line_recipe, [photo] * 6))
-story_batch.ask_plans = lambda *_a, **_k: [small_plan("二台", "STORY1 / STORY2 / STORY3")]
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("並べる", "STORY1 / STORY2", runs=3)]
 sv._start_batch()
-wait_batch(180)
+check(most_busy(4) == 2, "同じ件の 2 本を並べて作る")
+wait_batch(240)
+check(all(all(s.adopted for s in story.Story.load(str(parent / f"並べる_0{i}")).scenes) for i in (1, 2, 3)),
+      "3 本とも最後まで")
+check(told and told[-1].startswith("出来た物語 3 本 (バッチ 1 件)"), told[-1] if told else "")
+check(len(a.received) > sent_a and len(b.received) > sent_b, "両方の台を使う")
+# 別の件どうしも並べる。量産ラインと一緒でも、どちらの台も 2 件まで
+lv.engine.start(engine.Run.create(line_recipe, [photo] * 6))
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("件A", "STORY1 / STORY2"), small_plan("件B", "STORY1 / STORY2")]
+sv._start_batch()
+check(most_busy(4) == 2 and {e.plan.name for e in sv.batch.entries if e.id in sv.batch.working_ids()} <= {"件A", "件B"},
+      "別の件の物語も並べて作る")
+wait_batch(240)
 end = time.time() + 120
 while time.time() < end and lv.running():
     pump(0.2)
-got = a.received[sent_a:] + b.received[sent_b:]
-check(sum(1 for w in got if is_story(w)) == 3 and sum(1 for w in got if not is_story(w)) == 6,
-      "量産 6 件・物語 3 シーンとも出来る")
-check(len(a.received) > sent_a and len(b.received) > sent_b, "両方の台を使う")
+check((parent / "件A").exists() and (parent / "件B").exists() and not lv.running(), "量産も物語も最後まで")
 check(max(engine.POOL.peak.values()) <= 2, f"どちらの台も同時に 2 件まで ({engine.POOL.peak})")
 a.polls = 2
 b.close()
