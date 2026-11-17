@@ -72,6 +72,7 @@ class _Scan:
 class LineView(QWidget):
     status = Signal(str)  # ステータスバーに出す文
     to_story = Signal(list)  # 結果の画像を、開いている物語の最後にシーンとして足す
+    to_batch = Signal(list)  # 結果の画像を、物語のバッチの最初の画像にする (設定の窓を出す)
     _scanned = Signal(int, str, list)
 
     def __init__(self, eng: engine.Engine, parent=None):
@@ -1084,6 +1085,11 @@ class LineView(QWidget):
                              else "物語の最後にシーンとして足す (画像を選んでください)")
         act.setEnabled(bool(images))
         act.triggered.connect(lambda: self.to_story.emit(images))
+        batch = menu.addAction(f"物語のバッチに足す... ({len(images)} 枚)" if images
+                               else "物語のバッチに足す... (画像を選んでください)")
+        batch.setEnabled(bool(images))
+        batch.setToolTip("1 枚ごとに 1 件のバッチとして、最初の画像にします (設定の窓を出します)。")
+        batch.triggered.connect(lambda: self.to_batch.emit(images))
         menu.addSeparator()
         current = clicked if clicked is not None and not clicked.data(Qt.ItemDataRole.UserRole + 1) else None
         if current is not None:

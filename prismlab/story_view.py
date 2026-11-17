@@ -604,15 +604,20 @@ class StoryView(QWidget):
         self.pick_b.setToolTip("前に元画像などを選んだフォルダを J-Rate で開きます。画像を選んで右クリックの"
                                "「PrismLab に送る」で、新しいシーンや、選んでいるシーンの元画像などに入ります。")
         self.pick_b.clicked.connect(self._pick_in_jrate)
-        self.batch_b = QPushButton("バッチで作る...")
-        self.batch_b.setToolTip("最初の画像とカットごとのプロンプトから、物語をまとめて作ります (試し)。")
+        self.batch_b = QPushButton("バッチに足す...")
+        self.batch_b.setToolTip("最初の画像とカットごとのプロンプトから物語をまとめて作るバッチを、待ち行列に足します (試し)。"
+                                "動いているあいだも足せます。J-Rate などから「物語のバッチに足す」で送っても入ります。")
         self.batch_b.clicked.connect(self._start_batch)
+        self.queue_b = QPushButton("待ち行列")
+        self.queue_b.setToolTip("物語のバッチの待ち行列 (順番・一時停止・外す)。")
+        self.queue_b.clicked.connect(self._show_queue)
         self.new_b, self.open_b = new_b, open_b
         top.addWidget(QLabel("物語"))
         top.addWidget(self.story_box)
         top.addWidget(new_b)
         top.addWidget(open_b)
         top.addWidget(self.batch_b)
+        top.addWidget(self.queue_b)
         top.addStretch(1)
         for b in (self.pick_b, self.play_b, self.adopted_b, self.jrate_b):
             top.addWidget(b)
@@ -624,10 +629,18 @@ class StoryView(QWidget):
         bar.setContentsMargins(8, 4, 8, 4)
         self.batch_label = QLabel()
         self.batch_label.setStyleSheet("color: black; font-weight: bold; background: transparent;")
-        self.batch_stop = QPushButton("バッチを止める")
+        self.batch_pause = QPushButton("一時停止")
+        self.batch_pause.setToolTip("今のシーンが終わったら止めます。再開すると、作りかけの物語の続きから作ります。")
+        self.batch_pause.clicked.connect(lambda: self.batch.set_paused(not self.batch.paused))
+        self.batch_stop = QPushButton("今のバッチを止める")
+        self.batch_stop.setToolTip("動いているバッチをやめて、待ち行列の次へ進みます (ComfyUI に中止を送ります)。")
         self.batch_stop.clicked.connect(self._stop_batch)
+        self.batch_queue_b = QPushButton("待ち行列...")
+        self.batch_queue_b.clicked.connect(self._show_queue)
         bar.addWidget(self.batch_label, 1)
+        bar.addWidget(self.batch_pause)
         bar.addWidget(self.batch_stop)
+        bar.addWidget(self.batch_queue_b)
         self.batch_bar.setStyleSheet(f"background: {theme.ACCENT}; border-radius: 4px;")
         self.batch_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.batch_bar.hide()
@@ -673,9 +686,15 @@ class StoryView(QWidget):
         self._save_timer.setInterval(600)
         self._save_timer.timeout.connect(self._save)
 
-        self.batch = story_batch.BatchRunner(self)  # engine.finished は、この画面の _on_finished のあとに受ける
-        self.batch.progress.connect(self.batch_label.setText)
-        self.batch.done.connect(self._batch_done)
+        # 物語のバッチの待ち行列 (engine.finished は、この画面の _on_finished のあとに受ける)
+        self.batch = story_batch.BatchQueue(self)
+        self.batch.progress.connect(self._batch_progress)
+        self.batch.running.connect(self._lock_for_batch)
+        self.batch.changed.connect(self._batch_changed)
+        self.batch.entry_done.connect(lambda text: self.status.emit("バッチが 1 件終わりました。" + text))
+        self.batch.all_done.connect(self._batch_done)
+        self._batch_dialog = None  # 開いている「バッチに足す」の窓 (送られた画像をここに足す)
+        self._queue_window = None
 
         self._fill_stories()
         recent = story.recent()
@@ -2003,6 +2022,8 @@ class StoryView(QWidget):
 
     def receive(self, files: list, slot: str, sender: str = "") -> str:
         """ほかのアプリから送られたもの (spec 5 章)。入れられなければ理由を返す。"""
+        if slot == "batch":  # 物語のバッチに足す: 設定の窓を出す (バッチが動いていても足せる)
+            return self.queue_images(files)
         if self.batch.active:
             return "物語をバッチで作っています。終わるか止めてから、もう一度送ってください。"
         if self.story is None:
@@ -2270,14 +2291,24 @@ class StoryView(QWidget):
     # バッチ (story_batch.py)
     # ------------------------------------------------------------------
     def _start_batch(self) -> None:
-        if self.batch.active:
-            return
-        if self.busy():
-            QMessageBox.information(self, "バッチ", "候補を作っています。終わってからにしてください。")
-            return
-        if self.line_busy():
-            QMessageBox.information(self, "バッチ", "量産ラインが動いています (同じ台を使うので、同時には動かしません)。"
-                                    "終わるか止めてからにしてください。")
+        """「バッチに足す...」: 設定の窓を出して待ち行列に足す。"""
+        self._open_batch_dialog(None)
+
+    def queue_images(self, files: list) -> str:
+        """送られた画像を「バッチに足す」の窓の最初の画像にする (開いていればそこに足す)。入れられなければ理由。"""
+        images = [str(f) for f in files if Path(f).is_file() and str(f).lower().endswith(recipes.IMAGE_EXTS)]
+        if not images:
+            return "物語のバッチに足せるのは画像だけです。"
+        if self._batch_dialog is not None:
+            self._batch_dialog.add_images(images)
+            return ""
+        QTimer.singleShot(0, lambda: self._open_batch_dialog(images))  # 送ってきた側を待たせないよう、受け取ってから開く
+        return ""
+
+    def _open_batch_dialog(self, images) -> None:
+        if self._batch_dialog is not None:
+            if images:
+                self._batch_dialog.add_images(images)
             return
 
         def defaults(plan: story_batch.Plan) -> None:
@@ -2288,26 +2319,89 @@ class StoryView(QWidget):
             if self.scene is not None and not plan.image and self.scene.source:
                 plan.image = self.scene.source
 
-        plan = story_batch.ask_plan(self, defaults)
-        if plan is None:
+        def opened(dialog) -> None:
+            self._batch_dialog = dialog
+
+        plans = story_batch.ask_plans(self, defaults, images, opened)
+        if not plans:
             return
-        self._save()
-        self._lock_for_batch(True)
-        self.batch.start(plan)
+        self.batch.add(plans)
+        n = len(self.batch.waiting())
+        self.status.emit(f"物語のバッチを {len(plans)} 件、待ち行列に足しました (待機 {n} 件)。"
+                         + (" 一時停止中です (「再開」で始まります)。" if self.batch.paused else ""))
+
+    def _show_queue(self) -> None:
+        if self._queue_window is None:
+            self._queue_window = story_batch.QueueWindow(self.batch, self._start_batch, self)
+        self._queue_window.show()
+        self._queue_window.raise_()
+        self._queue_window.activateWindow()
 
     def _stop_batch(self) -> None:
-        self.batch.stop()
+        self.batch.stop_current()
+
+    def candidates_busy(self) -> bool:
+        """物語のタブで (手で) 候補を作っているか。"""
+        run = self.engine.run
+        return self.engine.active and run is not None and run.unfinished > 0
+
+    def prepare_for_batch(self) -> None:
+        """待ち行列が 1 件を始める前: 編集中のものを保存する。"""
+        self._save_timer.stop()
+        self._save()
 
     def _lock_for_batch(self, on: bool) -> None:
-        """バッチのあいだは見るだけ (物語の切り替え・シーンの編集・候補の操作はしない)。"""
-        for w in (self.story_box, self.new_b, self.open_b, self.batch_b, self.board_host, self.detail):
+        """バッチのあいだは見るだけ (物語の切り替え・シーンの編集・候補の操作はしない)。足すのはできる。"""
+        for w in (self.story_box, self.new_b, self.open_b, self.board_host, self.detail):
             w.setEnabled(not on)
-        self.batch_bar.setVisible(on)
         if on:
             self.batch_label.setText("バッチを始めます…")
+        else:
+            self._fill_stories()
+            self.refresh(rebuild=True, load=True)
+        self._batch_changed()
+
+    def _batch_progress(self, text: str) -> None:
+        self.batch_label.setText(text or self.batch.headline())
+
+    def _batch_changed(self) -> None:
+        unfinished = self.batch.unfinished()
+        self.queue_b.setText(f"待ち行列 ({unfinished})" if unfinished else "待ち行列")
+        self.batch_bar.setVisible(unfinished > 0 or self.batch.active)
+        self.batch_pause.setText("再開" if self.batch.paused else "一時停止")
+        self.batch_stop.setVisible(self.batch.active)
+        if not self.batch.active:
+            self.batch_label.setText(self.batch.headline())
+        elif self.batch.paused:
+            self.batch_label.setText(self.batch.headline())
+
+    def offer_batch_resume(self) -> None:
+        """起動したとき: 前回の待ち行列が残っていれば、続きから始めるか聞く (Esc は続きから)。"""
+        count, paused = self.batch.load_previous()
+        if not count:
+            self.batch.restore(False)
+            return
+        if paused:  # 一時停止したまま閉じた: 聞かずに一時停止のまま戻す
+            self.batch.restore(True)
+            self.status.emit(f"前回の物語のバッチを一時停止のまま戻しました (待機 {count} 件)。")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("続きから始める")
+        box.setText(f"前回の物語のバッチが終わっていません (待機 {count} 件)。")
+        box.setInformativeText("続きから始めると、作りかけの物語は、まだ採用していないシーンから作ります。")
+        resume = box.addButton("続きから始める", QMessageBox.ButtonRole.AcceptRole)
+        discard = box.addButton("捨てる", QMessageBox.ButtonRole.DestructiveRole)
+        box.setEscapeButton(resume)  # うっかり捨てないように
+        box.setDefaultButton(resume)
+        box.exec()
+        if box.clickedButton() is discard:
+            self.batch.restore(False)
+            self.status.emit("前回の物語のバッチを捨てました (出来ていた物語はそのまま残っています)。")
+        else:
+            self.batch.restore(True)
+            self.status.emit(f"前回の物語のバッチを続けます (待機 {count} 件)。")
 
     def _batch_done(self, summary: str) -> None:
-        self._lock_for_batch(False)
         self._fill_stories()
         self.refresh(rebuild=True, load=True)
         self.status.emit("バッチが終わりました。" + summary.replace("\n", " "))
@@ -2337,13 +2431,14 @@ class StoryView(QWidget):
             self.refresh(rebuild=True, load=True)
 
     def busy(self) -> bool:
-        run = self.engine.run
-        return self.batch.active or (self.engine.active and run is not None and run.unfinished > 0)
+        return self.batch.active or self.candidates_busy()
 
     def shutdown(self) -> None:
-        if self.batch.active:
-            self.batch.done.disconnect(self._batch_done)  # 閉じるときは「終わりました」の窓を出さない
-            self.batch.stop()
+        try:
+            self.batch.all_done.disconnect(self._batch_done)  # 閉じるときは「終わりました」の窓を出さない
+        except (RuntimeError, TypeError):
+            pass
+        self.batch.shutdown()  # 動いているものは待機に戻して残す (次に起動したときに続きから)
         self._save()
         if self.busy():
             self.engine.discard()

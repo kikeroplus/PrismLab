@@ -43,6 +43,7 @@ class MainWindow(QMainWindow):
         self.line.status.connect(self.show_status)
         self.story.status.connect(self.show_status)
         self.line.to_story.connect(self._line_to_story)
+        self.line.to_batch.connect(self._line_to_batch)
         # 量産ラインと物語のバッチは同じ台を使うので、同時には動かさない
         self.story.line_busy = self.line.running
         self.line.story_batch_busy = lambda: self.story.batch.active
@@ -106,6 +107,12 @@ class MainWindow(QMainWindow):
         if problem:
             QMessageBox.warning(self, "物語に足す", problem)
 
+    def _line_to_batch(self, files: list) -> None:
+        """量産ラインの結果の画像を、物語のバッチの最初の画像にする (設定の窓を出す)。"""
+        problem = self.story.queue_images(files)
+        if problem:
+            QMessageBox.warning(self, "物語のバッチに足す", problem)
+
     # 設定の窓 (GenCommon のもの。3 つのアプリと共有の登録) ---------------------
     def _comfy_settings(self) -> None:
         ComfySettingsDialog(self).exec()
@@ -125,6 +132,10 @@ class MainWindow(QMainWindow):
 
     # 続きから始める ---------------------------------------------------------
     def offer_resume(self) -> None:
+        self._offer_line_resume()
+        self.story.offer_batch_resume()
+
+    def _offer_line_resume(self) -> None:
         run = engine.load_run()
         if run is None:
             return
@@ -155,7 +166,16 @@ class MainWindow(QMainWindow):
 
     # 閉じる -----------------------------------------------------------------
     def closeEvent(self, event) -> None:
-        if self.story.busy():
+        if self.story.batch.active:
+            # バッチは待ち行列に残すが、今作っている候補は受け取れない
+            if QMessageBox.question(self, "閉じる", "物語のバッチを作っています。閉じると、今作っている候補は受け取れません"
+                                    " (ComfyUI には中止を送ります)。待ち行列は残り、次に起動したときに、まだ採用していない"
+                                    "シーンから続けられます。閉じますか?",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        elif self.story.busy():
             # 物語の候補は続きから受け取れないので、閉じる前に聞く
             if QMessageBox.question(self, "閉じる", "物語の候補を作っています。閉じると、作っている候補は受け取れません"
                                     " (ComfyUI には中止を送ります)。閉じますか?",
