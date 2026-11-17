@@ -2,13 +2,15 @@
 
 乗せて少し待つと出し、離れる・押す・ホイール・キー・ほかのウィンドウに移ると消す。
 大きい絵は別のサムネール (PREVIEW_SIZE) を裏で作る。出来るまでは小さいサムネールを伸ばして出す。
+動画は、始めのコマを出したうえで音なし・繰り返しで再生する (コマは QVideoSink で受けて同じ欄に描く。
+ToolTip の窓に QVideoWidget を入れると描画が乱れやすいため)。
 窓はフォーカスを取らず、マウスも素通りさせる (一覧の操作を邪魔しない)。
 """
 
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QGuiApplication, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QLabel, QVBoxLayout, QWidget
 
@@ -53,6 +55,10 @@ class HoverPreview(QObject):
         self.big.changed.connect(self._loaded)
         self.popup = _Popup(view)
         self.path = ""  # 出している (出そうとしている) ファイル
+        self._size = QSize()  # 絵を出す大きさ
+        self._player = None  # 動画を再生するもの (初めて動画に乗せたときに作る)
+        self._sink = None
+        self._playing = ""  # 再生している動画
         self._rect = QRect()  # その項目の場所 (view の viewport の座標)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -65,6 +71,7 @@ class HoverPreview(QObject):
     def hide(self) -> None:
         self._timer.stop()
         self.path = ""
+        self._stop_video()
         self.popup.hide()
 
     def eventFilter(self, obj, event) -> bool:
@@ -107,16 +114,51 @@ class HoverPreview(QObject):
                     self.hide()
                 return
             pix = small
-        size = pix.size().scaled(QSize(PREVIEW_SIZE, PREVIEW_SIZE), Qt.AspectRatioMode.KeepAspectRatio)
-        self.popup.image.setPixmap(pix.scaled(size, Qt.AspectRatioMode.KeepAspectRatio,
-                                              Qt.TransformationMode.SmoothTransformation))
-        name = Path(self.path).name
         video = Path(self.path).suffix.lower() in MOVIE_EXTS
-        self.popup.caption.setText(("▶ 動画 (始めのコマ) · " if video else "") + name)
+        if not (video and self._playing == self.path):  # 再生が始まっていれば、コマのほうを出したままにする
+            self._size = pix.size().scaled(QSize(PREVIEW_SIZE, PREVIEW_SIZE), Qt.AspectRatioMode.KeepAspectRatio)
+            self.popup.image.setPixmap(pix.scaled(self._size, Qt.AspectRatioMode.KeepAspectRatio,
+                                                  Qt.TransformationMode.SmoothTransformation))
+        name = Path(self.path).name
+        self.popup.caption.setText(("▶ 動画 · " if video else "") + name)
         self.popup.adjustSize()
         self._place()
         self.popup.show()
         self.popup.raise_()
+        if video:
+            self._play(self.path)
+        else:
+            self._stop_video()
+
+    # ---- 動画 ----
+    def _play(self, path: str) -> None:
+        if self._playing == path:
+            return
+        if self._player is None:
+            from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+            self._player = QMediaPlayer(self)  # 音の出口を付けない = 音なし
+            self._sink = QVideoSink(self)
+            self._player.setVideoOutput(self._sink)
+            self._player.setLoops(QMediaPlayer.Loops.Infinite)
+            self._sink.videoFrameChanged.connect(self._frame)
+        self._playing = path
+        self._player.setSource(QUrl.fromLocalFile(path))
+        self._player.play()
+
+    def _stop_video(self) -> None:
+        if self._player is not None and self._playing:
+            self._playing = ""
+            self._player.stop()
+            self._player.setSource(QUrl())
+
+    def _frame(self, frame) -> None:
+        if not self._playing or self._playing != self.path or not self.popup.isVisible() or not frame.isValid():
+            return
+        image = frame.toImage()
+        if image.isNull():
+            return
+        self.popup.image.setPixmap(QPixmap.fromImage(image).scaled(
+            self._size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def _place(self) -> None:
         """項目の上に、左右は項目の真ん中にそろえて出す。上に入らなければ下、それでもだめなら画面の中に収める。"""
