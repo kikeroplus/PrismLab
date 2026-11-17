@@ -611,6 +611,9 @@ class StoryView(QWidget):
         self.queue_b = QPushButton("待ち行列")
         self.queue_b.setToolTip("物語のバッチの待ち行列 (順番・一時停止・外す)。")
         self.queue_b.clicked.connect(self._show_queue)
+        self.machines_b = QPushButton("台の設定...")
+        self.machines_b.clicked.connect(self._edit_machines)
+        self._update_machines_button()
         self.new_b, self.open_b = new_b, open_b
         top.addWidget(QLabel("物語"))
         top.addWidget(self.story_box)
@@ -619,7 +622,7 @@ class StoryView(QWidget):
         top.addWidget(self.batch_b)
         top.addWidget(self.queue_b)
         top.addStretch(1)
-        for b in (self.pick_b, self.play_b, self.adopted_b, self.jrate_b):
+        for b in (self.machines_b, self.pick_b, self.play_b, self.adopted_b, self.jrate_b):
             top.addWidget(b)
         root.addLayout(top)
 
@@ -1593,9 +1596,9 @@ class StoryView(QWidget):
         run = self.engine.run
         if self.engine.active and run is not None and run.unfinished:
             return "ほかのシーンの候補を作っています。終わってからにしてください。"
-        machines = recipes.machines()
+        machines = recipes.story_machines()
         if not machines:
-            return "使う台が決まっていません (量産ラインの「台の設定...」で選んでください)。"
+            return "使う台が決まっていません (物語のタブの「台の設定...」で選んでください)。"
         if not workflow:
             return "ワークフローを選んでください (「生成の設定」で登録します)。"
         self.engine.set_machines(machines)
@@ -2296,6 +2299,31 @@ class StoryView(QWidget):
     # ------------------------------------------------------------------
     # バッチ (story_batch.py)
     # ------------------------------------------------------------------
+    def _update_machines_button(self) -> None:
+        """「台の設定...」の札: 選んでいる台の名前と、量産ラインと重なるか。"""
+        names = {p.value.rstrip("/").lower(): p.name for p in comfy.connections() if p.value}
+        urls = recipes.story_machines()
+        shown = " · ".join(names.get(u.lower()) or u for u in urls) or "なし"
+        self.machines_b.setText(f"台: {shown}")
+        self.machines_b.setToolTip(
+            "物語 (候補を作る・バッチ) で使う ComfyUI を選びます。"
+            + ("今は量産ラインと同じ台を含むので、物語のバッチと量産ラインは同時には動きません。"
+               if recipes.machines_overlap() else "量産ラインと別の台なので、物語のバッチと量産ラインを同時に動かせます。"))
+
+    def _edit_machines(self) -> None:
+        from .dialogs import MachinesDialog
+        dialog = MachinesDialog(recipes.story_machines(), self, "台の設定 (物語)",
+                                "物語 (候補を作る・バッチ) で使う ComfyUI を 3 台まで選びます。量産ラインの台と重ならなければ、"
+                                "物語のバッチと量産ラインを同時に動かせます (例: 物語は FALCON、量産ラインは CONDOR)。"
+                                "重なる台があるときは、今までどおり片方が終わるのを待ちます。")
+        if dialog.exec():
+            recipes.set_story_machines(dialog.urls())
+            if self.engine.active:
+                self.engine.set_machines(recipes.story_machines())
+            self._update_machines_button()
+            self.status.emit("物語の台を変えました。" + ("量産ラインと同じ台を含むので、バッチと量産は同時には動きません。"
+                                                    if recipes.machines_overlap() else "量産ラインと同時に動かせます。"))
+
     def _start_batch(self) -> None:
         """「バッチに足す...」: 設定の窓を出して待ち行列に足す。"""
         self._open_batch_dialog(None)
@@ -2444,6 +2472,7 @@ class StoryView(QWidget):
 
     def settings_changed(self) -> None:
         """生成・読み取り・エンハンサーの設定を変えたとき: 選ぶ欄を作り直す (選んでいたものは残す)。"""
+        self._update_machines_button()  # 接続先の名前が変わったかもしれない
         if self.story is not None:
             self.refresh(rebuild=True, load=True)
 

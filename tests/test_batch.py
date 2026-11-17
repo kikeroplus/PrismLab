@@ -37,6 +37,7 @@ assert str(store.APP_DIR).startswith(str(TMP))
 
 told = []
 QMessageBox.information = staticmethod(lambda _p, title, text, *a, **k: told.append(text))
+QMessageBox.warning = staticmethod(lambda _p, title, text, *a, **k: told.append(text))  # 窓で止まらないように
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 
 ok = []
@@ -398,6 +399,45 @@ wait_batch()
 check(told and told[-1].startswith("出来た物語 0 本") and told[-1].count("最初の画像が見つかりません") == 1,
       told[-1] if told else "")
 check(not any(n.name.startswith("消えた") for n in parent.iterdir()), "空の物語のフォルダを残さない")
+
+# 16. 物語の台を量産ラインと別にすれば、バッチと量産ラインを同時に動かす (例: 物語は FALCON、量産は CONDOR)
+check(recipes.story_machines() == recipes.machines() and recipes.machines_overlap(), "物語の台を選ぶ前は量産ラインと同じ台")
+b = FakeComfy(polls=6)
+b.video_bytes = clip.read_bytes()
+comfy.set_connections([comfy.Preset("FALCON", a.url), comfy.Preset("CONDOR", b.url)]
+                      + [comfy.Preset() for _ in range(comfy.PRESET_COUNT - 2)])
+recipes.set_machines([b.url])
+lv.engine.set_machines([b.url])
+recipes.set_story_machines([a.url])
+sv._update_machines_button()
+check(not recipes.machines_overlap() and sv.machines_b.text() == "台: FALCON", sv.machines_b.text())
+sv.line_busy = lv.blocks_batch
+a.polls = 6
+sent_a, sent_b = len(a.received), len(b.received)
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("別の台", "a / b")]
+sv._start_batch()
+pump(1.0)
+told.clear()
+check(sv.batch.active and not lv._batch_blocks("開始") and not told, "バッチの最中でも、台が別なら量産ラインを始められる")
+lv.engine.start(engine.Run.create(line_recipe, [photo, photo]))
+pump(1.0)
+check(sv.batch.active and lv.running() and lv.blocks_batch() is False, "同時に動く")
+wait_batch()
+end = time.time() + 60
+while time.time() < end and lv.running():
+    pump(0.2)
+check(len(a.received) - sent_a == 2 and len(b.received) - sent_b == 2,
+      f"物語は FALCON だけ、量産は CONDOR だけに送る (FALCON {len(a.received) - sent_a} / CONDOR {len(b.received) - sent_b})")
+# 重なる台に戻すと、今までどおりバッチの最中は量産を始めない
+recipes.set_story_machines([a.url, b.url])
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("重なる", "a / b")]
+sv._start_batch()
+pump(1.0)
+told.clear()
+check(sv.batch.active and lv._batch_blocks("開始") and told and "台の設定" in told[-1], "台が重なれば同時には動かさない")
+a.polls = b.polls = 2
+wait_batch()
+b.close()
 
 window.story.shutdown()
 window.engine.stop_threads()

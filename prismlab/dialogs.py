@@ -246,13 +246,15 @@ class StageDialog(QDialog):
 class MachinesDialog(QDialog):
     """台の設定: 登録してある接続先から 3 台まで選ぶ。"""
 
-    def __init__(self, urls: list[str], parent=None):
+    def __init__(self, urls: list[str], parent=None, title: str = "台の設定", hint: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("台の設定")
+        self.setWindowTitle(title)
         self.resize(480, 0)
         box = QVBoxLayout(self)
-        box.addWidget(_hint("量産で使う ComfyUI を 3 台まで選びます。役割は決めず、空いた台に何でも回します。"
-                            "どの台も同じワークフローを使うので、ワークフローが使うモデルはどの台にも同じ名前で置いてください。"))
+        box.addWidget(_hint(hint or (
+            "量産で使う ComfyUI を 3 台まで選びます。役割は決めず、空いた台に何でも回します。"
+            "どの台も同じワークフローを使うので、ワークフローが使うモデルはどの台にも同じ名前で置いてください。"
+            "物語 (候補づくり・バッチ) の台と重ならなければ、物語のバッチと同時に動かせます。")))
         form = QFormLayout()
         box.addLayout(form)
         self.boxes: list[QComboBox] = []

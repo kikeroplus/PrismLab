@@ -73,6 +73,7 @@ class LineView(QWidget):
     status = Signal(str)  # ステータスバーに出す文
     to_story = Signal(list)  # 結果の画像を、開いている物語の最後にシーンとして足す
     to_batch = Signal(list)  # 結果の画像を、物語のバッチの最初の画像にする (設定の窓を出す)
+    machines_changed = Signal()  # 台の設定を変えた (物語の台と重なるかが変わる)
     _scanned = Signal(int, str, list)
 
     def __init__(self, eng: engine.Engine, parent=None):
@@ -240,17 +241,17 @@ class LineView(QWidget):
     def blocks_batch(self) -> bool:
         """物語のバッチを待たせるか。一時停止していて実行中のものがなければ待たせない
         (一時停止のまま置いた量産で、夜中のバッチが止まったままにならないように。バッチの最中は再開させない)。"""
-        if not self.running():
-            return False
+        if not self.running() or not recipes.machines_overlap():
+            return False  # 物語と別の台なら、同時に動かしてよい
         run = self.engine.run
         return not (run.paused and not any(i.state == engine.RUNNING for i in run.items))
 
     def _batch_blocks(self, title: str) -> bool:
-        """物語のバッチが動いていれば知らせて True (同じ台を使うので、量産と同時には動かさない)。"""
-        if not self.story_batch_busy():
+        """物語のバッチが同じ台で動いていれば知らせて True (台が重ならなければ同時に動かしてよい)。"""
+        if not self.story_batch_busy() or not recipes.machines_overlap():
             return False
-        QMessageBox.information(self, title, "物語をバッチで作っています (同じ台を使うので、同時には動かしません)。"
-                                "終わるか止めてからにしてください。")
+        QMessageBox.information(self, title, "物語をバッチで作っています。量産ラインと物語が同じ台を使うので、同時には動かしません。"
+                                "終わるか止めてからにするか、物語のタブの「台の設定...」で物語の台を量産ラインと別にしてください。")
         return True
 
     def _schedule(self) -> None:
@@ -924,6 +925,9 @@ class LineView(QWidget):
             urls = dialog.urls()
             recipes.set_machines(urls)
             self.engine.set_machines(urls)
+            self.machines_changed.emit()
+            if recipes.machines_overlap():
+                self.status.emit("物語と同じ台を含むので、物語のバッチとは同時に動かしません (物語のタブの「台の設定...」で分けられます)。")
 
     # ------------------------------------------------------------------
     # 開始・一時停止・中止

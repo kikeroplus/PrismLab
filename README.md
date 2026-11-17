@@ -65,7 +65,7 @@ python tests\test_hover_video.py  # 結果の「乗せると拡大」の動画�
 
 ## 設定の保存先
 
-`%APPDATA%\PrismLab\` (レシピ `recipes.json`、台 `machines.txt`、量産の状態 `line_run.json`、生成の記録 `comfy_history.txt`、窓の位置、最近開いた物語 `stories.txt`、物語のバッチの前の設定 `story_batch.json` と待ち行列 `story_batch_queue.json`、元画像などを選んだフォルダ `story_pick_folder.txt`)。共有するものは `%APPDATA%\GenCommon\`。物語そのものは物語のフォルダの `story.json`。
+`%APPDATA%\PrismLab\` (レシピ `recipes.json`、量産ラインの台 `machines.txt`、物語の台 `story_machines.txt`、量産の状態 `line_run.json`、生成の記録 `comfy_history.txt`、窓の位置、最近開いた物語 `stories.txt`、物語のバッチの前の設定 `story_batch.json` と待ち行列 `story_batch_queue.json`、元画像などを選んだフォルダ `story_pick_folder.txt`)。共有するものは `%APPDATA%\GenCommon\`。物語そのものは物語のフォルダの `story.json`。
 
 ## 物語
 
