@@ -59,6 +59,7 @@ python tests\story_smoke.py   # 物語の画面 (シーン 2 つを作ってつ�
 python tests\test_send.py     # J-Rate・PromptWordCrafter からの「PrismLab に送る」(受ける側。別のプロセスから送るものも)
 python tests\test_batch.py    # 物語のバッチと待ち行列 (量産ラインとの取り合い・一時停止・続きから)
 python tests\test_hover_video.py  # 結果の「乗せると拡大」の動画再生
+python tests\test_thumbs.py      # サムネール (出来たばかりで読めないものを読み直す)
 ```
 
 物語のコマを読むのに OpenCV (`opencv-python`) を使います (`pip install -r requirements.txt`)。

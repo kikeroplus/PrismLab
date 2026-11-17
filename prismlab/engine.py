@@ -49,6 +49,7 @@ class Item:
     adds: list = field(default_factory=list)
     reference: str = ""  # リファレンス画像 (主に顔)。ワークフローにリファレンス用の LoadImage があるときだけ使う
     last_frame: str = ""  # ラストフレーム。ワークフローにラストフレーム用の LoadImage があるときだけ使う
+    memos: dict = field(default_factory=dict)  # 覚えたプロンプト (メモの名前 → {"text", "enhanced", "adds"})。生成を通っても残す
     plan: dict = field(default_factory=dict)  # 差し込みの割り当て (ステップの番号の文字 → 枠の形)。始めたときに決める
     error: str = ""
     error_stage: int = -1
@@ -85,6 +86,8 @@ class Item:
             it.state = WAITING  # 閉じたとき実行中だったもの (頼み済みなら prompt_id で続きを待つ)
         adds = data.get("adds")
         it.adds = [d for d in adds if isinstance(d, dict)] if isinstance(adds, list) else []
+        memos = data.get("memos")
+        it.memos = {str(k): v for k, v in memos.items() if isinstance(v, dict)} if isinstance(memos, dict) else {}
         plan = data.get("plan")
         it.plan = {str(k): v for k, v in plan.items() if isinstance(v, dict)} if isinstance(plan, dict) else {}
         outs = data.get("outputs")
@@ -127,6 +130,8 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
             snap["text"] = stage.text
         elif stage.type == recipes.INSERT:
             snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name if stage.folder else ""
+        elif stage.type in recipes.MEMO_TYPES:
+            snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
         else:
             snap["workflow"] = stage.workflow
             names = [w.name for w in comfy.workflows() if stage.workflow and w.value.lower() == stage.workflow.lower()]
@@ -155,6 +160,8 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         except inserts.InsertError as exc:
             raise ValueError(f"差し込みのステップ: {exc}") from exc
         snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name
+    elif stage.type in recipes.MEMO_TYPES:
+        snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
     else:
         if not stage.workflow:
             raise ValueError("生成のステップにワークフローが選ばれていません。")
@@ -320,6 +327,12 @@ class SlotPool:
 
 
 POOL = SlotPool()  # アプリの中で 1 つ (量産ラインと物語のエンジンが共有する)
+
+
+def _sent_body(text: Optional[str], enhanced: Optional[str], adds: list) -> str:
+    """その状態で生成に送る文 (ベースプロンプトは除く。GenRequest.full_prompt と同じ組み立て)。"""
+    head = enhanced if enhanced is not None else inserts.join(text, *inserts.texts(adds, True))
+    return inserts.join(head, *inserts.texts(adds, False))
 
 
 def _cancellable(func: Callable[[], str], cancel: threading.Event) -> str:
@@ -635,6 +648,8 @@ class Engine(QObject):
                     it.read_name = str(stage["reader"].get("name", ""))
             elif stage["type"] in recipes.ADD_TYPES:
                 self._add_text(it, stage)
+            elif stage["type"] in recipes.MEMO_TYPES:
+                self._memo(it, stage)
             else:
                 source = inserts.join(it.text, *inserts.texts(it.adds, True))  # 読み取った文 + 盛る前に足した文
                 if not source.strip():
@@ -668,6 +683,27 @@ class Engine(QObject):
                    "file": str(planned.get("file") or ""), "text": str(planned.get("text") or "")}
         with self._cond:
             it.adds.append(add)
+
+    def _memo(self, it: Item, stage: dict) -> None:
+        """覚える: その時点のプロンプト (元の文・盛った文・足した文) をメモに写す。
+        思い出す: メモから戻す。置き換えるならそっくり戻し、後ろに足すなら、今の状態で送る文の後ろに、
+        メモの状態で送る文をつなげる (それを元の文にする。あとに盛るを置けば一緒に盛る)。"""
+        name = str(stage.get("memo") or recipes.DEFAULT_MEMO)
+        with self._cond:
+            if stage["type"] == recipes.SAVE:
+                it.memos[name] = {"text": it.text, "enhanced": it.enhanced, "adds": [dict(a) for a in it.adds]}
+                return
+            memo = it.memos.get(name)
+            if memo is None:
+                raise ValueError(f"メモ「{name}」を覚えていません (前に「覚える」を置いてください)。")
+            text, enhanced = memo.get("text"), memo.get("enhanced")
+            adds = [dict(a) for a in memo.get("adds") or [] if isinstance(a, dict)]
+            has_now = it.text is not None or it.enhanced is not None or bool(it.adds)
+            if stage.get("mode") == recipes.APPEND and has_now:
+                it.text = inserts.join(_sent_body(it.text, it.enhanced, it.adds), _sent_body(text, enhanced, adds))
+                it.enhanced, it.adds = None, []
+            else:
+                it.text, it.enhanced, it.adds = text, enhanced, adds
 
     def _run_gen(self, it: Item, m: Machine, cancel: threading.Event) -> None:
         run = self.run

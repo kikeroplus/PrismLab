@@ -414,6 +414,40 @@ check(engine.Item.from_dict(run18.items[0].to_dict()).last_frame == str(TMP / "i
       "18: ラストフレームを保存する")
 eng18.stop_threads()
 
+# 19. 覚える・思い出す: その時点のプロンプトをメモに覚え、生成を通ったあとで戻す (2026-11-18)
+save_m = S(recipes.SAVE, memo="T2I の文")
+load_m = S(recipes.LOAD, memo="T2I の文")
+check(("norecall", 0) in recipes.line_problems([load_m, i2v]) and "覚えていません" in recipes.entry_problem([load_m, i2v], False),
+      "19: 覚えていないメモを思い出すステップは、理由を出して始めない")
+check(("memoempty", 0) in recipes.line_problems([save_m, i2v]), "19: 文がないところで覚えると知らせる")
+check(not recipes.can_bypass([S(recipes.ENHANCE, enhancer=ENHANCER), save_m, t2i, load_m, i2v], 1, text_entry=True),
+      "19: あとで思い出すメモの「覚える」はバイパスにできない")
+eng19 = engine.Engine()
+eng19.set_machines([a.url])
+# 置き換える: 盛る → 覚える → T2I → 思い出す → I2V で、I2V にも T2I と同じ文を送る
+r19 = recipe("19", txt, [S(recipes.ENHANCE, enhancer=ENHANCER), save_m, t2i, load_m, i2v])
+r19.source = recipes.TEXTS
+check(recipes.line_problems(r19.stages, text_entry=True) == set() and
+      recipes.entry_problem(r19.stages, True) == "", "19: 覚えてから思い出す並びは問題なし")
+eng19.start(engine.Run.create(r19, recipes.list_texts(str(txt))[:1]))
+wait(eng19)
+o19 = eng19.run.items[0].outputs
+check(eng19.run.items[0].state == engine.DONE and len(o19) == 2, "19: 完了")
+check(o19[0]["sent"].startswith("a red fox in snow enhanced") and o19[1]["sent"].startswith("a red fox in snow enhanced"),
+      f"19: T2I と I2V に同じ盛った文を送る ({o19[0]['sent']!r} / {o19[1]['sent']!r})")
+check(engine.Item.from_dict(eng19.run.items[0].to_dict()).memos.get("T2I の文", {}).get("enhanced", "").startswith(
+    "a red fox in snow enhanced"), "19: 覚えたメモも保存する (続きから始めても使える)")
+# 後ろに足す: 覚える → T2I → 読み取り → 思い出す (後ろに足す) → I2V で、読み取った説明 + 覚えた文
+load_add = S(recipes.LOAD, memo="T2I の文", mode=recipes.APPEND)
+r19b = recipe("19b", txt, [save_m, t2i, S(recipes.READ, reader=READER, reread=True), load_add, i2v])
+r19b.source = recipes.TEXTS
+eng19.start(engine.Run.create(r19b, recipes.list_texts(str(txt))[:1]))
+wait(eng19)
+sent_b = eng19.run.items[0].outputs[1]["sent"]
+check(eng19.run.items[0].state == engine.DONE and sent_b.startswith("a photo") and "a red fox in snow" in sent_b
+      and sent_b.index("a photo") < sent_b.index("a red fox"), f"19: 後ろに足す: 読み取った説明のあとに覚えた文 ({sent_b!r})")
+eng19.stop_threads()
+
 for s in (a, b, slow):
     s.close()
 llm.close()

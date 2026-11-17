@@ -10,10 +10,12 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QImage, QImageReader, QPixmap
 
 MOVIE_EXTS = {".mp4", ".m4v", ".webm", ".mov", ".mkv"}
+SIIGBF_THUMBNAILONLY = 0x08
+RETRY_MS = (1500, 3000, 6000, 12000, 24000)  # 読めなかったとき、読み直すまでの間 (出来たばかり・ネットワークで書きかけ)
 
 
 def _is_video(path: Path) -> bool:
@@ -80,7 +82,10 @@ def _shell_thumbnail(path: Path, size: int) -> Optional[QImage]:
     try:
         get_image = _GetImageProto(vtable[3])
         try:
-            get_image(factory, _SIZE(size, size), 0, ctypes.byref(hbitmap))  # SIIGBF_RESIZETOFIT
+            # SIIGBF_RESIZETOFIT | SIIGBF_THUMBNAILONLY: サムネールが作れないときにアプリのアイコンを返させない
+            # (出来たばかりのファイルで、関連付けアプリのアイコンがサムネールとして残ってしまったため。2026-11-18)
+            if get_image(factory, _SIZE(size, size), SIIGBF_THUMBNAILONLY, ctypes.byref(hbitmap)) != 0:
+                return None
         except OSError:
             return None
     finally:
@@ -209,6 +214,8 @@ class ThumbCache(QObject):
         self._pending: set[str] = set()
         self._stamps: dict[str, Optional[tuple]] = {}  # get(check=True) で見た (更新時刻, 大きさ)
         self._stale: set[str] = set()
+        self._tries: dict[str, int] = {}  # 読めなかった回数 (少し待って読み直す)
+        self._resting: set[str] = set()  # 読み直すのを待っているもの (ファイルは開いていない)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(2)
         self._signals = _Signals()
@@ -241,7 +248,7 @@ class ThumbCache(QObject):
         """そのファイルのサムネール (最後のコマも) をまだ作っているか (読んでいるあいだは消せない)。"""
         keys = {str(p).lower() for p in paths}
         keys |= {k + LAST_SUFFIX for k in keys}
-        return bool(keys & self._pending)
+        return bool(keys & (self._pending - self._resting))  # 読み直すのを待っているものは開いていない
 
     def forget(self, path: str) -> None:
         for key in (path.lower(), path.lower() + LAST_SUFFIX):
@@ -257,5 +264,25 @@ class ThumbCache(QObject):
             self._stale.discard(key)
             self.changed.emit(path)
             return
+        if image.isNull():
+            # 読めなかった: 出来たばかり (ネットワークで書きかけなど) かもしれないので、覚えずに少し待って読み直す。
+            # 何度か試してもだめなら、読めないものとして覚える
+            tries = self._tries.get(key, 0)
+            if tries < len(RETRY_MS):
+                self._tries[key] = tries + 1
+                self._pending.add(key)  # 待っているあいだは「作っている途中」(get で頼み直さない)
+                self._resting.add(key)
+                QTimer.singleShot(RETRY_MS[tries], lambda: self._retry(path))
+                return
+        self._tries.pop(key, None)
         self._pixmaps[key] = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         self.changed.emit(path)
+
+    def _retry(self, path: str) -> None:
+        key = path.lower()
+        self._resting.discard(key)
+        if key not in self._pending or key in self._pixmaps:
+            return
+        last = key.endswith(LAST_SUFFIX)
+        real = path[:-len(LAST_SUFFIX)] if last else path
+        self._pool.start(_Job(real, self.size, self._signals, last))

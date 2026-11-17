@@ -67,6 +67,28 @@ class StageDialog(QDialog):
             form.addRow("足す文", self.text)
             box.addWidget(_hint("前のステップまでのプロンプトに、改行してこの文を足します (どの画像にも同じ文)。"
                                 "「盛る」より前に置くと一緒に盛り、あとに置くと盛った文にそのまま付けます。"))
+        elif stage.type in recipes.MEMO_TYPES:
+            self.memo = QComboBox()
+            self.memo.setEditable(True)
+            owner = getattr(parent, "recipe", None)
+            names = [s.memo or recipes.DEFAULT_MEMO for s in getattr(owner, "stages", []) if s.type == recipes.SAVE]
+            for n in dict.fromkeys(names + [recipes.DEFAULT_MEMO]):
+                self.memo.addItem(n)
+            self.memo.setCurrentText(stage.memo or (names[-1] if stage.type == recipes.LOAD and names
+                                                    else recipes.DEFAULT_MEMO))
+            form.addRow("メモの名前", self.memo)
+            if stage.type == recipes.SAVE:
+                box.addWidget(_hint("この時点のプロンプト (元の文・盛った文・足した文) を、この名前のメモに覚えます。"
+                                    "生成を通るとプロンプトは空に戻りますが、メモは残ります。"
+                                    "あとの「思い出す」で同じ名前を選ぶと、その文を使えます"
+                                    " (例: 盛る → 覚える → T2I → 思い出す → I2V で、T2I と同じ文を I2V にも送る)。"))
+            else:
+                self.replace = QCheckBox("今の文を置き換える (外すと、今の文の後ろに足す)")
+                self.replace.setChecked(stage.mode != recipes.APPEND)
+                form.addRow("", self.replace)
+                box.addWidget(_hint("前の「覚える」で覚えた文を戻します。置き換えるときは覚えた時点の状態 (盛った文・足した文も) "
+                                    "にそっくり戻します。後ろに足すときは、今の文 (読み取った説明など) のあとに、覚えた文をつなげます。"
+                                    "このあとに「盛る」を置けば、それを盛ります。"))
         elif stage.type == recipes.INSERT:
             self.folder = QLineEdit(stage.folder)
             self.folder.setPlaceholderText("セリフやアクションの .txt を入れたフォルダ")
@@ -228,6 +250,10 @@ class StageDialog(QDialog):
                 QMessageBox.warning(self, "追加テキスト", "足す文を入れてください。")
                 return
             s.text = text
+        elif s.type in recipes.MEMO_TYPES:
+            s.memo = self.memo.currentText().strip() or recipes.DEFAULT_MEMO
+            if s.type == recipes.LOAD:
+                s.mode = recipes.REPLACE if self.replace.isChecked() else recipes.APPEND
         elif s.type == recipes.INSERT:
             folder = self.folder.text().strip()
             try:

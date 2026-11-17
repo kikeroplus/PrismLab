@@ -18,8 +18,15 @@ MAX_MACHINES = 3
 
 READ, ENHANCE, GEN = "read", "enhance", "gen"
 TEXT, INSERT = "text", "insert"  # 追加テキスト (入力した文を足す)・差し込み (フォルダの .txt を 1 枚ごとに順に足す)
-STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", TEXT: "追加テキスト", INSERT: "差し込み", GEN: "生成"}
-STAGE_ORDER = (READ, ENHANCE, TEXT, INSERT, GEN)  # メニューに並べる順
+# 覚える・思い出す (2026-11-18 利用者の希望): その時点のプロンプト (元の文・盛った文・足した文) を名前のメモに覚え、
+# あとのステップで戻す。生成を通るとプロンプトは空に戻るので、T2I に送った文を次の I2V でも使う、などのため
+SAVE, LOAD = "memo_save", "memo_load"
+STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", TEXT: "追加テキスト", INSERT: "差し込み", GEN: "生成",
+                SAVE: "覚える", LOAD: "思い出す"}
+STAGE_ORDER = (READ, ENHANCE, TEXT, INSERT, SAVE, LOAD, GEN)  # メニューに並べる順
+MEMO_TYPES = (SAVE, LOAD)
+DEFAULT_MEMO = "メモ 1"
+REPLACE, APPEND = "replace", "append"  # 思い出すとき: 今の文を置き換える / 今の文の後ろに足す
 ADD_TYPES = (TEXT, INSERT)  # プロンプトに文を足すステップ (盛るより前なら一緒に盛り、あとならそのまま付ける)
 IMAGE_EXTS = reader.IMAGE_EXTS
 
@@ -35,6 +42,8 @@ class Stage:
     base_prompt: bool = True  # ベースプロンプトを付ける
     text: str = ""  # 追加テキストの文
     folder: str = ""  # 差し込みのフォルダ
+    memo: str = ""  # 覚える・思い出すのメモの名前
+    mode: str = REPLACE  # 思い出すとき: 置き換える / 後ろに足す
     bypass: bool = False  # バイパス (このステップを飛ばして、前のものをそのまま次に渡す)
 
     def to_dict(self) -> dict:
@@ -56,6 +65,8 @@ class Stage:
         s.base_prompt = bool(data.get("base_prompt", True))
         s.text = str(data.get("text") or "")
         s.folder = str(data.get("folder") or "")
+        s.memo = str(data.get("memo") or "")
+        s.mode = APPEND if data.get("mode") == APPEND else REPLACE
         s.bypass = bool(data.get("bypass", False))
         return s
 
@@ -163,12 +174,15 @@ def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set
     """ラインが成り立たないところ (skip 番目もバイパスしたとして数える)。
     "nogen" = 生成のステップが 1 つも動かない。("enhance", i) = i 番目の盛るの前に、盛る元の文がない
     (読み取り・追加テキスト・差し込みのどれか。生成を通るとプロンプトは空に戻るので、直前の生成よりあとに要る)。
-    ("needimage", i) = テキストの入口で、まだ画像がないのに i 番目が画像を要る (読み取り・I2I・I2V)。"""
+    ("needimage", i) = テキストの入口で、まだ画像がないのに i 番目が画像を要る (読み取り・I2I・I2V)。
+    ("memoempty", i) = i 番目の覚えるの時点で、覚える文がない。("norecall", i) = i 番目の思い出すより前に、
+    その名前のメモを覚えるステップがない。"""
     from . import kinds
     problems = set()
     has_gen = False
     has_text = text_entry  # テキストの入口は、初めから文がある
     has_image = not text_entry
+    memos = set()  # ここまでに覚えたメモの名前 (生成を通っても残る)
     for i, s in enumerate(stages):
         if s.bypass or i == skip:
             continue
@@ -182,6 +196,15 @@ def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set
             has_text = True
         elif s.type in ADD_TYPES:
             has_text = True
+        elif s.type == SAVE:
+            if not has_text:
+                problems.add(("memoempty", i))
+            memos.add(s.memo or DEFAULT_MEMO)
+        elif s.type == LOAD:
+            if (s.memo or DEFAULT_MEMO) not in memos:
+                problems.add(("norecall", i))
+            else:
+                has_text = True
         elif not has_text:
             problems.add(("enhance", i))
     if not has_gen:
@@ -204,6 +227,8 @@ def bypass_reason(stages: list, index: int, text_entry: bool = False) -> str:
         return "生成のステップがなくなるので、バイパスにできません。"
     if any(isinstance(p, tuple) and p[0] == "needimage" for p in new):
         return "あとのステップに要る画像がなくなるので、バイパスにできません。"
+    if any(isinstance(p, tuple) and p[0] in ("memoempty", "norecall") for p in new):
+        return "あとの「覚える」「思い出す」に要る文・メモがなくなるので、バイパスにできません。"
     return "あとの「盛る」の元になる文がなくなるので、バイパスにできません。"
 
 
@@ -279,6 +304,10 @@ def entry_problem(stages: list, text_entry: bool) -> str:
     if any(isinstance(p, tuple) and p[0] == "needimage" for p in problems):
         return ("テキストの入口には画像がないので、最初の生成は T2I か T2V にしてください "
                 "(読み取り・I2I・I2V は、画像が出来たあとに置けます)。")
+    missing = sorted({stages[p[1]].memo or DEFAULT_MEMO for p in problems if isinstance(p, tuple) and p[0] == "norecall"})
+    if missing:
+        return (f"「思い出す」のメモ ({' / '.join(missing)}) を、その前の「覚える」で覚えていません "
+                "(同じ名前の「覚える」を前に置いてください)。")
     return ""
 
 

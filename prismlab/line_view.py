@@ -38,6 +38,13 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}時間{m}分" if h else f"{max(m, 1)}分"
 
 
+def _memo_detail(stage_type: str, memo: str, mode) -> str:
+    name = memo or recipes.DEFAULT_MEMO
+    if stage_type == recipes.SAVE:
+        return f"メモ「{name}」に覚える"
+    return f"メモ「{name}」から" + ("後ろに足す" if mode == recipes.APPEND else "戻す (置き換える)")
+
+
 def find_jrate() -> Optional[Path]:
     """J-Rate の EXE (デスクトップの Application か、隣の J-Rate のフォルダ)。"""
     here = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
@@ -364,6 +371,9 @@ class LineView(QWidget):
                     v["detail"] = self._short(s.get("text", ""))
                 elif s["type"] == recipes.INSERT:
                     v["detail"] = "フォルダ: " + str(s.get("name", ""))
+                elif s["type"] in recipes.MEMO_TYPES:
+                    v["detail"] = _memo_detail(s["type"], str(s.get("memo", "")), s.get("mode"))
+                    v["append"] = s.get("mode") == recipes.APPEND
                 else:
                     v["kind"] = s.get("kind", "")
                     v["detail"] = s.get("workflow_name", "")
@@ -388,6 +398,9 @@ class LineView(QWidget):
                     except inserts.InsertError as exc:
                         nxt = str(exc)
                     v["detail"] = f"フォルダ: {Path(s.folder).name}\n{nxt}"
+            elif s.type in recipes.MEMO_TYPES:
+                v["detail"] = _memo_detail(s.type, s.memo, s.mode)
+                v["append"] = s.mode == recipes.APPEND
             else:
                 v["kind"] = kinds.kind_of(s.workflow)
                 names = [p.name for p in comfy.workflows() if s.workflow and p.value.lower() == s.workflow.lower()]
@@ -523,6 +536,18 @@ class LineView(QWidget):
                     parts.append(p)
                 card.io.setText(io_html(parts + ["→", out]) if parts else io_html(["→", out]))
                 prev_out, has_text = out, False
+            elif v["type"] in recipes.MEMO_TYPES:
+                # 覚える・思い出す: プロンプトをメモに写す・メモから戻す (中身は文字のまま)
+                card.chip.set("メモ", kinds.TEXT_COLOR)
+                card.set_color(kinds.TEXT_COLOR)
+                src = ("文字", kinds.TEXT_COLOR)
+                if v["type"] == recipes.SAVE:
+                    card.io.setText(io_html([src, "→", src, "+", ("メモ", kinds.TEXT_COLOR)]))
+                else:
+                    card.io.setText(io_html(([src, "+"] if has_text and v.get("append") else [])
+                                            + [("メモ", kinds.TEXT_COLOR), "→", src]))
+                    has_text = True
+                card.thumbs.hide()
             elif v["type"] in recipes.ADD_TYPES:
                 # 追加テキスト・差し込み: 文を足す (盛るより前なら一緒に盛る)
                 card.chip.set("文字", kinds.TEXT_COLOR)
@@ -549,6 +574,10 @@ class LineView(QWidget):
                     reason = "画像がまだありません (テキストの入口では、先に T2I / T2V の生成を置く)"
                 elif ("enhance", i) in problems:
                     reason = "盛る元の文がありません (前に読み取り・追加テキスト・差し込みを置く)"
+                elif ("memoempty", i) in problems:
+                    reason = "覚える文がありません (前に読み取り・盛る・追加テキストなどを置く。生成のあとは空です)"
+                elif ("norecall", i) in problems:
+                    reason = "このメモを覚えていません (前に同じ名前の「覚える」を置く)"
                 if reason:
                     card.io.setText(f'<span style="color:#ef5350; font-weight:bold">⚠ {html.escape(reason)}</span>')
                     card.io.setWordWrap(True)
