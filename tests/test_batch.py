@@ -180,8 +180,9 @@ for name in folders:
 sent = a.received[before_sent:]
 check(len(sent) == 6 and all(w["6"]["inputs"]["image"] != w["1"]["inputs"]["image"] for w in sent),
       "6 本とも、顔の LoadImage に元画像とは別の画像を送る")
-check(sv.story is None and not any(Path(f).parent == parent for f in story.recent()),
-      "バッチは物語のタブで物語を開かない (最近開いた物語にも入れない)")
+check(sv.story is not None and Path(sv.story.folder) == parent / "駅_02" and not sv.watch_folder
+      and not any(Path(f).parent == parent for f in story.recent()),
+      "終わったら、最後に作っていた物語を直せるように開く (最近開いた物語には入れない)")
 window.grab().save(str(OUT / "batch_done.png"))
 
 # 4. 失敗したらその物語は止め、次の本へ
@@ -229,7 +230,9 @@ check(sv.story is not None and Path(sv.story.folder) == Path(working), "(物語�
 a.polls = 2
 sv.batch.set_paused(False)
 pump(0.5)
-check(sv.story is None, "続きを作る前に、物語のタブで開いていたものを閉じる")
+check(sv.watch_folder and Path(sv.watch_folder) == Path(working) and sv.story is not None
+      and sv.batch.busy_workers()[0].story is not sv.story,
+      "続きを作る前に、物語のタブで開いていたものを閉じ、見るだけで出し直す")
 wait_batch()
 check(all(s.adopted for s in story.Story.load(working).scenes), "続きから最後まで作る")
 
@@ -343,6 +346,70 @@ modal.close()
 check(sv.story.name == "自分の物語" and len(sv.story.scenes) == 2 and Path(sv.story.scenes[1].source).is_file(),
       "自分の物語はそのまま")
 check(all(s.adopted for s in story.Story.load(str(parent / "裏で")).scenes), "窓を開いていてもバッチは最後まで")
+
+# 15. バッチで作っている物語を、物語のタブに見るだけで出す (2026-11-18 利用者の希望)
+hand = story.Story.create(str(TMP / "自分" / "手の物語"), "手の物語")
+sv.open_folder(hand.folder)
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("見る", "a / b / c", runs=2)]
+a.polls = 6
+sv._start_batch()
+end = time.time() + 10
+while time.time() < end and not sv.watch_folder:
+    pump(0.1)
+w1 = sv.batch.busy_workers()[0]
+check(Path(sv.watch_folder) == Path(w1.folder) == parent / "見る_01" and sv.story.name == "見る 01",
+      "バッチが動き出したら、作っている物語を出す")
+check(sv.story is not w1.story and sv.watch_note.isVisible() and "見るだけ" in sv.watch_note.text(),
+      "出すのは写しで、見るだけと知らせる")
+check(sv.story_box.currentText().startswith("▶ 作成中: 見る 01"), f"物語を選ぶ欄にも作成中と出す ({sv.story_box.currentText()})")
+check(not sv.make_b.isEnabled() and not sv.adopt_b.isEnabled() and sv.original.isReadOnly() and sv.prompt.isReadOnly()
+      and not sv.pick_file.isEnabled() and not sv.workflow_box.isEnabled(), "見ているあいだは直せない")
+check(sv.scene_cards[0].state.text() == "バッチで作っています…", f"作っているシーンの札 ({sv.scene_cards[0].state.text()})")
+before_json = (Path(w1.folder) / story.STORY_FILE).read_text(encoding="utf-8")
+sv.story.scenes[0].name = "いたずら"
+sv._save()
+check((Path(w1.folder) / story.STORY_FILE).read_text(encoding="utf-8") == before_json, "画面からはバッチの物語を書かない")
+end = time.time() + 60
+while time.time() < end and w1.active and w1.scene_index < 1:
+    pump(0.1)
+pump(0.6)
+check(sv.story.scenes[0].adopted and sv.scene is sv.story.scenes[1] and sv.scene_cards[1].state.text() == "バッチで作っています…",
+      "進んだら描き直して、作っているシーンを追いかける")
+sv.select(sv.story.scenes[0])
+pump(0.8)
+check(sv.scene is sv.story.scenes[0], "人が選んだシーンには留まる")
+end = time.time() + 120
+while time.time() < end and not (sv.watch_folder and Path(sv.watch_folder) == parent / "見る_02"):
+    pump(0.1)
+check(Path(sv.watch_folder) == parent / "見る_02", "1 本出来たら、次に作っている物語へ")
+wait_batch()
+check(not sv.watch_folder and sv.story is not None and Path(sv.story.folder) == parent / "見る_02"
+      and sv.make_b.isEnabled() and not sv.original.isReadOnly() and not sv.watch_note.isVisible(),
+      "終わったら、出来た物語を直せるように開く")
+# 人がほかの物語を開いたら、バッチの途中でも勝手に切り替えない
+story_batch.ask_plans = lambda *_a, **_k: [small_plan("見ない", "a / b", runs=2)]
+sv._start_batch()
+end = time.time() + 10
+while time.time() < end and not sv.watch_folder:
+    pump(0.1)
+sv.story_box.setCurrentIndex(sv.story_box.findData(hand.folder))
+sv._story_chosen(sv.story_box.currentIndex())
+check(not sv.watch_folder and sv.story.name == "手の物語" and sv.make_b.isEnabled(), "物語を選べば、手の物語に戻る")
+pump(1.0)
+end = time.time() + 120
+while time.time() < end and not (parent / "見ない_02").exists():
+    pump(0.1)
+pump(1.0)
+check(not sv.watch_folder and sv.story.name == "手の物語", "次の本が始まっても、勝手に切り替えない")
+i = sv.story_box.findData(sv.batch.busy_workers()[0].folder)
+check(i >= 0, "作成中の物語は、選ぶ欄から選べる")
+sv._story_chosen(i)
+check(sv.watch_folder and sv.story.name == "見ない 02", "選べば、また見るだけで出す")
+sv.receive([str(face)], "scenes")
+check(not sv.watch_folder and sv.story.name == "手の物語" and len(sv.story.scenes) == 2,
+      "見ているときに送られたものは、前に開いていた物語に入れる")
+wait_batch()
+a.polls = 2
 
 # 12. 量産ラインとバッチは同時に動く。台の空きは分け合い (1 台に合わせて 2 件まで)、両方が待っていれば物語が先
 def is_story(wf):

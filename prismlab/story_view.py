@@ -577,6 +577,14 @@ class StoryView(QWidget):
         self._translated.connect(self._on_translated)
         self._loading = False
         self._player = None
+        # バッチで作っている物語を見るだけで出す (2026-11-18 利用者の希望)。見ているあいだは、バッチの物語の写しを出し、
+        # 画面からは書かない (同じ物語を両方が書かないように)。watch_folder = 見ている物語のフォルダ ("" = 見ていない)
+        self.watch_folder = ""
+        self._watch_pin = ""  # 見ているあいだに人が選んだシーンの id ("" = バッチが作っているシーンを追いかける)
+        self._watch_shape = None  # 絵コンテを作り直すかの目印 (シーンの並び・つなぎ・名前)
+        self._follow_batch = True  # バッチが動いたら、その物語を出す (バッチ中に人がほかの物語を開いたら、やめる)
+        self._hand_folder = ""  # 見る前に開いていた物語 (見終わったら戻す)
+        self._working = ()  # 物語を選ぶ欄に出している、作成中の物語のフォルダ
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -650,6 +658,11 @@ class StoryView(QWidget):
         self.batch_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.batch_bar.hide()
         root.addWidget(self.batch_bar)
+        self.watch_note = QLabel()
+        self.watch_note.setWordWrap(True)
+        self.watch_note.setStyleSheet(f"color: {theme.ACCENT}; font-weight: bold; padding: 2px 4px;")
+        self.watch_note.hide()
+        root.addWidget(self.watch_note)
 
         # 絵コンテ
         self.board_host = QWidget()
@@ -689,12 +702,18 @@ class StoryView(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
         self._save_timer.timeout.connect(self._save)
+        self._watch_timer = QTimer(self)  # バッチの進みに合わせた描き直し (続けて来たらまとめる)
+        self._watch_timer.setSingleShot(True)
+        self._watch_timer.setInterval(250)
+        self._watch_timer.timeout.connect(self._sync_watch)
 
         # 物語のバッチの待ち行列 (engine.finished は、この画面の _on_finished のあとに受ける)
         self.batch = story_batch.BatchQueue(self)
         self.batch.progress.connect(self._batch_progress)
         self.batch.running.connect(lambda _on: self._batch_changed())
         self.batch.changed.connect(self._batch_changed)
+        self.batch.changed.connect(self._batch_watch)
+        self.batch.running.connect(self._batch_running)
         self.batch.entry_done.connect(lambda text: self.status.emit("バッチが 1 件終わりました。" + text))
         self.batch.all_done.connect(self._batch_done)
         self._batch_dialog = None  # 開いている「バッチに足す」の窓 (送られた画像をここに足す)
@@ -1022,8 +1041,12 @@ class StoryView(QWidget):
     def _fill_stories(self) -> None:
         self.story_box.blockSignals(True)
         self.story_box.clear()
+        for w in self._working_workers():
+            self.story_box.addItem(f"▶ 作成中: {w.story.name}   (バッチ · {w.folder})", w.folder)
+        working = {str(Path(w.folder)).lower() for w in self._working_workers()}
         for folder in story.recent():
-            self.story_box.addItem(f"{Path(folder).name}   ({folder})", folder)
+            if str(Path(folder)).lower() not in working:
+                self.story_box.addItem(f"{Path(folder).name}   ({folder})", folder)
         if self.story is not None:
             index = self.story_box.findData(self.story.folder)
             if index < 0:  # 最近開いた物語に入れていないもの (バッチが作っている物語)
@@ -1045,6 +1068,8 @@ class StoryView(QWidget):
                 QMessageBox.warning(self, "物語を開く", str(exc))
             return False
         self._save()
+        self.watch_folder, self._watch_pin, self._watch_shape = "", "", None
+        self._hand_folder = st.folder
         self.story = st
         self.scene = st.scenes[0]
         if remember:
@@ -1056,8 +1081,17 @@ class StoryView(QWidget):
 
     def _story_chosen(self, index: int) -> None:
         folder = self.story_box.itemData(index)
-        if folder and (self.story is None or Path(folder) != Path(self.story.folder)):
-            self.open_folder(str(folder))
+        if not folder or (self.story is not None and Path(folder) == Path(self.story.folder)):
+            return
+        if self._worker_of(str(folder)) is not None:
+            if self.watch(str(folder), quiet=False):
+                self._follow_batch = True
+            else:
+                self._fill_stories()
+            return
+        self._user_opens()
+        if not self.open_folder(str(folder)):
+            self._fill_stories()
 
     def _new_story(self) -> None:
         name = ask_text(self, "新しい物語", "物語の名前")
@@ -1073,17 +1107,19 @@ class StoryView(QWidget):
         except story.StoryError as exc:
             QMessageBox.warning(self, "新しい物語", str(exc))
             return
+        self._user_opens()
         self.open_folder(str(folder))
 
     def _open_story(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "物語のフォルダを選ぶ (story.json のあるフォルダ)",
                                                   str(Path(self.story.folder).parent) if self.story else "")
         if folder:
+            self._user_opens()
             self.open_folder(folder)
 
     def _save(self) -> None:
-        if self.story is None:
-            return
+        if self.story is None or self.watch_folder or self._worker_of(self.story.folder) is not None:
+            return  # バッチが作っている物語は、バッチだけが書く (画面の写しで上書きしない)
         try:
             self.story.save()
         except story.StoryError as exc:
@@ -1091,7 +1127,8 @@ class StoryView(QWidget):
 
     def _changed(self, rebuild: bool = False) -> None:
         """物語を直したとき: 少しあとで保存し、描き直す。"""
-        self._save_timer.start()
+        if not self.watch_folder:
+            self._save_timer.start()
         self.refresh(rebuild=rebuild)
 
     # ------------------------------------------------------------------
@@ -1110,6 +1147,7 @@ class StoryView(QWidget):
             if i > 0:
                 link = LinkButton(scene.link)
                 link.clicked.connect(lambda _c=False, s=scene: self._toggle_link(s))
+                link.setEnabled(not self.watch_folder)
                 self.board.addWidget(link)
             card = SceneCard()
             card.clicked.connect(lambda s=scene: self.select(s))
@@ -1121,6 +1159,7 @@ class StoryView(QWidget):
         add.setFixedWidth(100)
         add.setToolTip("最後に「続き」でシーンを足します。")
         add.clicked.connect(lambda: self._add_scene(None))
+        add.setEnabled(not self.watch_folder)
         spacer = QWidget()
         spacer.setFixedWidth(16)
         self.board.addWidget(spacer)
@@ -1130,12 +1169,17 @@ class StoryView(QWidget):
     def select(self, scene: story.Scene) -> None:
         if scene is self.scene:
             return
+        if self.watch_folder:
+            # バッチが作っているシーンを選んだら、また追いかける。ほかを選んだら、そのシーンに留まる
+            w = self._worker_of(self.watch_folder)
+            now = w.story.scenes[min(w.scene_index, len(w.story.scenes) - 1)].id if w and w.story.scenes else ""
+            self._watch_pin = "" if scene.id == now else scene.id
         self._save()
         self.scene = scene
         self.refresh(rebuild=False, load=True)
 
     def _toggle_link(self, scene: story.Scene) -> None:
-        if self._busy_here(scene):
+        if self.watch_folder or self._busy_here(scene):
             return
         try:
             self.story.set_link(scene, story.CUT if scene.link == story.CONT else story.CONT)
@@ -1155,6 +1199,8 @@ class StoryView(QWidget):
         return scene
 
     def _scene_menu(self, scene: story.Scene, pos) -> None:
+        if self.watch_folder:
+            return
         menu = QMenu(self)
         rename = menu.addAction("名前を変える...")
         add_after = menu.addAction("このあとにシーンを足す")
@@ -1194,7 +1240,7 @@ class StoryView(QWidget):
     # 元画像
     # ------------------------------------------------------------------
     def _link_clicked(self, n: int) -> None:
-        if self.scene is None or self.story.index_of(self.scene) == 0:
+        if self.watch_folder or self.scene is None or self.story.index_of(self.scene) == 0:
             return
         want = story.CONT if n == 0 else story.CUT
         if want != self.scene.link:
@@ -1303,7 +1349,7 @@ class StoryView(QWidget):
 
     def _drop(self, event) -> None:
         path = event.mimeData().urls()[0].toLocalFile()
-        if self.scene is not None:
+        if self.scene is not None and not self.watch_folder:
             event.acceptProposedAction()
             story.remember_pick(path)
             self._set_source(lambda: self.story.set_source_file(self.scene, path))
@@ -1312,7 +1358,7 @@ class StoryView(QWidget):
     # プロンプト
     # ------------------------------------------------------------------
     def _original_changed(self) -> None:
-        if self._loading or self.scene is None:
+        if self._loading or self.scene is None or self.watch_folder:
             return
         self.scene.original = self.original.toPlainText()
         self._save_timer.start()
@@ -1505,6 +1551,8 @@ class StoryView(QWidget):
         self.refresh()
 
     def _undo_llm(self) -> None:
+        if self.watch_folder:
+            return
         """元に戻す / Ctrl+Z: 欄の編集を 1 つ戻す。戻すものがなければ (開き直したあと) 履歴の直前の操作の前の文へ。"""
         if self.scene is None or self._llm_busy:
             return
@@ -1554,7 +1602,7 @@ class StoryView(QWidget):
     # 候補
     # ------------------------------------------------------------------
     def _gen_settings_changed(self, *_a) -> None:
-        if self._loading or self.scene is None:
+        if self._loading or self.scene is None or self.watch_folder:
             return
         s = self.scene
         s.workflow = str(self.workflow_box.currentData() or "")
@@ -1764,6 +1812,13 @@ class StoryView(QWidget):
         menu = QMenu(self)
         play = menu.addAction("再生 / 開く")
         folder = menu.addAction("フォルダを開く")
+        if self.watch_folder:  # バッチで作っている物語は見るだけ
+            chosen = menu.exec(self.cands.mapToGlobal(pos))
+            if chosen is play:
+                self._play_candidate(item)
+            elif chosen is folder:
+                subprocess.Popen(["explorer", "/select,", path])  # noqa: S603,S607
+            return
         menu.addSeparator()
         cand = next((c for c in self.scene.candidates if c.path == path), None) if self.scene else None
         back = menu.addAction("このときのプロンプトに戻す")
@@ -1797,7 +1852,7 @@ class StoryView(QWidget):
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.cands and event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Delete:
-            if not event.isAutoRepeat():  # 押しっぱなしで続けて消えないように
+            if not event.isAutoRepeat() and not self.watch_folder:  # 押しっぱなしで続けて消えないように
                 self._delete_candidates()
             return True
         return super().eventFilter(obj, event)
@@ -1991,12 +2046,12 @@ class StoryView(QWidget):
                 if u.isLocalFile() and u.toLocalFile().lower().endswith(recipes.IMAGE_EXTS)]
 
     def _board_drag(self, event) -> None:
-        if self.story is not None and self._image_urls(event):
+        if self.story is not None and not self.watch_folder and self._image_urls(event):
             event.acceptProposedAction()
 
     def _board_drop(self, event) -> None:
         paths = self._image_urls(event)
-        if self.story is None or not paths:
+        if self.story is None or not paths or self.watch_folder:
             return
         event.acceptProposedAction()
         pos = event.position().toPoint()
@@ -2037,6 +2092,10 @@ class StoryView(QWidget):
         """ほかのアプリから送られたもの (spec 5 章)。入れられなければ理由を返す。"""
         if slot == "batch":  # 物語のバッチに足す: 設定の窓を出す (バッチが動いていても足せる)
             return self.queue_images(files)
+        if self.watch_folder:
+            # バッチの物語は直せないので、見る前に開いていた物語に戻して入れる
+            self._user_opens()
+            self.unwatch()
         if self.story is None:
             return "物語を開いていません。PrismLab の「物語」で物語を開いてから、もう一度送ってください。"
         found = [f for f in files if Path(f).is_file()]
@@ -2141,7 +2200,37 @@ class StoryView(QWidget):
         finally:
             self._loading = False
 
+    def _edit_widgets(self) -> list:
+        """見ているあいだは止める欄 (直すもの・作るもの)。"""
+        return [self.link_cont, self.link_cut, self.pick_file, self.pick_frame, self.pick_t2i, self.ref_pick,
+                self.ref_clear, self.ref_inherit, self.last_pick, self.last_clear, self.add_original_b, self.to_english,
+                self.reader_box, self.read_b, self.enhancer_box, self.enhance_b, self.insert_b, self.undo_b,
+                self.workflow_box, self.use_seconds, self.seconds_box, self.base_box, self.count_box, self.make_b,
+                self.adopt_b, self.adopt_only, self.frame_next_b]
+
     def refresh(self, rebuild: bool = False, load: bool = False) -> None:
+        watching = bool(self.watch_folder)
+        if not watching and getattr(self, "_watch_locked", False):
+            # 見るのをやめた: 止めていた欄を戻す (このあと、ふだんの決まりで入れ直す)
+            self._watch_locked = False
+            for w in self._edit_widgets():
+                w.setEnabled(True)
+            self.original.setReadOnly(False)
+            self.seconds_box.setEnabled(self.use_seconds.isChecked())
+        self.watch_note.setVisible(watching)
+        self._refresh(rebuild, load)
+        if watching and self.story is not None:
+            self._watch_locked = True
+            for w in self._edit_widgets():
+                w.setEnabled(False)
+            self.original.setReadOnly(True)
+            self.prompt.setReadOnly(True)
+            self.stop_b.setVisible(False)
+            w = self._worker_of(self.watch_folder)
+            if w is not None and w.status:
+                self.gen_state.setText(w.status)
+
+    def _refresh(self, rebuild: bool = False, load: bool = False) -> None:
         has_story = self.story is not None
         self.detail.setVisible(has_story)
         self.empty.setVisible(not has_story)
@@ -2159,6 +2248,9 @@ class StoryView(QWidget):
         index = self.story.index_of(s)
 
         # 絵コンテ
+        watcher = self._worker_of(self.watch_folder) if self.watch_folder else None
+        watched_now = watcher.story.scenes[watcher.scene_index].id \
+            if watcher is not None and watcher.scene_index < len(watcher.story.scenes) else ""
         for i, (scene, card) in enumerate(zip(self.story.scenes, self.scene_cards)):
             card.set_selected(scene is s)
             card.name.setText(scene.label(i))
@@ -2171,7 +2263,9 @@ class StoryView(QWidget):
                     pix = with_inset(pix, last, SCENE_THUMB - QSize(6, 6))
             card.thumb.setPixmap(_framed(pix, SCENE_THUMB, OK_COLOR if scene.adopted else ""))
             busy = self.job == ("cand", scene.id) and self.engine.active
-            if busy:
+            if watched_now == scene.id:
+                text = "バッチで作っています…"
+            elif busy:
                 text = "候補を作っています…"
             elif scene.adopted:
                 text = "採用済み"
@@ -2386,6 +2480,120 @@ class StoryView(QWidget):
             self._fill_stories()
             self.refresh(rebuild=True)
             self.status.emit(f"物語「{Path(folder).name}」はバッチが続きを作るので閉じました。")
+
+    # ------------------------------------------------------------------
+    # バッチで作っている物語を見る (見るだけ)
+    # ------------------------------------------------------------------
+    def _working_workers(self) -> list:
+        return [w for w in self.batch.busy_workers() if w.story is not None and w.folder] \
+            if hasattr(self, "batch") else []
+
+    def _worker_of(self, folder: str):
+        key = str(Path(folder)).lower()
+        return next((w for w in self._working_workers() if str(Path(w.folder)).lower() == key), None)
+
+    def _hand_busy(self) -> bool:
+        """この画面で (手で) 候補・読み取り・盛るを動かしている (見る物語に切り替えると、結果の入れ先がずれる)。"""
+        return self.candidates_busy() or bool(self._llm_busy)
+
+    def _user_opens(self) -> None:
+        """人がほかの物語を開く: バッチが動いていても、もう勝手に切り替えない。"""
+        if self.batch.active:
+            self._follow_batch = False
+
+    def watch(self, folder: str, quiet: bool = True) -> bool:
+        """バッチで作っている物語を見るだけで出す。見ているあいだは直せず、バッチの進みに合わせて描き直す。"""
+        w = self._worker_of(folder)
+        if w is None:
+            return False
+        if self._hand_busy():
+            if not quiet:
+                QMessageBox.information(self, "作成中の物語を見る", "この画面で候補・読み取り・盛るを動かしています。"
+                                        "終わってから選んでください。")
+            return False
+        if not self.watch_folder:
+            self._save_timer.stop()
+            self._save()
+            if self.story is not None:
+                self._hand_folder = self.story.folder
+        self.watch_folder, self._watch_pin, self._watch_shape = w.folder, "", None
+        self._sync_watch()
+        self.status.emit(f"バッチで作っている物語「{w.story.name}」を出しています (見るだけ)。")
+        return True
+
+    def unwatch(self) -> None:
+        """見るのをやめて、見る前に開いていた物語に戻す。"""
+        if not self.watch_folder:
+            return
+        self.watch_folder, self._watch_pin, self._watch_shape = "", "", None
+        self.story, self.scene = None, None
+        self._open_hand()
+
+    def _open_hand(self) -> None:
+        """見る前に開いていた物語を開き直す (なければ、何も開いていない画面)。"""
+        hand = self._hand_folder
+        if not (hand and (Path(hand) / story.STORY_FILE).is_file() and self.open_folder(hand, quiet=True, remember=False)):
+            self._fill_stories()
+            self.refresh(rebuild=True)
+
+    def _sync_watch(self) -> None:
+        """見ている物語を、バッチが持っている今の中身で出し直す (写しを出す。画面で直しても、バッチの物語は変わらない)。"""
+        w = self._worker_of(self.watch_folder) if self.watch_folder else None
+        if w is None:
+            return
+        src = w.story
+        st = story.Story(src.folder, src.name, [story.Scene.from_dict(sc.to_dict()) for sc in src.scenes])
+        now = st.scenes[min(w.scene_index, len(st.scenes) - 1)] if st.scenes else None
+        pinned = next((sc for sc in st.scenes if sc.id == self._watch_pin), None)
+        shape = tuple((sc.id, sc.link, sc.name) for sc in st.scenes)
+        rebuild = shape != self._watch_shape
+        self._watch_shape = shape
+        self.story, self.scene = st, pinned or now
+        self.watch_note.setText(f"バッチで作っている物語「{st.name}」を出しています (見るだけ。直すのは出来上がってから)。"
+                                + (f"  今: シーン {w.scene_index + 1} / {len(st.scenes)}" if w.scene_index < len(st.scenes) else ""))
+        working = tuple(str(Path(x.folder)).lower() for x in self._working_workers())
+        if rebuild or working != self._working:
+            self._working = working
+            self._fill_stories()
+        self.refresh(rebuild=rebuild, load=True)
+
+    def _batch_running(self, on: bool) -> None:
+        if on:
+            self._follow_batch = True  # 新しく動き出したら、また出す
+            QTimer.singleShot(0, self._batch_watch)
+
+    def _batch_watch(self) -> None:
+        """バッチが進んだ: 見ている物語を描き直す。終わったらほかの作成中の物語へ、なければ出来た物語を開く。"""
+        working = tuple(str(Path(x.folder)).lower() for x in self._working_workers())
+        if self.watch_folder:
+            if self._worker_of(self.watch_folder) is not None:
+                self._watch_timer.start()
+                return
+            ended = self.watch_folder
+            others = self._working_workers()
+            if others and self._follow_batch:
+                # 次の物語を見る (前に開いていた物語は覚えたまま)。見ていた写しは書かずに手放す
+                # (先に手放さないと、watch が古い写しを手の物語として保存し、出来た物語を上書きする)
+                self.watch_folder, self.story, self.scene = "", None, None
+                if not self.watch(others[0].folder):
+                    self._open_hand()
+                return
+            self.watch_folder, self._watch_pin, self._watch_shape = "", "", None
+            self.story, self.scene = None, None
+            hand = self._hand_folder
+            if (Path(ended) / story.STORY_FILE).is_file() and not self.batch.is_working(ended)                     and self.open_folder(ended, quiet=True, remember=False):
+                # 出来た (止めた) 物語を、そのまま直せるように開く。次にバッチの物語を見終わったら、元の物語に戻す
+                self._hand_folder = hand
+            else:
+                self._open_hand()  # 一時停止などで作りかけのまま止まった
+            return
+        if working != self._working:
+            self._working = working
+            self._fill_stories()
+        if self._follow_batch and not self._hand_busy():
+            others = self._working_workers()
+            if others:
+                self.watch(others[0].folder)
 
     def _batch_progress(self, text: str) -> None:
         self.batch_label.setText(text)
