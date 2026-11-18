@@ -40,6 +40,7 @@ PROFILE = app.Profile(
         "「Load Image」ノードがあれば元画像も送ります。seed は毎回ランダムになります。"
     ),
     output_folder=False,
+    share_history=True,  # PC1 で作った結果を、PC2 の PromptWordCrafter の生成結果にも出す (2026-11-18)
     colors=app.Colors(ok=theme.OK_COLOR, error=theme.ERROR_COLOR, hint=theme.HINT_COLOR,
                       paused="#ff9800", separator="#555555"),
 )

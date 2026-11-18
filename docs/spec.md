@@ -281,6 +281,7 @@ PromptWordCrafter・ImageMimicArt・J-Rate の「作る」部分をまとめる�
 
 - PrismLab の記録 (`comfy_history.txt`) の量産・試作の行に、`origin` (入口のファイル。どのステップの出力でも同じ)、`originText` (入口がテキストのとき、始めたときの中身)、`recipe` (レシピ名)、`step` (何番目のステップか。1 から) を足す (GenCommon の `GenRequest`)。
 - PWC の帯は、自分の記録に加えて PrismLab の記録も読み、`origin` が表示中のテキストのものを出す (出力がどのフォルダにあっても)。ラインの途中の出力 (T2I の画像など) も出し、サムネールの右上に「PL」の印 (PrismLab の強調色)、指を置くと「PrismLab: レシピ名 ・ ステップ n」。`originText` が今の本文と違えば、PWC の結果と同じく「前の本文」の印。
+- **別の PC** (2026-11-18 利用者の希望): PC1 の PrismLab で作った結果を、同じフォルダを見ている PC2 の PWC にも出す。PrismLab は記録を共有の置き場所の `history\PrismLab.(PC名).txt` にも書き、PWC はほかの PC のものも読む (generation-standard 6 章「別の PC の記録」)。両方の PC で共有の置き場所を決めていて、出力フォルダがどちらからも同じパスで見えるときに出る。
 - PWC でテキストの名前を変えても、PrismLab の結果のファイルの名前は変えない (量産の出力を勝手に動かさない。利用者の決定)。PrismLab の記録の `origin` だけを新しい名前に付け替える。
 - PWC の今の生成はそのまま残す (6 章の 4。利用者の決定 2026-11-16)。
 
