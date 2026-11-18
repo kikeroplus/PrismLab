@@ -24,7 +24,7 @@ from PySide6.QtGui import QColor, QDropEvent, QImage  # noqa: E402
 from PySide6.QtNetwork import QLocalSocket  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
-from fakes import FakeComfy, workflow_i2v, workflow_t2i  # noqa: E402
+from fakes import FakeComfy, make_video, workflow_i2v, workflow_t2i  # noqa: E402
 from gencommon import comfy, store  # noqa: E402
 from prismlab import engine, main, profile, recipes, story, theme  # noqa: E402
 from prismlab.main_window import MainWindow  # noqa: E402
@@ -363,6 +363,36 @@ video_rows[0].setSelected(True)
 lv._result_menu(lv.results.visualItemRect(video_rows[0]).center())
 act = [a for a in menus[-1].actions() if "物語の最後" in a.text()][0]
 check(not act.isEnabled(), "動画だけなら押せない")
+
+# 物語のシーンの札: 採用した動画は、量産ラインと同じく右下に最後のコマを小さく重ねる
+clip = TMP / "採用.mp4"
+make_video(clip, [(200, 40, 40)] * 6 + [(40, 60, 220)] * 2, size=(96, 64))  # 赤 6 コマ → 最後は青
+sc = sv.story.scenes[0]
+sc.adopted = str(clip)
+sv.refresh()
+
+
+def scene_thumb():
+    return sv.scene_cards[0].thumb.pixmap().toImage()
+
+
+def blue_corner(img) -> bool:
+    c = img.pixelColor(img.width() - 12, img.height() - 10)
+    return c.blue() > 150 and c.red() < 120
+
+
+end = time.time() + 20
+while time.time() < end and not blue_corner(scene_thumb()):
+    pump(0.2)
+    sv.refresh()
+img = scene_thumb()
+mid = img.pixelColor(img.width() // 2, img.height() // 2)
+check(blue_corner(img) and mid.red() > 150 and mid.blue() < 120,
+      f"採用した動画のシーンは、右下に最後のコマを重ねる (真ん中 {mid.name()}・右下 {img.pixelColor(img.width() - 12, img.height() - 10).name()})")
+sc.adopted = ""
+sv.refresh()
+pump(0.3)
+check(not blue_corner(scene_thumb()), "採用していなければ重ねない")
 
 window.story.shutdown()
 window.engine.stop_threads()

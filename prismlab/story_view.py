@@ -24,7 +24,7 @@ from gencommon import comfy, enhancer, inserts, reader, store
 from . import engine, highlight, kinds, recipes, recycle, story, story_batch, theme, translate
 from .dialogs import ask_text
 from .thumbs import ThumbCache
-from .widgets import AddButton
+from .widgets import AddButton, with_inset
 
 ENGLISH = "英語に直し"  # LLM の仕事の名前 (「英語に直し中…」「英語に直しに失敗しました」)
 TRANSLATE_DELAY_MS = 900  # 送るプロンプトを直して、これだけ止まったら訳し直す
@@ -2164,6 +2164,11 @@ class StoryView(QWidget):
             card.name.setText(scene.label(i))
             shown = scene.adopted if scene.adopted else scene.source
             pix = self.thumbs.get(shown, check=True) if shown and Path(shown).exists() else None
+            if pix is not None and not pix.isNull() and scene.adopted and _is_video(shown):
+                # 量産ラインと同じく、採用した動画は右下に最後のコマを小さく重ねる
+                last = self.thumbs.get(shown, last=True)
+                if last is not None and not last.isNull():
+                    pix = with_inset(pix, last, SCENE_THUMB - QSize(6, 6))
             card.thumb.setPixmap(_framed(pix, SCENE_THUMB, OK_COLOR if scene.adopted else ""))
             busy = self.job == ("cand", scene.id) and self.engine.active
             if busy:
