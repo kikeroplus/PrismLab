@@ -346,6 +346,28 @@ assert not adopted2.exists() and s2.adopted == "" and s2.candidates == [], "Del 
 names = sorted(p.name for p in sv.story.adopted_dir().iterdir())
 assert names == ["01_ホーム.mp4"], names
 assert "ごみ箱へ移動しました" in window.statusBar().currentMessage(), window.statusBar().currentMessage()
+# 消したあとに作り直すと、空いた番号で同じ名前になる: 消した候補のサムネールを出さない (2026-11-18 の不具合)
+gone_names = {other.name, adopted2.name}
+recolored = TMP / "recolored.mp4"
+make_video(recolored, [(40, 160, 220)] * 4 + [(230, 210, 40)] * 4, size=(160, 96))  # 水色 → 黄
+a.video_bytes = recolored.read_bytes()
+sv.count_box.setValue(1)
+sv.make_b.click()
+wait_engine()
+assert len(s2.candidates) == 1 and Path(s2.candidates[0].path).name in gone_names, (s2.candidates, gone_names)
+sv.cands.setCurrentRow(0)
+pump(0.5)
+cf, cl = shown_color(sv.preview), shown_color(sv.preview_last)
+# 「始め」は Windows のサムネール (短い動画ではどのコマか決まらない) なので、消した候補の赤でないことを見る
+assert not (cf.red() > 150 and cf.green() < 100), ("作り直した候補の絵 (消した候補の赤ではない)", cf.getRgb())
+assert cl.red() > 150 and cl.blue() < 120, ("作り直した候補の最後のコマ (黄)", cl.getRgb())
+icon = sv.cands.item(0).icon().pixmap(sv.cands.iconSize()).toImage()
+ci = icon.pixelColor(icon.width() // 2, icon.height() // 2)
+assert not (ci.red() > 150 and ci.green() < 100), ("候補の一覧の絵も新しいもの", ci.getRgb())
+a.video_bytes = clip.read_bytes()
+sv._delete_candidates()
+pump(0.3)
+assert s2.candidates == []
 sv.cands.setCurrentRow(-1)
 
 # リファレンス画像 (顔): 対応するワークフローのときだけ選べる

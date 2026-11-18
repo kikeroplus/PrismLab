@@ -377,6 +377,25 @@ class PlayDialog(QDialog):
 
 
 # ----------------------------------------------------------------------
+# 候補づくり 1 つ分
+# ----------------------------------------------------------------------
+class CandJob:
+    """シーン 1 つの候補 (または T2I の元画像) づくり。1 つずつ Engine を持つので、別のシーンなら並べて作れる
+    (2026-11-18 利用者の希望。台の空きは量産ライン・バッチと POOL で分け合う)。"""
+
+    def __init__(self, kind: str, scene_id: str, folder: str, eng: "engine.Engine", prompt: str = "",
+                 original: str = "", reference: str = "", last_frame: str = ""):
+        self.kind, self.scene_id, self.folder, self.engine = kind, scene_id, folder, eng
+        self.prompt, self.original, self.reference, self.last_frame = prompt, original, reference, last_frame
+        self.done = False  # finished を受け取った
+        self.held = kind == "t2i"  # T2I の窓が結果を見ているあいだは捨てない
+
+    @property
+    def running(self) -> bool:
+        return not self.done and self.engine.active
+
+
+# ----------------------------------------------------------------------
 # T2I で元画像を作る
 # ----------------------------------------------------------------------
 class T2IDialog(QDialog):
@@ -428,7 +447,8 @@ class T2IDialog(QDialog):
         if self.workflow.count() == 0:
             self.state.setText("T2I のワークフローが登録されていません (「生成の設定」で登録してください)。")
             self.make.setEnabled(False)
-        self.view.engine.changed.connect(self._schedule)
+        self.job: Optional[CandJob] = None
+        self.finished.connect(lambda _r: self._release())
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(300)
@@ -449,15 +469,21 @@ class T2IDialog(QDialog):
             source.write_text(text, encoding="utf-8")
         except OSError:
             pass
-        ok = self.view.start_job(("t2i", self.scene.id), str(self.workflow.currentData() or ""), text, None, True,
-                                 self.count.value(), str(source), str(folder))
-        if ok:
+        job = self.view.start_job(("t2i", self.scene.id), str(self.workflow.currentData() or ""), text, None, True,
+                                  self.count.value(), str(source), str(folder))
+        if job is not None:
+            self._release()
+            self.job = job
+            job.engine.changed.connect(self._schedule)
             self.make.setEnabled(False)
 
+    def _release(self) -> None:
+        if self.job is not None:
+            self.job.held = False
+
     def _refresh(self) -> None:
-        run, items, _m = self.view.engine.snapshot()
-        mine = self.view.job == ("t2i", self.scene.id)
-        if mine and run is not None:
+        run, items, _m = self.job.engine.snapshot() if self.job is not None else (None, [], [])
+        if run is not None:
             done = sum(1 for i in items if i.finished)
             self.state.setText(f"作っています {done} / {len(items)}" if run.unfinished else f"出来ました ({done} 枚)")
             outs = [o["path"] for i in items for o in i.outputs]
@@ -558,19 +584,13 @@ class StoryView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.engine = engine.Engine(self, run_file=None, first=True)  # 候補づくり (量産ラインとは別。続きからは書かない。
-        # 台は量産ラインと分け合い、両方が待っていれば物語が先)
-        self.engine.changed.connect(self._schedule)
-        self.engine.finished.connect(self._on_finished)
+        # 候補づくり (量産ラインとは別。続きからは書かない。台は量産ラインと分け合い、両方が待っていれば物語が先)。
+        # シーンごとに 1 つ。前後がつながっていなければ並べて作れる
+        self._jobs: list[CandJob] = []
         self.thumbs = ThumbCache(200, self)
         self.thumbs.changed.connect(lambda _p: self._schedule())
         self.story: Optional[story.Story] = None
         self.scene: Optional[story.Scene] = None
-        self.job = None  # 候補づくりの印 ("cand" / "t2i", シーンの id)
-        self._job_prompt = ""
-        self._job_original = ""  # 候補づくりのときの元のプロンプト (候補に記録する)
-        self._job_reference = ""
-        self._job_last = ""
         self._before: dict[str, str] = {}  # シーンの id → 読み取る・盛るを始めたときの文 (うまくいったら履歴に残す)
         self._llm_busy = ""
         self._llm_done.connect(self._on_llm_done)
@@ -707,7 +727,7 @@ class StoryView(QWidget):
         self._watch_timer.setInterval(250)
         self._watch_timer.timeout.connect(self._sync_watch)
 
-        # 物語のバッチの待ち行列 (engine.finished は、この画面の _on_finished のあとに受ける)
+        # 物語のバッチの待ち行列
         self.batch = story_batch.BatchQueue(self)
         self.batch.progress.connect(self._batch_progress)
         self.batch.running.connect(lambda _on: self._batch_changed())
@@ -1222,6 +1242,9 @@ class StoryView(QWidget):
         elif chosen is add_after:
             self._add_scene(scene)
         elif chosen in (left, right):
+            if self._running_jobs():  # 並べ替えると「続き」の前のシーンが変わり、作っている元画像が書き換わる
+                self.status.emit("候補を作っているあいだは、シーンを並べ替えられません。")
+                return
             self.story.move_scene(scene, -1 if chosen is left else 1)
             self._changed(rebuild=True)
         elif chosen is delete:
@@ -1247,6 +1270,8 @@ class StoryView(QWidget):
             self._toggle_link(self.scene)
 
     def _set_source(self, func) -> None:
+        if self.scene is None or self._busy_here(self.scene):
+            return
         try:
             func()
         except story.StoryError as exc:
@@ -1623,37 +1648,74 @@ class StoryView(QWidget):
             label.setPixmap(QPixmap())
             label.setText(empty if not path else "")
 
+    def _running_jobs(self) -> list[CandJob]:
+        return [j for j in self._jobs if j.running]
+
+    def _job_for(self, scene_id: str, kind: str = "") -> Optional[CandJob]:
+        """そのシーンで動いている候補 (kind="t2i" なら T2I の元画像) づくり。"""
+        return next((j for j in self._jobs if j.scene_id == scene_id and (not kind or j.kind == kind) and j.running),
+                    None)
+
     def _busy_job(self, scene: story.Scene) -> bool:
         """このシーンの候補を作っているか (知らせない)。"""
-        return self.job is not None and self.job[1] == scene.id and self.engine.active
+        return self._job_for(scene.id) is not None
 
     def _busy_here(self, scene: story.Scene) -> bool:
-        if self.job is not None and self.job[1] == scene.id and self.engine.active:
+        if self._busy_job(scene):
             self.status.emit("このシーンは候補を作っています。終わるか中止してから直してください。")
             return True
         return False
 
+    def _wait_reason(self, s: story.Scene) -> str:
+        """そのシーンの候補をいま作れない理由 (前後がつながっているときだけ待つ)。作れるなら空。"""
+        if self._busy_job(s):
+            return "このシーンは候補を作っています。"
+        i = self.story.index_of(s)
+        if i > 0 and s.link == story.CONT and self._busy_job(self.story.scenes[i - 1]):
+            return ("前のシーンの候補を作っています。「続き」は前のシーンの採用で元画像が決まるので、"
+                    "終わってから作ってください。")
+        return ""
+
+    def _next_busy(self, scene: story.Scene) -> bool:
+        """次の「続き」のシーンが、このシーンの採用から取った元画像で候補を作っている (採用を変えられない)。"""
+        i = self.story.index_of(scene)
+        nxt = self.story.scenes[i + 1] if i + 1 < len(self.story.scenes) else None
+        if nxt is not None and nxt.link == story.CONT and self._busy_job(nxt):
+            self.status.emit(f"次のシーン「{nxt.label(i + 1)}」が、このシーンの採用の最後のコマから候補を作っています。"
+                             "終わるか中止してから採用を変えてください。")
+            return True
+        return False
+
+    def _prune_jobs(self) -> None:
+        """終わって誰も見ていない候補づくりを片付ける (スレッドが終わってから)。"""
+        keep = []
+        for j in self._jobs:
+            if j.done and not j.held and not j.engine.active:
+                j.engine.deleteLater()
+            else:
+                keep.append(j)
+        self._jobs = keep
+
     def start_job(self, job, workflow: str, prompt: str, seconds, base: bool, count: int, source: str,
-                  out_dir: str, reference: str = "", original: str = "", last_frame: str = "") -> bool:
-        """候補 (または T2I の元画像) を作り始める。一度に 1 つだけ。始められなければ窓で知らせる。"""
+                  out_dir: str, reference: str = "", original: str = "", last_frame: str = "") -> Optional[CandJob]:
+        """候補 (または T2I の元画像) を作り始める。シーンごとに 1 つ。始められなければ窓で知らせて None。"""
         problem = self._try_start_job(job, workflow, prompt, seconds, base, count, source, out_dir,
                                       reference, original, last_frame)
         if problem:
             QMessageBox.information(self, "候補を作る", problem)
-        return not problem
+            return None
+        return self._job_for(job[1], job[0])
 
     def _try_start_job(self, job, workflow: str, prompt: str, seconds, base: bool, count: int, source: str,
                        out_dir: str, reference: str = "", original: str = "", last_frame: str = "") -> str:
         """start_job の中身。始められなければ理由を返す (バッチは窓を出さずに止めるため)。"""
-        run = self.engine.run
-        if self.engine.active and run is not None and run.unfinished:
-            return "ほかのシーンの候補を作っています。終わってからにしてください。"
+        if self._job_for(job[1]) is not None:
+            return "このシーンは作っています。終わってからにしてください。"
         machines = recipes.machines()
         if not machines:
             return recipes.no_machines_reason()
         if not workflow:
             return "ワークフローを選んでください (「生成の設定」で登録します)。"
-        self.engine.set_machines(machines)
         recipe = recipes.Recipe(name=self.story.name, output_dir=out_dir, inherit=False,
                                 stages=[recipes.Stage(recipes.GEN, workflow=workflow, seconds=seconds, base_prompt=base)])
         try:
@@ -1664,9 +1726,14 @@ class StoryView(QWidget):
             it.text = prompt or None  # 空ならワークフローに書かれたプロンプトのまま
             it.reference = reference
             it.last_frame = last_frame
-        self.job, self._job_prompt = job, prompt
-        self._job_original, self._job_reference, self._job_last = original, reference, last_frame
-        self.engine.start(new)
+        self._prune_jobs()
+        eng = engine.Engine(self, run_file=None, first=True)
+        cj = CandJob(job[0], job[1], self.story.folder, eng, prompt, original, reference, last_frame)
+        eng.changed.connect(self._schedule)
+        eng.finished.connect(lambda cj=cj: self._on_finished(cj))
+        eng.set_machines(machines)
+        self._jobs.append(cj)
+        eng.start(new)
         self.refresh()
         return ""
 
@@ -1682,6 +1749,9 @@ class StoryView(QWidget):
     def make_candidates_for(self, s: story.Scene) -> str:
         """そのシーンの候補を、シーンに決めてある設定で作り始める。始められなければ理由を返す
         (「候補を作る」とバッチから。欄の値は先にシーンに入れておく)。"""
+        wait = self._wait_reason(s)
+        if wait:
+            return wait
         if not s.source or not Path(s.source).is_file():
             kind = kinds.kind_of(s.workflow)
             if kind.startswith("I") or not kind:
@@ -1719,26 +1789,28 @@ class StoryView(QWidget):
         return problem
 
     def _stop_job(self) -> None:
-        if self.engine.active:
-            self.engine.cancel_all()
+        j = self._job_for(self.scene.id) if self.scene is not None else None
+        if j is not None:
+            j.engine.cancel_all()
 
-    def _on_finished(self) -> None:
-        run, items, _m = self.engine.snapshot()
-        job = self.job
-        if job is not None and job[0] == "cand":
-            self.job = None  # T2I の元画像づくりは、窓が結果を拾うので印を残す
-        if run is None or job is None:
+    def _on_finished(self, j: CandJob) -> None:
+        if j.done:
             return
-        if job[0] == "cand" and self.story is not None:
-            scene = next((s for s in self.story.scenes if s.id == job[1]), None)
+        j.done = True  # T2I の元画像は、窓が結果を拾う
+        run, items, _m = j.engine.snapshot()
+        if run is None:
+            self.refresh(rebuild=True)
+            return
+        if j.kind == "cand" and self.story is not None and Path(self.story.folder) == Path(j.folder):
+            scene = next((s for s in self.story.scenes if s.id == j.scene_id), None)
             if scene is not None:
                 known = {c.path for c in scene.candidates}
                 for it in items:
                     for o in it.outputs:
                         if o["path"] not in known and Path(o["path"]).exists():  # 作っている途中で消したものは戻さない
                             scene.candidates.append(story.Candidate(
-                                o["path"], self._job_prompt, float(o.get("time") or time.time()),
-                                self._job_original, self._job_reference, self._job_last))
+                                o["path"], j.prompt, float(o.get("time") or time.time()),
+                                j.original, j.reference, j.last_frame))
                 self._save()
                 failed = [it.error for it in items if it.state == engine.FAILED]
                 self.status.emit(f"シーン「{scene.label(self.story.index_of(scene))}」の候補が出来ました"
@@ -1750,8 +1822,9 @@ class StoryView(QWidget):
         if self.scene is None:
             return []
         paths = [c.path for c in sorted(self.scene.candidates, key=lambda c: c.time, reverse=True)]
-        if self.job == ("cand", self.scene.id):
-            _r, items, _m = self.engine.snapshot()
+        j = self._job_for(self.scene.id, "cand")
+        if j is not None:
+            _r, items, _m = j.engine.snapshot()
             fresh = [o["path"] for it in items for o in it.outputs if o["path"] not in paths]
             paths = fresh + paths
         return [p for p in paths if Path(p).exists()]
@@ -1773,12 +1846,13 @@ class StoryView(QWidget):
 
         put(self.preview_src, self.thumbs.get(src, check=True) if has_src else None,
             "読み込み中…" if has_src else "元画像なし")
-        put(self.preview, self.thumbs.get(path) if path else None,
+        # 候補は空いた番号の名前で作るので、同じパスでも中身が変わる: 更新時刻も見る
+        put(self.preview, self.thumbs.get(path, check=True) if path else None,
             "読み込み中…" if path else "候補を選ぶと、元画像と並べて出します (動画はダブルクリックで再生)")
         self.preview_last.setVisible(video)
         self.preview_caps[2].setVisible(video)
         if video:
-            put(self.preview_last, self.thumbs.get(path, last=True), "読み込み中…")
+            put(self.preview_last, self.thumbs.get(path, check=True, last=True), "読み込み中…")
         # その候補でラストフレームを指定していたら、候補の最後のコマと見比べられるように並べる
         cand = next((c for c in self.scene.candidates if c.path == path), None) if self.scene and path else None
         target = cand.last_frame if cand is not None and cand.last_frame and Path(cand.last_frame).is_file() else ""
@@ -1845,6 +1919,8 @@ class StoryView(QWidget):
         elif chosen is folder:
             subprocess.Popen(["explorer", "/select,", path])  # noqa: S603,S607
         elif chosen is drop and self.scene is not None:
+            if self.scene.adopted == path and self._next_busy(self.scene):
+                return
             self.scene.candidates = [c for c in self.scene.candidates if c.path != path]
             if self.scene.adopted == path:
                 self.story.adopt(self.scene, path)
@@ -1881,6 +1957,8 @@ class StoryView(QWidget):
         paths = [Path(str(i.data(Qt.ItemDataRole.UserRole))) for i in items]
         if not paths:
             return
+        if any(str(p) == self.scene.adopted for p in paths) and self._next_busy(self.scene):
+            return
         recyclable = all(recycle.can_recycle(p) for p in paths)
         if len(paths) > 1 or not recyclable:
             what = paths[0].name if len(paths) == 1 else f"選んでいる {len(paths)} 個の候補"
@@ -1905,6 +1983,8 @@ class StoryView(QWidget):
         finally:
             self._deleting = False
         gone = [p for p in paths if not p.exists()]
+        for p in gone:  # 次に作る候補が同じ名前 (空いた番号) になるので、消したもののサムネールを覚えておかない
+            self.thumbs.forget(str(p))
         scene = self.scene
         was_adopted = scene.adopted and any(str(p) == scene.adopted for p in gone)
         self.story.remove_candidates(scene, gone)
@@ -1942,6 +2022,8 @@ class StoryView(QWidget):
         path = str(item.data(Qt.ItemDataRole.UserRole))
         if go_next and self.scene.adopted == path:
             pass  # 採用のまま次へ
+        elif self._next_busy(self.scene):
+            return
         else:
             try:
                 self.story.adopt(self.scene, path)
@@ -2109,7 +2191,7 @@ class StoryView(QWidget):
             return self._add_image_scenes(images, warn=False) or ""
         if self.scene is None:
             return "シーンを選んでいません。"
-        if self.job is not None and self.job[1] == self.scene.id and self.engine.active:
+        if self._busy_job(self.scene):
             return "選んでいるシーンは候補を作っています。終わるか中止してから、もう一度送ってください。"
         path = found[0]
         label = self.scene.label(self.story.index_of(self.scene))
@@ -2258,11 +2340,11 @@ class StoryView(QWidget):
             pix = self.thumbs.get(shown, check=True) if shown and Path(shown).exists() else None
             if pix is not None and not pix.isNull() and scene.adopted and _is_video(shown):
                 # 量産ラインと同じく、採用した動画は右下に最後のコマを小さく重ねる
-                last = self.thumbs.get(shown, last=True)
+                last = self.thumbs.get(shown, check=True, last=True)
                 if last is not None and not last.isNull():
                     pix = with_inset(pix, last, SCENE_THUMB - QSize(6, 6))
             card.thumb.setPixmap(_framed(pix, SCENE_THUMB, OK_COLOR if scene.adopted else ""))
-            busy = self.job == ("cand", scene.id) and self.engine.active
+            busy = self._job_for(scene.id, "cand") is not None
             if watched_now == scene.id:
                 text = "バッチで作っています…"
             elif busy:
@@ -2351,19 +2433,24 @@ class StoryView(QWidget):
         self.prompt.setReadOnly(llm)
 
         # 候補
-        run, items, _m = self.engine.snapshot()
-        running = self.engine.active and run is not None and run.unfinished > 0
-        mine = running and self.job is not None and self.job[1] == s.id
-        if mine:
+        mine = self._job_for(s.id)
+        others = [j for j in self._running_jobs() if j is not mine]
+        wait = self._wait_reason(s) if mine is None else ""
+        if mine is not None:
+            _run, items, _m = mine.engine.snapshot()
             done = sum(1 for i in items if i.finished)
             now = next((i.status for i in items if i.state == engine.RUNNING and i.status), "")
-            self.gen_state.setText(f"作っています {done} / {len(items)}" + (f" ・ {now}" if now else ""))
-        elif running:
-            self.gen_state.setText("ほかのシーンの候補を作っています")
+            what = "作っています" if mine.kind == "cand" else "T2I で元画像を作っています"
+            self.gen_state.setText(f"{what} {done} / {len(items)}" + (f" ・ {now}" if now else ""))
+        elif wait:
+            self.gen_state.setText("前のシーンの候補を作っています (「続き」なので、終わってから)")
+        elif others:
+            self.gen_state.setText(f"ほかの {len({j.scene_id for j in others})} シーンでも作っています")
         else:
             self.gen_state.setText("")
-        self.make_b.setEnabled(not running)
-        self.stop_b.setVisible(mine)
+        self.make_b.setEnabled(mine is None and not wait)
+        self.make_b.setToolTip(wait)
+        self.stop_b.setVisible(mine is not None)
         paths = self._cand_paths()
         current = self.cands.currentItem()
         keep = str(current.data(Qt.ItemDataRole.UserRole)) if current else ""
@@ -2392,7 +2479,7 @@ class StoryView(QWidget):
             item = self.cands.item(n)
             path = str(item.data(Qt.ItemDataRole.UserRole))
             if item.icon().isNull():
-                pix = self.thumbs.get(path)
+                pix = self.thumbs.get(path, check=True)
                 if pix is not None:
                     item.setIcon(QIcon(_framed(pix, CAND_ICON, OK_COLOR if path == s.adopted else "")))
         self._show_candidate()
@@ -2412,8 +2499,8 @@ class StoryView(QWidget):
     def machines_changed(self) -> None:
         """台の設定を変えたとき: 札を直し、動いている候補づくりにも新しい台を使わせる。"""
         self._update_machines_button()
-        if self.engine.active:
-            self.engine.set_machines(recipes.machines())
+        for j in self._running_jobs():
+            j.engine.set_machines(recipes.machines())
         self.batch.set_machines(recipes.machines())  # 作っているバッチの物語にも (休みにした台へ新しく送らない)
 
     def _start_batch(self) -> None:
@@ -2468,8 +2555,7 @@ class StoryView(QWidget):
 
     def candidates_busy(self) -> bool:
         """物語のタブで (手で) 候補を作っているか。"""
-        run = self.engine.run
-        return self.engine.active and run is not None and run.unfinished > 0
+        return bool(self._running_jobs())
 
     def release_story(self, folder: str) -> None:
         """バッチが作りかけの物語の続きを作る前: この画面で開いていたら閉じる (同じ物語を両方が書かないように)。"""
@@ -2658,7 +2744,8 @@ class StoryView(QWidget):
             pass
         self.batch.shutdown()  # 動いているものは待機に戻して残す (次に起動したときに続きから)
         self._save()
-        if self.busy():
-            self.engine.discard()
-        else:
-            self.engine.stop_threads()
+        for j in self._jobs:
+            if j.running:
+                j.engine.discard()
+            else:
+                j.engine.stop_threads()
