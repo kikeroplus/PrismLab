@@ -26,9 +26,30 @@ SLOTS_PER_MACHINE = 2  # 1 台に同時に送る件数 (generation-standard 6 �
 FAIL_LIMIT = 3  # ある台でだけ、これだけ続けて失敗したら、その台を外す
 DOWN_RECHECK = 30.0  # 繋がらない台を確かめ直す間隔 (秒)
 SEEN_SECONDS = 3.0  # これより前に空きを求められていない台は、譲る先にしない (繋がらない・外した台)
+# 同じワークフローを同じ台に寄せる (2026-11-18 利用者の希望。画像と動画が混じるレシピで、ComfyUI がモデルを読み直す回数を
+# 減らす)。緩い重み付け: 台が空いたら、待っている生成の先頭から AFFINITY_LOOKAHEAD 件のうち、その台が最後に動かした
+# ワークフローと同じものを先に取る。先頭の件は AFFINITY_MAX_SKIPS 回まで後回しにしたら、次は必ず取る (待たせすぎない)
+AFFINITY_LOOKAHEAD = 6
+AFFINITY_MAX_SKIPS = 3
+_last_workflow: dict = {}  # 台の URL の小文字 → 最後に送ったワークフローのパスの小文字 (量産ラインと物語で共通)
+_last_lock = threading.Lock()
+
+
+def last_workflow(url: str) -> str:
+    with _last_lock:
+        return _last_workflow.get(url.lower(), "")
+
+
+def _set_last_workflow(url: str, workflow: str) -> None:
+    with _last_lock:
+        _last_workflow[url.lower()] = workflow.lower()
 
 WAITING, RUNNING, DONE, FAILED, CANCELED = "waiting", "running", "done", "failed", "canceled"
-STATE_TEXT = {WAITING: "待機中", RUNNING: "実行中", DONE: "完了", FAILED: "失敗", CANCELED: "取り消し"}
+# ★を待つ: GATED = ★が付くのを待っている (J-Rate で★を付けると先へ)、SKIPPED = ★待ちを終えたときに★がなく、そこで終えた
+GATED, SKIPPED = "gated", "skipped"
+STATE_TEXT = {WAITING: "待機中", RUNNING: "実行中", DONE: "完了", FAILED: "失敗", CANCELED: "取り消し",
+              GATED: "★待ち", SKIPPED: "★なし"}
+FRAME_DIR = "コマ"  # 最後のコマのステップが書く画像の置き場 (出力フォルダの下)
 UP, DOWN, OFF = "up", "down", "off"
 
 
@@ -55,13 +76,17 @@ class Item:
     error_stage: int = -1
     machine: str = ""  # 頼み済みの台の URL (prompt_id とセット)
     prompt_id: str = ""
+    # 増やすで分かれた枝の番号 (0 から)。差し込みの割り当て (plan) を枝ごとに引くのに使う
+    branch: int = 0
     status: str = ""  # 進み具合の文 (保存しない)
     at: str = ""  # いま動いている台の URL (保存しない)
+    skips: int = 0  # 同じワークフローを寄せるために後回しにした回数 (保存しない)
 
     def to_dict(self) -> dict:
         data = dict(self.__dict__)
         data.pop("status", None)
         data.pop("at", None)
+        data.pop("skips", None)
         return data
 
     @staticmethod
@@ -76,6 +101,7 @@ class Item:
             value = data.get(key)
             setattr(it, key, value if isinstance(value, str) else None)
         try:
+            it.branch = max(0, int(data.get("branch") or 0))
             it.stage = int(data.get("stage") or 0)
             it.error_stage = int(data.get("error_stage", -1))
         except (TypeError, ValueError):
@@ -96,7 +122,7 @@ class Item:
 
     @property
     def finished(self) -> bool:
-        return self.state in (DONE, FAILED, CANCELED)
+        return self.state in (DONE, FAILED, CANCELED, SKIPPED)
 
 
 @dataclass
@@ -132,6 +158,8 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
             snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name if stage.folder else ""
         elif stage.type in recipes.MEMO_TYPES:
             snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
+        elif stage.type in (recipes.FRAME, recipes.SPLIT, recipes.GATE, recipes.SUB):
+            snap["count"], snap["stars"], snap["rules"] = stage.count, stage.stars, stage.rules
         else:
             snap["workflow"] = stage.workflow
             names = [w.name for w in comfy.workflows() if stage.workflow and w.value.lower() == stage.workflow.lower()]
@@ -162,6 +190,17 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name
     elif stage.type in recipes.MEMO_TYPES:
         snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
+    elif stage.type == recipes.FRAME:
+        pass
+    elif stage.type == recipes.SPLIT:
+        snap["count"] = max(2, min(recipes.MAX_SPLIT, int(stage.count)))
+    elif stage.type == recipes.GATE:
+        snap["stars"] = max(1, min(5, int(stage.stars)))
+    elif stage.type == recipes.SUB:
+        rules = recipes.parse_rules(stage.rules)
+        if not rules:
+            raise ValueError("置き換えのステップに、置き換える語がありません。")
+        snap["rules"] = [list(r) for r in rules]
     else:
         if not stage.workflow:
             raise ValueError("生成のステップにワークフローが選ばれていません。")
@@ -174,6 +213,11 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         snap["seconds"] = stage.seconds if comfy.get_duration(wf) is not None else None
         snap["base"] = comfy.base_prompt_for(kinds.is_video(kind)) if stage.base_prompt else ""
     return snap
+
+
+def plan_key(stage: int, branch: int) -> str:
+    """差し込みの割り当ての鍵 (枝 0 は前と同じ "ステップの番号")。"""
+    return str(stage) if branch == 0 else f"{stage}/{branch}"
 
 
 def next_stage(stages: list, index: int) -> int:
@@ -219,14 +263,22 @@ class Run:
                 it.text = texts[it.source] or None
                 it.origin_text = it.text
         pickers = []
+        branches = 1  # そこまでの「増やす」で、1 件が何本に分かれているか
         for i, snap in enumerate(stages):
-            if snap["type"] != recipes.INSERT or snap.get("bypass"):
+            if snap.get("bypass"):
                 continue
-            # 差し込み: 1 枚ごとに次のファイルを割り当てる (続きから始めても変わらない)
+            if snap["type"] == recipes.SPLIT:
+                branches *= int(snap["count"])
+                continue
+            if snap["type"] != recipes.INSERT:
+                continue
+            # 差し込み: 1 枚ごとに次のファイルを割り当てる (続きから始めても変わらない)。
+            # 増やすで分かれたあとなら、枝ごとに別のファイル (枝 0 は "i"、枝 k は "i/k")
             try:
                 picker = inserts.Picker([inserts.Slot(snap["name"], snap["folder"], True, False)])
                 for it in items:
-                    it.plan[str(i)] = picker.next()[0]
+                    for k in range(branches):
+                        it.plan[plan_key(i, k)] = picker.next()[0]
             except inserts.InsertError as exc:
                 raise ValueError(str(exc)) from exc
             pickers.append(picker)
@@ -329,6 +381,15 @@ class SlotPool:
 POOL = SlotPool()  # アプリの中で 1 つ (量産ラインと物語のエンジンが共有する)
 
 
+def _cancel_prompts(pairs: list) -> None:
+    """(台の URL, prompt_id) を ComfyUI の待ち行列から外す (繋がらなければそのまま)。"""
+    for url, pid in pairs:
+        try:
+            comfy.cancel_prompt(url, pid)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _sent_body(text: Optional[str], enhanced: Optional[str], adds: list) -> str:
     """その状態で生成に送る文 (ベースプロンプトは除く。GenRequest.full_prompt と同じ組み立て)。"""
     head = enhanced if enhanced is not None else inserts.join(text, *inserts.texts(adds, True))
@@ -375,6 +436,7 @@ class Engine(QObject):
         self._stop = False
         self._cancels: dict[int, threading.Event] = {}  # id(Item) → キャンセル
         self._save_failed = False
+        self._passed: Optional[Item] = None  # _pick が後回しにした先頭の件 (ロックを持って使う)
 
     # ------------------------------------------------------------------
     # 外から呼ぶもの (画面のスレッド)
@@ -440,7 +502,7 @@ class Engine(QObject):
             if self.run is None:
                 return
             for it in self.run.items:
-                if it.state == WAITING:
+                if it.state in (WAITING, GATED):
                     it.state = CANCELED
             for ev in self._cancels.values():
                 ev.set()
@@ -527,13 +589,19 @@ class Engine(QObject):
         self._threads.pop(key, None)
 
     def _unpin_missing(self) -> None:
-        """頼み済みの台が今の台にないときは、ほかの台で頼み直す。"""
+        """頼み済みの台が今の台にない (外した・休みにした) ときは、ほかの台で頼み直す。
+        その台の待ち行列に残った頼みは取り消す (休みの台で同じものを作らないように。動いている件はそのまま)。"""
         if self.run is None:
             return
         urls = {m.url.lower() for m in self.machines}
+        drop = []
         for it in self.run.items:
             if it.machine and it.machine.lower() not in urls:
+                if it.state == WAITING and it.prompt_id:
+                    drop.append((it.machine, it.prompt_id))
                 it.machine, it.prompt_id = "", ""
+        if drop:
+            threading.Thread(target=_cancel_prompts, args=(drop,), daemon=True).start()
 
     def _machine(self, url: str) -> Optional[Machine]:
         for m in self.machines:
@@ -542,19 +610,39 @@ class Engine(QObject):
         return None
 
     def _pick(self, gen: bool, url: str = "") -> Optional[Item]:
+        """次にやる件。生成なら、その台が最後に動かしたワークフローと同じものを少しだけ先にする
+        (後回しにした先頭の件は self._passed に入れておき、本当に取ったときに数える)。"""
+        self._passed = None
         run = self.run
         if run is None or run.paused:
             return None
+        candidates = []
         for it in run.items:
             if it.state != WAITING or it.stage >= len(run.stages):
                 continue
             is_gen = run.stages[it.stage]["type"] == recipes.GEN
             if gen != is_gen:
                 continue
-            if gen and it.machine and it.machine.lower() != url.lower():
-                continue  # ほかの台に頼み済み (その台で続きを待つ)
-            return it
-        return None
+            if not gen:
+                return it
+            if it.machine:
+                if it.machine.lower() != url.lower():
+                    continue  # ほかの台に頼み済み (その台で続きを待つ)
+                return it  # この台に頼み済み: 先に続きを待つ
+            candidates.append(it)
+            if len(candidates) >= AFFINITY_LOOKAHEAD:
+                break
+        if not candidates:
+            return None
+        first = candidates[0]
+        last = last_workflow(url)
+        if last and first.skips < AFFINITY_MAX_SKIPS:
+            for it in candidates:
+                if str(run.stages[it.stage].get("workflow", "")).lower() == last:
+                    if it is not first:
+                        self._passed = first
+                    return it
+        return first
 
     def _llm_loop(self, key) -> None:
         while True:
@@ -592,6 +680,9 @@ class Engine(QObject):
                         it = self._pick(gen=True, url=url)
                         # 台の空きは量産ラインと物語で分け合う (1 台に合わせて 2 件まで。物語が先)
                         if it is not None and self.pool.take(url, self.first, balance=not it.machine):
+                            if self._passed is not None:
+                                self._passed.skips += 1
+                            _set_last_workflow(url, str(self.run.stages[it.stage].get("workflow", "")))
                             it.state = RUNNING
                             it.at = url
                             cancel = self._cancels.setdefault(id(it), threading.Event())
@@ -650,6 +741,22 @@ class Engine(QObject):
                 self._add_text(it, stage)
             elif stage["type"] in recipes.MEMO_TYPES:
                 self._memo(it, stage)
+            elif stage["type"] == recipes.FRAME:
+                self._last_frame(it)
+            elif stage["type"] == recipes.SPLIT:
+                self._split(it, stage)
+            elif stage["type"] == recipes.SUB:
+                self._substitute(it, stage)
+            elif stage["type"] == recipes.GATE:
+                if not self._gate_pass(it, stage):
+                    with self._cond:
+                        it.state, it.status, it.at = GATED, "", ""
+                        self._cancels.pop(id(it), None)
+                        self._cond.notify_all()
+                    self._save()
+                    self._check_finished()
+                    self.changed.emit()
+                    return
             else:
                 source = inserts.join(it.text, *inserts.texts(it.adds, True))  # 読み取った文 + 盛る前に足した文
                 if not source.strip():
@@ -673,10 +780,11 @@ class Engine(QObject):
         """追加テキスト・差し込みの文を足す。まだ盛っていなければ盛る前 (このあとの盛るに渡す)、盛ったあとならそのまま付ける。"""
         before = it.enhanced is None
         if stage["type"] == recipes.TEXT:
+            # {a|b|c} は 1 件ごとに 1 つ選ぶ (選んだ文を記録に残す)
             add = {"slot": -1, "name": "追加テキスト", "folder": "", "before": before, "file": "",
-                   "text": str(stage.get("text") or "")}
+                   "text": recipes.expand_wildcards(str(stage.get("text") or ""))}
         else:
-            planned = it.plan.get(str(it.stage))
+            planned = it.plan.get(plan_key(it.stage, it.branch)) or it.plan.get(str(it.stage))
             if not planned:
                 raise ValueError("差し込みのファイルが割り当てられていません (始め直してください)。")
             add = {"slot": -1, "name": "差し込み", "folder": str(planned.get("folder") or ""), "before": before,
@@ -704,6 +812,93 @@ class Engine(QObject):
                 it.enhanced, it.adds = None, []
             else:
                 it.text, it.enhanced, it.adds = text, enhanced, adds
+
+    def _last_frame(self, it: Item) -> None:
+        """最後のコマ: 動画の最後のコマを (出力フォルダ)\\コマ に PNG で書き、次のステップにはその画像を渡す。"""
+        from . import story  # OpenCV は使うときに読む
+        video = Path(it.current)
+        if video.suffix.lower() not in (".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"):
+            raise ValueError(f"最後のコマ: 動画ではありません ({video.name})。前に動画の生成を置いてください。")
+        self._set_status(it, "最後のコマを取り出しています...")
+        dest = Path(self.run.output_dir) / FRAME_DIR / f"{video.stem}_last.png"
+        story.save_frame(str(video), dest, -1)
+        with self._cond:
+            it.current = str(dest)
+
+    def _split(self, it: Item, stage: dict) -> None:
+        """増やす: この件を count 本に分ける (ここまでの文・メモ・出来たファイルはそのまま。
+        ここまでに出来た結果は元の件にだけ残す)。分けたものは元の件のすぐあとに並べる。"""
+        count = max(2, int(stage.get("count") or 2))
+        with self._cond:
+            run = self.run
+            nxt = next_stage(run.stages, it.stage)
+            clones = []
+            for c in range(1, count):
+                clone = Item(it.source, current=it.current, stage=nxt,
+                             state=DONE if nxt >= len(run.stages) else WAITING,
+                             text=it.text, origin_text=it.origin_text, enhanced=it.enhanced, read_name=it.read_name,
+                             adds=[dict(a) for a in it.adds], reference=it.reference, last_frame=it.last_frame,
+                             memos=json.loads(json.dumps(it.memos)), plan=dict(it.plan), branch=it.branch * count + c)
+                clones.append(clone)
+            it.branch *= count
+            at = run.items.index(it) + 1
+            run.items[at:at] = clones
+
+    def _substitute(self, it: Item, stage: dict) -> None:
+        """置き換え: いまのプロンプト (元の文・盛った文・足した文) の語を置き換える・消す。"""
+        rules = [(str(r[0]), str(r[1])) for r in stage.get("rules") or [] if isinstance(r, (list, tuple)) and len(r) == 2]
+        with self._cond:
+            it.text = recipes.apply_rules(it.text, rules)
+            it.enhanced = recipes.apply_rules(it.enhanced, rules)
+            for a in it.adds:
+                a["text"] = recipes.apply_rules(str(a.get("text") or ""), rules)
+
+    def _gate_pass(self, it: Item, stage: dict) -> bool:
+        """★を待つ: いまのファイルに★が stars 以上あれば通す。試作は止めない。"""
+        if self.run.trial:
+            return True
+        return rating.get_stars(Path(it.current)) >= int(stage.get("stars") or 1)
+
+    def gated(self) -> int:
+        """★待ちの件数。"""
+        with self._cond:
+            return 0 if self.run is None else sum(1 for it in self.run.items if it.state == GATED)
+
+    def recheck_gates(self) -> int:
+        """★待ちの件の★を読み直し、付いたものを先へ進める (★を読むのに時間がかかるので、画面のスレッドから呼ばない)。
+        戻り値は進めた件数。"""
+        with self._cond:
+            run = self.run
+            if run is None:
+                return 0
+            waiting = [(it, it.current, int(run.stages[it.stage].get("stars") or 1)) for it in run.items
+                       if it.state == GATED and it.stage < len(run.stages)]
+        passed = [it for it, path, need in waiting if rating.get_stars(Path(path)) >= need]
+        moved = 0
+        for it in passed:
+            with self._cond:
+                if it.state != GATED or self.run is not run:
+                    continue
+                it.state = RUNNING
+            self._advance(it)
+            moved += 1
+        return moved
+
+    def end_gates(self) -> int:
+        """★待ちを終える: まだ★のない件を「★なし」で終える (ここまでに出来たものはそのまま残す)。戻り値は件数。"""
+        with self._cond:
+            if self.run is None:
+                return 0
+            ended = [it for it in self.run.items if it.state == GATED]
+            for it in ended:
+                it.state = SKIPPED
+            self._cond.notify_all()
+        for it in ended:
+            self._inherit(it)
+        self._save()
+        self._check_finished()
+        self.changed.emit()
+        return len(ended)
 
     def _run_gen(self, it: Item, m: Machine, cancel: threading.Event) -> None:
         run = self.run

@@ -612,7 +612,7 @@ class StoryWorker(QObject):
             return
         machines = recipes.machines()
         if not machines:
-            self._end(FAILED, "使う台が決まっていません (「台の設定...」で選んでください)")
+            self._end(FAILED, recipes.no_machines_reason())
             return
         folder = st.scene_dir(scene)
         folder.mkdir(parents=True, exist_ok=True)
@@ -721,6 +721,12 @@ class BatchQueue(QObject):
 
     def unfinished(self) -> int:
         return sum(1 for e in self.entries if e.unfinished)
+
+    def set_machines(self, urls: list[str]) -> None:
+        """台を変えた・休みにしたとき: 作っている物語の候補づくりにも新しい台を使わせる (次のシーンは作るときに読み直す)。"""
+        for w in self.workers:
+            if w.engine.active:
+                w.engine.set_machines(urls)
 
     @staticmethod
     def capacity() -> int:
@@ -858,7 +864,7 @@ class BatchQueue(QObject):
             return
         if not recipes.machines():
             if self.waiting():
-                self.progress.emit(f"待機 {len(self.waiting())} 件 · 台が決まっていません (「台の設定...」で選んでください)")
+                self.progress.emit(f"待機 {len(self.waiting())} 件 · " + recipes.no_machines_reason())
             return
         started = False
         while len(self.busy_workers()) < self.capacity():

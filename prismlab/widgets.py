@@ -4,7 +4,7 @@ from typing import Optional
 
 from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QProgressBar, QSizePolicy, QToolButton,
+from PySide6.QtWidgets import (QCheckBox, QFrame,QHBoxLayout, QLabel, QProgressBar, QSizePolicy, QToolButton,
                                QVBoxLayout, QWidget)
 
 from . import theme
@@ -260,7 +260,9 @@ class InsertArrow(QToolButton):
 
 
 class MachineCard(QFrame):
-    """台の札 (状態の丸・名前・出来た数・いまの進み具合)。"""
+    """台の札 (状態の丸・名前・出来た数・使うのチェック・いまの進み具合)。"""
+
+    use_toggled = Signal(bool)  # 「使う」のチェックを人が変えた (休みにする / 戻す)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -274,15 +276,27 @@ class MachineCard(QFrame):
         self.name.setStyleSheet("font-weight: bold; background: transparent;")
         self.done = QLabel()
         self.done.setStyleSheet(f"color: {theme.TEXT_DIM}; background: transparent;")
+        self.use = QCheckBox("使う")
+        self.use.setStyleSheet("background: transparent;")
+        self.use.setToolTip("外すと、この台を一時的に使いません (台の設定には残します)。"
+                            "いま動いている件は最後まで作り、新しい件は送りません。")
+        self.use.clicked.connect(self.use_toggled)  # 人が押したときだけ (set_on では出さない)
         head.addWidget(self.dot)
         head.addWidget(self.name, 1)
         head.addWidget(self.done)
+        head.addWidget(self.use)
         box.addLayout(head)
         self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 11px; background: transparent;")
         box.addWidget(self.status)
         self.set_down(False)
+
+    def set_on(self, on: bool, shown: bool = True) -> None:
+        """「使う」のチェックを合わせる (shown=False で隠す。台が決まっていない札など)。"""
+        self.use.setVisible(shown)
+        self.use.setChecked(on)
+        self.name.setEnabled(on)  # 休みの台は名前を薄く
 
     def set_down(self, down: bool, color: str = OK_DOT) -> None:
         self.dot.setStyleSheet(f"color: {DOWN_COLOR if down else color}; background: transparent;")

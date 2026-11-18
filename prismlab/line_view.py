@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
@@ -25,7 +25,7 @@ from . import engine, kinds, rating, recipes, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
 from .hover_preview import HoverPreview
 from .thumbs import MOVIE_EXTS, ThumbCache
-from .widgets import AddButton, Card, InsertArrow, MachineCard, io_html
+from .widgets import CARD_WIDTH, AddButton, Card, InsertArrow, MachineCard, io_html
 
 CONFIRM_COUNT = 30  # これを超える件数で始めるときは確かめる (generation-standard 6 章)
 RESULT_ICON = QSize(128, 128)
@@ -43,6 +43,42 @@ def _memo_detail(stage_type: str, memo: str, mode) -> str:
     if stage_type == recipes.SAVE:
         return f"メモ「{name}」に覚える"
     return f"メモ「{name}」から" + ("後ろに足す" if mode == recipes.APPEND else "戻す (置き換える)")
+
+
+# ステップの種類の短い説明 (メニューの項目に重ねると横に出す。2026-11-18 利用者の希望)
+STAGE_HELP = {
+    recipes.READ: "画像を LLM に見せて、説明のプロンプトを書かせます (.txt があればそれを使う)。",
+    recipes.ENHANCE: "ここまでの文を LLM で盛ります。1 件ごとに違う盛り方になります。",
+    recipes.TEXT: "決まった文をプロンプトに足します。{a|b|c} と書くと 1 件ごとにどれかを選びます。",
+    recipes.INSERT: "フォルダの .txt (セリフ・アクションなど) を、1 件ごとに順に足します。",
+    recipes.SUB: "プロンプトの語を置き換える・消します (1 行に「元 => 先」)。",
+    recipes.SAVE: "この時点のプロンプトを名前のメモに覚えます (生成を通っても残る)。",
+    recipes.LOAD: "「覚える」で覚えたプロンプトを戻します (置き換える / 後ろに足す)。",
+    recipes.SPLIT: "そこから先を N 本に分けます。前の読み取りは 1 回で、盛る・差し込みは 1 本ずつ変わります。",
+    recipes.GATE: "J-Rate で★を付けたものだけ先へ進めます。ほかは★待ちで止めます。",
+    recipes.FRAME: "前の生成で出来た動画の最後のコマを画像にして、次へ渡します。",
+    recipes.GEN: "ComfyUI のワークフローで画像・動画を作ります (T2I / I2I / I2V など)。",
+}
+
+FLOW_MIN_HEIGHT = 262  # ステップの並びの欄の高さ (札がこれより高ければ伸ばす)
+FLOW_MAX_HEIGHT = 520
+SPLIT_COLOR = "#4fc3f7"  # 増やすの札
+GATE_COLOR = "#ffca28"  # ★を待つの札
+TOOL_TYPES = (recipes.FRAME, recipes.SPLIT, recipes.GATE, recipes.SUB)
+
+
+def _tool_detail(stage_type: str, count: int, stars: int, rules: list) -> str:
+    """最後のコマ・増やす・★を待つ・置き換えの札の説明。"""
+    if stage_type == recipes.FRAME:
+        return "動画の最後のコマを画像にして次へ"
+    if stage_type == recipes.SPLIT:
+        return f"ここから先を {count} 通りに (盛る・差し込み・ワイルドカードで 1 本ずつ変わる)"
+    if stage_type == recipes.GATE:
+        return f"★{stars} 以上を付けたものだけ先へ (J-Rate で付ける)"
+    if not rules:
+        return "(置き換える語を入れてください)"
+    first = f"{rules[0][0]} → {rules[0][1] or '(消す)'}"
+    return first + (f" ほか {len(rules) - 1} 個" if len(rules) > 1 else "")
 
 
 def find_jrate() -> Optional[Path]:
@@ -130,10 +166,11 @@ class LineView(QWidget):
         scroll = QScrollArea()
         scroll.setWidget(self.flow_host)
         scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(262)
+        scroll.setFixedHeight(FLOW_MIN_HEIGHT)  # 札の高さに合わせて伸ばす (_fit_flow)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         root.addWidget(scroll)
+        self.flow_scroll = scroll
 
         # 出力フォルダ
         out_row = QHBoxLayout()
@@ -157,6 +194,8 @@ class LineView(QWidget):
         mrow.setSpacing(8)
         self.machine_cards = [MachineCard() for _ in range(recipes.MAX_MACHINES)]
         for card in self.machine_cards:
+            card.url = ""
+            card.use_toggled.connect(lambda on, c=card: self._set_machine_on(c.url, on))
             mrow.addWidget(card, 1)
         self.machines_button = QPushButton("台の設定...")
         self.machines_button.clicked.connect(self._edit_machines)
@@ -179,10 +218,25 @@ class LineView(QWidget):
         self.cancel_button.clicked.connect(self._cancel)
         self.retry_button = QPushButton("失敗したものをやり直す")
         self.retry_button.clicked.connect(self._retry)
+        # ★を待つ: ★を読み直す (戻ったとき・1 分ごとにも読む) / ★待ちを終える
+        self.gate_recheck_button = QPushButton("★を読み直す")
+        self.gate_recheck_button.setToolTip("★待ちのファイルの★を読み直し、付いたものを先へ進めます"
+                                            " (PrismLab に戻ったときと、1 分ごとにも読みます)。")
+        self.gate_recheck_button.clicked.connect(self._recheck_gates)
+        self.gate_end_button = QPushButton("★待ちを終える...")
+        self.gate_end_button.setToolTip("まだ★のないものを「★なし」で終えます (ここまでに出来たものは残します)。")
+        self.gate_end_button.clicked.connect(self._end_gates)
+        self._gate_timer = QTimer(self)
+        self._gate_timer.setInterval(60_000)
+        self._gate_timer.timeout.connect(self._recheck_gates)
+        self._gate_checking = False
         self.summary = QLabel()
         self.summary.setStyleSheet("font-size: 13px;")
-        for w in (self.start_button, self.trial_button, self.pause_button, self.cancel_button, self.retry_button):
+        for w in (self.start_button, self.trial_button, self.pause_button, self.cancel_button, self.retry_button,
+                  self.gate_recheck_button, self.gate_end_button):
             crow.addWidget(w)
+        self.gate_recheck_button.hide()
+        self.gate_end_button.hide()
         crow.addSpacing(12)
         crow.addWidget(self.summary, 1)
         root.addLayout(crow)
@@ -374,6 +428,12 @@ class LineView(QWidget):
                 elif s["type"] in recipes.MEMO_TYPES:
                     v["detail"] = _memo_detail(s["type"], str(s.get("memo", "")), s.get("mode"))
                     v["append"] = s.get("mode") == recipes.APPEND
+                elif s["type"] in TOOL_TYPES:
+                    rules = s.get("rules") or []
+                    v["count"], v["stars"] = int(s.get("count") or 2), int(s.get("stars") or 1)
+                    v["detail"] = _tool_detail(s["type"], v["count"], v["stars"],
+                                               [tuple(r) for r in rules] if isinstance(rules, list) else
+                                               recipes.parse_rules(str(rules)))
                 else:
                     v["kind"] = s.get("kind", "")
                     v["detail"] = s.get("workflow_name", "")
@@ -401,6 +461,9 @@ class LineView(QWidget):
             elif s.type in recipes.MEMO_TYPES:
                 v["detail"] = _memo_detail(s.type, s.memo, s.mode)
                 v["append"] = s.mode == recipes.APPEND
+            elif s.type in TOOL_TYPES:
+                v["count"], v["stars"] = s.count, s.stars
+                v["detail"] = _tool_detail(s.type, s.count, s.stars, recipes.parse_rules(s.rules))
             else:
                 v["kind"] = kinds.kind_of(s.workflow)
                 names = [p.name for p in comfy.workflows() if s.workflow and p.value.lower() == s.workflow.lower()]
@@ -548,6 +611,33 @@ class LineView(QWidget):
                                             + [("メモ", kinds.TEXT_COLOR), "→", src]))
                     has_text = True
                 card.thumbs.hide()
+            elif v["type"] == recipes.FRAME:
+                # 最後のコマ: 動画 → その最後のコマの画像
+                card.chip.set("コマ", kinds.IMAGE_COLOR)
+                card.set_color(kinds.IMAGE_COLOR)
+                card.io.setText(io_html([prev_out, "→", ("画像", kinds.IMAGE_COLOR)]))
+                prev_out = ("画像", kinds.IMAGE_COLOR)
+                card.thumbs.hide()
+            elif v["type"] == recipes.SPLIT:
+                # 増やす: そこから先を N 通りに (中身はそのまま)
+                card.chip.set(f"×{v.get('count', 2)}", SPLIT_COLOR)
+                card.set_color(SPLIT_COLOR)
+                card.io.setText(io_html([prev_out] + (["+", ("文字", kinds.TEXT_COLOR)] if has_text else [])
+                                        + ["→", f"{v.get('count', 2)} 本に分ける"]))
+                card.thumbs.hide()
+            elif v["type"] == recipes.GATE:
+                # ★を待つ: J-Rate で★を付けたものだけ先へ
+                card.chip.set("★" * int(v.get("stars", 1)), GATE_COLOR)
+                card.set_color(GATE_COLOR)
+                card.io.setText(io_html([prev_out, "→", (f"★{v.get('stars', 1)} 以上だけ", GATE_COLOR)]))
+                card.thumbs.hide()
+            elif v["type"] == recipes.SUB:
+                # 置き換え: 文字 → 文字
+                card.chip.set("文字", kinds.TEXT_COLOR)
+                card.set_color(kinds.TEXT_COLOR)
+                src = ("文字", kinds.TEXT_COLOR)
+                card.io.setText(io_html([src, "→", ("置き換え", kinds.TEXT_COLOR), "→", src]))
+                card.thumbs.hide()
             elif v["type"] in recipes.ADD_TYPES:
                 # 追加テキスト・差し込み: 文を足す (盛るより前なら一緒に盛る)
                 card.chip.set("文字", kinds.TEXT_COLOR)
@@ -578,6 +668,10 @@ class LineView(QWidget):
                     reason = "覚える文がありません (前に読み取り・盛る・追加テキストなどを置く。生成のあとは空です)"
                 elif ("norecall", i) in problems:
                     reason = "このメモを覚えていません (前に同じ名前の「覚える」を置く)"
+                elif ("needvideo", i) in problems:
+                    reason = "動画がまだありません (前に I2V などの動画の生成を置く)"
+                elif ("notext", i) in problems:
+                    reason = "置き換える文がありません (前に読み取り・盛る・追加テキストなどを置く)"
                 if reason:
                     card.io.setText(f'<span style="color:#ef5350; font-weight:bold">⚠ {html.escape(reason)}</span>')
                     card.io.setWordWrap(True)
@@ -592,25 +686,77 @@ class LineView(QWidget):
 
         self.flow.addWidget(self._insert_arrow(len(views)))
         self.add_stage = AddButton("＋ ステップ")
-        self.add_stage.setMenu(self._type_menu(self.add_stage, lambda t: self._add_stage(t)))
+        self.add_stage.setMenu(self._type_menu(self.add_stage, lambda t: self._add_stage(t),
+                                               paste_at=lambda: len(self.recipe.stages)))
         self.flow.addWidget(self.add_stage)
         self.flow.addStretch(1)
 
-    def _type_menu(self, parent, chosen, skip: str = "") -> QMenu:
-        """ステップの種類 (読み取り・盛る・生成) を選ぶメニュー。"""
+    def _type_menu(self, parent, chosen, skip: str = "", paste_at: Optional[Callable[[], int]] = None) -> QMenu:
+        """ステップの種類 (読み取り・盛る・生成) を選ぶメニュー。paste_at があれば、コピーしたステップの貼り付けも
+        (開くたびに作り直す。ほかのレシピでコピーしたものも出すため)。"""
         menu = QMenu(parent)
-        for t in recipes.STAGE_ORDER:
-            if t != skip:
+        menu.setToolTipsVisible(True)  # 項目に重ねると、種類の説明を横に出す
+
+        def fill():
+            menu.clear()
+            if paste_at is not None and LineView.clipboard:
                 # 並びを作り直すとこのメニューのボタンも消えるので、メニューを閉じてから行う
-                menu.addAction(recipes.STAGE_TITLES[t], lambda t=t: QTimer.singleShot(0, lambda: chosen(t)))
+                paste = menu.addAction(self._paste_title(),
+                                       lambda: QTimer.singleShot(0, lambda: self._paste_stages(paste_at())))
+                paste.setToolTip("コピーしたステップを、設定ごとここに入れます"
+                                 + (f" (「{LineView.clipboard_from}」から)。" if LineView.clipboard_from else "。"))
+                menu.addSeparator()
+            for t in recipes.STAGE_ORDER:
+                if t != skip:
+                    act = menu.addAction(recipes.STAGE_TITLES[t], lambda t=t: QTimer.singleShot(0, lambda: chosen(t)))
+                    act.setToolTip(STAGE_HELP.get(t, ""))
+
+        fill()
+        menu.aboutToShow.connect(fill)
         return menu
 
     def _insert_arrow(self, index: int) -> InsertArrow:
         """index の位置 (0 = 入口のすぐあと) にステップを挿入する矢印。"""
         button = InsertArrow()
-        button.set_menu(self._type_menu(button, lambda t: self._add_stage(t, index)))
+        button.set_menu(self._type_menu(button, lambda t: self._add_stage(t, index), paste_at=lambda: index))
         button.setEnabled(not self.locked())
         return button
+
+    # ------------------------------------------------------------------
+    # ステップのコピー・貼り付け (レシピをまたいで使える。アプリを閉じるまで覚える)
+    # ------------------------------------------------------------------
+    clipboard: list = []  # コピーしたステップ (Stage.to_dict() の並び)。量産ラインの画面で 1 つ
+    clipboard_from = ""  # コピー元のレシピの名前 (知らせに出す)
+
+    def _copy_stages(self, start: int, end: int) -> None:
+        """start から end (含まない) のステップをコピーする。動いている量産のレシピからもコピーできる。"""
+        stages = self.recipe.stages[start:end]
+        if not stages:
+            return
+        LineView.clipboard = [s.to_dict() for s in stages]
+        LineView.clipboard_from = self.recipe.name
+        what = recipes.STAGE_TITLES.get(stages[0].type, "") if len(stages) == 1 else f"{len(stages)} 個のステップ"
+        self.status.emit(f"「{what}」をコピーしました。ほかのレシピでも、ステップの右クリックか → の挿入で貼り付けられます。")
+
+    @staticmethod
+    def _paste_title() -> str:
+        clip = LineView.clipboard
+        if len(clip) == 1:
+            return f"貼り付け: {recipes.STAGE_TITLES.get(clip[0].get('type'), '?')}"
+        return f"貼り付け: {len(clip)} 個のステップ"
+
+    def _paste_stages(self, index: int) -> None:
+        """コピーしたステップを index の位置に入れる (中身はコピーしたときのまま。窓は出さない)。"""
+        if self.locked() or not LineView.clipboard:
+            return
+        stages = self.recipe.stages
+        index = max(0, min(index, len(stages)))
+        pasted = [recipes.Stage.from_dict(dict(d)) for d in LineView.clipboard]
+        stages[index:index] = pasted
+        self._save_recipes()
+        self.refresh(rebuild=True)
+        self.status.emit(f"{len(pasted)} 個のステップを貼り付けました"
+                         + (f" (「{LineView.clipboard_from}」から)" if LineView.clipboard_from != self.recipe.name else "") + "。")
 
     def _edit_stage(self, index: int) -> None:
         if self.locked():
@@ -625,24 +771,49 @@ class LineView(QWidget):
             self.refresh(rebuild=True)
 
     def _stage_menu(self, index: int, pos) -> None:
-        if self.locked():
-            return
         stages = self.recipe.stages
+        if self.locked():
+            # 動いている量産のレシピは直せないが、コピーはできる (ほかのレシピに貼るため)
+            if index < len(stages):
+                menu = QMenu(self)
+                copy = menu.addAction("コピー")
+                copy_right = menu.addAction("ここから右をまとめてコピー")
+                copy_right.setEnabled(index < len(stages) - 1)
+                chosen = menu.exec(pos)
+                if chosen is copy:
+                    self._copy_stages(index, index + 1)
+                elif chosen is copy_right:
+                    self._copy_stages(index, len(stages))
+            return
         menu = QMenu(self)
         edit = menu.addAction("設定...")
         jobs = {}  # サブメニューの項目 → メニューを閉じてからやること
 
         def sub(title: str, job, skip: str = "") -> None:
             m = menu.addMenu(title)
+            m.setToolTipsVisible(True)
             for t in recipes.STAGE_ORDER:
                 if t != skip:
-                    jobs[m.addAction(recipes.STAGE_TITLES[t])] = lambda t=t: job(t)
+                    act = m.addAction(recipes.STAGE_TITLES[t])
+                    act.setToolTip(STAGE_HELP.get(t, ""))
+                    jobs[act] = lambda t=t: job(t)
 
         sub("種類を変える", lambda t: self._change_stage_type(index, t), skip=stages[index].type)
         menu.addSeparator()
         sub("左に挿入", lambda t: self._add_stage(t, index))
         sub("右に挿入", lambda t: self._add_stage(t, index + 1))
         duplicate = menu.addAction("複製")
+        menu.addSeparator()
+        copy = menu.addAction("コピー")
+        copy_right = menu.addAction("ここから右をまとめてコピー")
+        copy_right.setEnabled(index < len(stages) - 1)
+        has_clip = bool(LineView.clipboard)
+        clip_name = self._paste_title().replace("貼り付け: ", "") if has_clip else ""
+        paste_left = menu.addAction(f"左に貼り付け ({clip_name})" if has_clip else "左に貼り付け")
+        paste_right = menu.addAction(f"右に貼り付け ({clip_name})" if has_clip else "右に貼り付け")
+        paste_left.setEnabled(has_clip)
+        paste_right.setEnabled(has_clip)
+        menu.addSeparator()
         bypass = menu.addAction("バイパス")
         bypass.setCheckable(True)
         bypass.setChecked(stages[index].bypass)
@@ -667,6 +838,15 @@ class LineView(QWidget):
             return
         if chosen is bypass:
             self._set_bypass(index, bypass.isChecked())
+            return
+        if chosen is copy:
+            self._copy_stages(index, index + 1)
+            return
+        if chosen is copy_right:
+            self._copy_stages(index, len(stages))
+            return
+        if chosen in (paste_left, paste_right):
+            self._paste_stages(index if chosen is paste_left else index + 1)
             return
         if chosen in (left, right):
             j = index - 1 if chosen is left else index + 1
@@ -904,7 +1084,10 @@ class LineView(QWidget):
         self.refresh()
 
     def rescan(self) -> None:
-        """入口の★を読み直す (J-Rate から戻ったときなど)。動いている量産の入口は変えない。"""
+        """入口の★を読み直す (J-Rate から戻ったときなど)。動いている量産の入口は変えない。
+        ★待ちの件があれば、その★も読み直す。"""
+        if self.engine.gated():
+            self._recheck_gates()
         if self.locked():
             return
         self._input_key = None
@@ -945,12 +1128,27 @@ class LineView(QWidget):
     # 台
     # ------------------------------------------------------------------
     def _edit_machines(self) -> None:
-        dialog = MachinesDialog(recipes.machines(), self)
+        dialog = MachinesDialog(recipes.all_machines(), self, off=recipes.machines_off())
         if dialog.exec():
             urls = dialog.urls()
-            recipes.set_machines(urls)
-            self.engine.set_machines(urls)
-            self.machines_changed.emit()
+            recipes.set_machines(urls, dialog.off())
+            self._apply_machines()
+
+    def _set_machine_on(self, url: str, on: bool) -> None:
+        """台の札の「使う」: 台を一時的に休ませる / 戻す。動いている件はその台で最後まで作る。"""
+        if not url:
+            return
+        recipes.set_machine_on(url, on)
+        self._apply_machines()
+        name = next((p.name for p in comfy.connections() if p.value and p.value.rstrip("/").lower() == url.lower()
+                     and p.name), url)
+        self.status.emit(("台を使います: " if on else "台を休みにしました (新しい件は送りません): ") + name)
+
+    def _apply_machines(self) -> None:
+        """保存した台を、量産と物語 (候補づくり・バッチ) に知らせる。"""
+        self.engine.set_machines(recipes.machines())
+        self.machines_changed.emit()
+        self.refresh()
 
     # ------------------------------------------------------------------
     # 開始・一時停止・中止
@@ -977,7 +1175,7 @@ class LineView(QWidget):
             QMessageBox.warning(self, title, problem)
             return False
         if any(s.type == recipes.GEN and not s.bypass for s in r.stages) and not self.engine.machines:
-            QMessageBox.warning(self, title, "使う台が決まっていません。「台の設定...」で選んでください。")
+            QMessageBox.warning(self, title, recipes.no_machines_reason())
             return False
         return True
 
@@ -1066,6 +1264,35 @@ class LineView(QWidget):
         if QMessageBox.question(self, "中止", text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                 QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             self.engine.cancel_all()
+
+    def _recheck_gates(self) -> None:
+        """★待ちの★を裏で読み直す (★を読むのに時間がかかるので)。"""
+        if self._gate_checking or not self.engine.gated():
+            return
+        self._gate_checking = True
+        eng = self.engine
+
+        def work():
+            try:
+                moved = eng.recheck_gates()
+            finally:
+                self._gate_checking = False
+            if moved:
+                self.status.emit(f"★が付いた {moved} 件を先へ進めました。")
+
+        threading.Thread(target=work, daemon=True, name="prismlab-gate").start()
+
+    def _end_gates(self) -> None:
+        n = self.engine.gated()
+        if not n:
+            return
+        if QMessageBox.question(self, "★待ちを終える",
+                                f"★待ちの {n} 件を、★なしで終えますか?\n(ここまでに出来たものは残します)",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        ended = self.engine.end_gates()
+        self.status.emit(f"★待ちの {ended} 件を終えました。")
 
     def _retry(self) -> None:
         n = self.engine.retry_failed()
@@ -1364,11 +1591,17 @@ class LineView(QWidget):
             passed = sum(1 for it in items if it.stage > i)
             here = [it for it in items if it.stage == i and it.state == engine.RUNNING]
             failed = sum(1 for it in items if it.state == engine.FAILED and it.error_stage == i)
+            gated = sum(1 for it in items if it.stage == i and it.state == engine.GATED)
+            skipped = sum(1 for it in items if it.stage == i and it.state == engine.SKIPPED)
             card.bar.setMaximum(max(total, 1))
             card.bar.setValue(passed)
             text = f"済み {passed} / {total}"
             if here:
                 text += f" ・ 実行中 {len(here)}"
+            if gated:
+                text += f" ・ ★待ち {gated}"
+            if skipped:
+                text += f" ・ ★なし {skipped}"
             if failed:
                 text += f" ・ 失敗 {failed}"
             card.count.setText(text)
@@ -1391,21 +1624,36 @@ class LineView(QWidget):
         self.out_change.setEnabled(not showing)
         self.out_reset.setEnabled(not showing and bool(self.recipe.output_dir))
 
-        # 台
+        # 台 (台の設定で選んである台を全部。休みの台は「使う」のチェックを外して出す)
+        configured = recipes.all_machines()
+        off = recipes.machines_off()
+        by_url = {m.url.lower(): m for m in machines}
+        names = {p.value.rstrip("/").lower(): p.name for p in comfy.connections() if p.value} if configured else {}
         for n, card in enumerate(self.machine_cards):
-            if n >= len(machines):
+            if n >= len(configured):
                 card.setVisible(n == 0)
                 if n == 0:
                     card.name.setText("台が決まっていません")
                     card.done.setText("")
                     card.status.setText("「台の設定...」で ComfyUI を選んでください")
                     card.set_down(False, "#777777")
+                    card.set_on(True, shown=False)
                 continue
-            m = machines[n]
+            url = configured[n]
+            card.url = url
             card.setVisible(True)
+            m = by_url.get(url.lower())
+            mine = [it for it in items if it.state == engine.RUNNING and it.at.lower() == url.lower()]
+            if url.lower() in off or m is None:
+                card.name.setText(names.get(url.lower()) or url)
+                card.done.setText("")
+                card.status.setText("休み (いまの件が終わったら止まります)" if mine else "休み (新しい件は送りません)")
+                card.set_on(False)
+                card.set_down(False, "#777777")
+                continue
+            card.set_on(True)
             card.name.setText(m.label)
             card.done.setText(f"{m.done} 件")
-            mine = [it for it in items if it.state == engine.RUNNING and it.at.lower() == m.url.lower()]
             if m.state == engine.DOWN:
                 text = m.reason + "。残りはほかの台に回しています"
             elif m.state == engine.OFF:
@@ -1430,8 +1678,38 @@ class LineView(QWidget):
         failed_total = sum(1 for it in items if it.state == engine.FAILED)
         self.retry_button.setEnabled(failed_total > 0 and not (run is not None and run.paused))
         self.retry_button.setVisible(failed_total > 0)
+        gated_total = sum(1 for it in items if it.state == engine.GATED)
+        self.gate_recheck_button.setVisible(gated_total > 0)
+        self.gate_end_button.setVisible(gated_total > 0)
+        if gated_total and not self._gate_timer.isActive():
+            self._gate_timer.start()
+        elif not gated_total:
+            self._gate_timer.stop()
         self.summary.setText(self._summary(run, items, running))
         self._refresh_results(items)
+        self._fit_flow()
+
+    def _fit_flow(self) -> None:
+        """ステップの並びの欄を、いちばん高い札 (入口の★の内訳などで伸びる) が全部見える高さにする。
+        縦のスクロールバーは出さず、そのぶん結果の欄を下へ送る (2026-11-18 利用者の希望)。窓の高さの半分までにする。"""
+        cards = [self.entry] + list(self.stage_cards) if getattr(self, "entry", None) is not None else []
+        tallest = 0
+        for card in cards:
+            hint = card.heightForWidth(card.width() or CARD_WIDTH) if card.hasHeightForWidth() else -1
+            tallest = max(tallest, hint if hint > 0 else card.sizeHint().height(), card.minimumSizeHint().height())
+        bar = self.flow_scroll.horizontalScrollBar().sizeHint().height()
+        margins = self.flow.contentsMargins()
+        want = tallest + margins.top() + margins.bottom() + bar + 4
+        limit = max(FLOW_MIN_HEIGHT, self.height() // 2) if self.height() > 0 else FLOW_MAX_HEIGHT
+        height = max(FLOW_MIN_HEIGHT, min(want, limit, FLOW_MAX_HEIGHT))
+        self.flow_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff if want <= height
+                                                    else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        if self.flow_scroll.height() != height:
+            self.flow_scroll.setFixedHeight(height)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_flow()
 
     def _summary(self, run, items, running: bool) -> str:
         if run is None:
@@ -1440,7 +1718,14 @@ class LineView(QWidget):
         done = sum(1 for i in items if i.state == engine.DONE)
         failed = sum(1 for i in items if i.state == engine.FAILED)
         canceled = sum(1 for i in items if i.state == engine.CANCELED)
+        gated = sum(1 for i in items if i.state == engine.GATED)
+        skipped = sum(1 for i in items if i.state == engine.SKIPPED)
         text = ("試作 " if run.trial else "") + f"「{run.name}」 完了 {done} / {total}"
+        if gated:
+            text += (f' ・ <span style="color:{GATE_COLOR}; font-weight:bold">★待ち {gated}</span>'
+                     " (J-Rate で★を付けると先へ)")
+        if skipped:
+            text += f" ・ ★なし {skipped}"
         if failed:
             text += f" ・ 失敗 {failed}"
         if canceled:
@@ -1448,8 +1733,8 @@ class LineView(QWidget):
         if running:
             if run.paused:
                 text = '<span style="color:#ff9800; font-weight:bold">一時停止中</span>  ' + text
-            elif done:
-                left = total - done - failed - canceled
+            elif done and total - done - failed - canceled - gated - skipped > 0:
+                left = total - done - failed - canceled - gated - skipped
                 spent = time.time() - run.started
                 text += f" ・ 残り 約 {_fmt_duration(spent / done * left)}"
             if self.engine.llm_status:

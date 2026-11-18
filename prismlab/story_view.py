@@ -1602,7 +1602,7 @@ class StoryView(QWidget):
             return "ほかのシーンの候補を作っています。終わってからにしてください。"
         machines = recipes.machines()
         if not machines:
-            return "使う台が決まっていません (「台の設定...」で選んでください)。"
+            return recipes.no_machines_reason()
         if not workflow:
             return "ワークフローを選んでください (「生成の設定」で登録します)。"
         self.engine.set_machines(machines)
@@ -2305,7 +2305,8 @@ class StoryView(QWidget):
         """「台の設定...」の札: 使う台の名前 (量産ラインと共通)。"""
         names = {p.value.rstrip("/").lower(): p.name for p in comfy.connections() if p.value}
         shown = " · ".join(names.get(u.lower()) or u for u in recipes.machines()) or "なし"
-        self.machines_b.setText(f"台: {shown}")
+        resting = [names.get(u.lower()) or u for u in recipes.all_machines() if u.lower() in recipes.machines_off()]
+        self.machines_b.setText(f"台: {shown}" + (f"  (休み: {' · '.join(resting)})" if resting else ""))
         self.machines_b.setToolTip("ComfyUI の台を 3 台まで選びます (量産ラインと共通)。台の空きは量産ラインと分け合い、"
                                    "1 台に合わせて 2 件まで送ります。両方が待っているときは、物語 (候補・バッチ) が先です。")
 
@@ -2314,6 +2315,7 @@ class StoryView(QWidget):
         self._update_machines_button()
         if self.engine.active:
             self.engine.set_machines(recipes.machines())
+        self.batch.set_machines(recipes.machines())  # 作っているバッチの物語にも (休みにした台へ新しく送らない)
 
     def _start_batch(self) -> None:
         """「バッチに足す...」: 設定の窓を出して待ち行列に足す。"""

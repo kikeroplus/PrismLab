@@ -14,6 +14,7 @@ from gencommon import reader, store
 RECIPES_FILE = "recipes.json"
 LAST_FILE = "last_recipe.txt"
 MACHINES_FILE = "machines.txt"  # 台 (1 行に 1 つ、接続先の URL)。最大 3 台
+MACHINES_OFF_FILE = "machines_off.txt"  # 休みの台 (1 行に 1 つ)。台の設定には残したまま、一時的に使わない
 MAX_MACHINES = 3
 
 READ, ENHANCE, GEN = "read", "enhance", "gen"
@@ -21,9 +22,14 @@ TEXT, INSERT = "text", "insert"  # 追加テキスト (入力した文を足す)
 # 覚える・思い出す (2026-11-18 利用者の希望): その時点のプロンプト (元の文・盛った文・足した文) を名前のメモに覚え、
 # あとのステップで戻す。生成を通るとプロンプトは空に戻るので、T2I に送った文を次の I2V でも使う、などのため
 SAVE, LOAD = "memo_save", "memo_load"
+# 2026-11-18 利用者の希望 (提案した 5 つを全部): 最後のコマ (動画 → 最後のコマの画像)・増やす (そこから先を N 通りに)・
+# ★を待つ (J-Rate で★を付けたものだけ先へ)・置き換え (プロンプトの語を置き換える・消す)。
+# ワイルドカード ({a|b|c}) はステップではなく、追加テキストの書き方
+FRAME, SPLIT, GATE, SUB = "last_frame", "split", "star_gate", "substitute"
 STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", TEXT: "追加テキスト", INSERT: "差し込み", GEN: "生成",
-                SAVE: "覚える", LOAD: "思い出す"}
-STAGE_ORDER = (READ, ENHANCE, TEXT, INSERT, SAVE, LOAD, GEN)  # メニューに並べる順
+                SAVE: "覚える", LOAD: "思い出す", FRAME: "最後のコマ", SPLIT: "増やす", GATE: "★を待つ", SUB: "置き換え"}
+STAGE_ORDER = (READ, ENHANCE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, GATE, FRAME, GEN)  # メニューに並べる順
+MAX_SPLIT = 20  # 増やすの数の上限
 MEMO_TYPES = (SAVE, LOAD)
 DEFAULT_MEMO = "メモ 1"
 REPLACE, APPEND = "replace", "append"  # 思い出すとき: 今の文を置き換える / 今の文の後ろに足す
@@ -45,6 +51,9 @@ class Stage:
     memo: str = ""  # 覚える・思い出すのメモの名前
     mode: str = REPLACE  # 思い出すとき: 置き換える / 後ろに足す
     bypass: bool = False  # バイパス (このステップを飛ばして、前のものをそのまま次に渡す)
+    count: int = 2  # 増やす: いくつに分けるか
+    stars: int = 3  # ★を待つ: いくつ以上で先へ進めるか
+    rules: str = ""  # 置き換え: 1 行に「元 => 先」(先がなければ消す)
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -68,7 +77,17 @@ class Stage:
         s.memo = str(data.get("memo") or "")
         s.mode = APPEND if data.get("mode") == APPEND else REPLACE
         s.bypass = bool(data.get("bypass", False))
+        s.count = _int_in(data.get("count"), 2, 2, MAX_SPLIT)
+        s.stars = _int_in(data.get("stars"), 3, 1, 5)
+        s.rules = str(data.get("rules") or "")
         return s
+
+
+def _int_in(value, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 # 入口: フォルダの画像 / 1 枚の画像 (LoadImage のように) / フォルダのテキスト (1 ファイル = 1 件の T2I) /
@@ -176,20 +195,36 @@ def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set
     (読み取り・追加テキスト・差し込みのどれか。生成を通るとプロンプトは空に戻るので、直前の生成よりあとに要る)。
     ("needimage", i) = テキストの入口で、まだ画像がないのに i 番目が画像を要る (読み取り・I2I・I2V)。
     ("memoempty", i) = i 番目の覚えるの時点で、覚える文がない。("norecall", i) = i 番目の思い出すより前に、
-    その名前のメモを覚えるステップがない。"""
+    その名前のメモを覚えるステップがない。("needvideo", i) = i 番目の最後のコマの前に、動画の生成がない。
+    ("notext", i) = i 番目の置き換えの時点で、置き換える文がない。"""
     from . import kinds
     problems = set()
     has_gen = False
     has_text = text_entry  # テキストの入口は、初めから文がある
     has_image = not text_entry
+    video = False  # いま流れているのが動画か (ワークフローの種類が分からなければ None = 確かめない)
     memos = set()  # ここまでに覚えたメモの名前 (生成を通っても残る)
     for i, s in enumerate(stages):
         if s.bypass or i == skip:
             continue
         if s.type == GEN:
-            if not has_image and kinds.kind_of(s.workflow).startswith("I"):
+            kind = kinds.kind_of(s.workflow)
+            if not has_image and kind.startswith("I"):
                 problems.add(("needimage", i))
             has_gen, has_text, has_image = True, False, True
+            video = kinds.is_video(kind) if kind else None
+        elif s.type == FRAME:
+            if video is False:
+                problems.add(("needvideo", i))
+            video = False
+        elif s.type == GATE:
+            if not has_image:
+                problems.add(("needimage", i))  # テキストには★がない
+        elif s.type == SPLIT:
+            pass
+        elif s.type == SUB:
+            if not has_text:
+                problems.add(("notext", i))
         elif s.type == READ:
             if not has_image:
                 problems.add(("needimage", i))
@@ -229,7 +264,65 @@ def bypass_reason(stages: list, index: int, text_entry: bool = False) -> str:
         return "あとのステップに要る画像がなくなるので、バイパスにできません。"
     if any(isinstance(p, tuple) and p[0] in ("memoempty", "norecall") for p in new):
         return "あとの「覚える」「思い出す」に要る文・メモがなくなるので、バイパスにできません。"
+    if any(isinstance(p, tuple) and p[0] == "needvideo" for p in new):
+        return "あとの「最後のコマ」に要る動画がなくなるので、バイパスにできません。"
+    if any(isinstance(p, tuple) and p[0] == "notext" for p in new):
+        return "あとの「置き換え」に要る文がなくなるので、バイパスにできません。"
     return "あとの「盛る」の元になる文がなくなるので、バイパスにできません。"
+
+
+# ----------------------------------------------------------------------
+# ワイルドカード ({a|b|c} を 1 件ごとに 1 つ選ぶ) と置き換え
+# ----------------------------------------------------------------------
+_WILD = re.compile(r"\{([^{}]*\|[^{}]*)\}")
+
+
+def expand_wildcards(text: str, rng=None) -> str:
+    """{a|b|c} を 1 つ選んだものにする (入れ子は内側から)。| のない {…} はそのまま。"""
+    import random
+    rng = rng or random
+    for _ in range(100):  # 入れ子の深さ (念のため上限)
+        new = _WILD.sub(lambda m: rng.choice(m.group(1).split("|")), text)
+        if new == text:
+            break
+        text = new
+    return text
+
+
+def has_wildcards(text: str) -> bool:
+    return bool(_WILD.search(text or ""))
+
+
+RULE_SEPS = ("=>", "→")
+
+
+def parse_rules(text: str) -> list[tuple[str, str]]:
+    """置き換えの決まり: 1 行に「元 => 先」(「→」も可)。先がない行・区切りのない行は、元を消す。空行と # の行は飛ばす。"""
+    rules = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        old, new = line, ""
+        for sep in RULE_SEPS:
+            if sep in line:
+                old, new = (part.strip() for part in line.split(sep, 1))
+                break
+        if old:
+            rules.append((old, new))
+    return rules
+
+
+def apply_rules(text: Optional[str], rules: list[tuple[str, str]]) -> Optional[str]:
+    """置き換える (大文字・小文字は区別しない)。消したあとに残る「, ,」や続いた空白は詰める。"""
+    if text is None:
+        return None
+    for old, new in rules:
+        text = re.sub(re.escape(old), lambda _m, n=new: n, text, flags=re.IGNORECASE)
+    text = re.sub(r"[ \t]*,(?:[ \t]*,)+", ",", text)  # , , → ,
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"^[ \t]*,[ \t]*|[ \t]*,[ \t]*$", "", text, flags=re.MULTILINE)  # 行の頭と終わりの ,
+    return text.strip()
 
 
 def safe_name(name: str) -> str:
@@ -285,13 +378,45 @@ def _read_machines(name: str) -> list[str]:
     return urls[:MAX_MACHINES]
 
 
-def machines() -> list[str]:
-    """台の URL (最大 3 つ。小文字にはしない)。量産ラインと物語で共通 (空きは engine.POOL で分け合う)。"""
+def all_machines() -> list[str]:
+    """台の設定で選んである台の URL (休みの台も入れる。最大 3 つ。小文字にはしない)。"""
     return _read_machines(MACHINES_FILE)
 
 
-def set_machines(urls: list[str]) -> None:
-    store.write_text(store.app_file(MACHINES_FILE), "\n".join(u.strip().rstrip("/") for u in urls[:MAX_MACHINES]))
+def machines_off() -> set[str]:
+    """一時的に使わない (休み) 台の URL の小文字。台の設定はそのままで、チェックを外した台 (2026-11-18 利用者の希望)。"""
+    return {u.lower() for u in _read_machines(MACHINES_OFF_FILE)}
+
+
+def machines() -> list[str]:
+    """使う台の URL (休みの台を除く)。量産ラインと物語で共通 (空きは engine.POOL で分け合う)。"""
+    off = machines_off()
+    return [u for u in all_machines() if u.lower() not in off]
+
+
+def set_machines(urls: list[str], off: Optional[set] = None) -> None:
+    """台を保存する。off を渡せば休みの台も (渡さなければ、残った台の休みはそのまま)。"""
+    urls = [u.strip().rstrip("/") for u in urls[:MAX_MACHINES]]
+    store.write_text(store.app_file(MACHINES_FILE), "\n".join(urls))
+    off = machines_off() if off is None else {u.lower() for u in off}
+    store.write_text(store.app_file(MACHINES_OFF_FILE), "\n".join(u for u in urls if u.lower() in off))
+
+
+def set_machine_on(url: str, on: bool) -> None:
+    """台を使う / 休みにする (台の設定はそのまま)。"""
+    off = machines_off()
+    if on:
+        off.discard(url.lower())
+    else:
+        off.add(url.lower())
+    set_machines(all_machines(), off)
+
+
+def no_machines_reason() -> str:
+    """使う台がないときの知らせ。"""
+    if all_machines():
+        return "使う台がありません (どの台も休みです。台の札の「使う」にチェックを入れてください)。"
+    return "使う台が決まっていません (「台の設定...」で選んでください)。"
 
 
 def natural_key(text: str):
