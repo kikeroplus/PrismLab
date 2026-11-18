@@ -26,9 +26,12 @@ SAVE, LOAD = "memo_save", "memo_load"
 # ★を待つ (J-Rate で★を付けたものだけ先へ)・置き換え (プロンプトの語を置き換える・消す)。
 # ワイルドカード ({a|b|c}) はステップではなく、追加テキストの書き方
 FRAME, SPLIT, GATE, SUB = "last_frame", "split", "star_gate", "substitute"
+# 英語に (2026-11-18 利用者の希望): いまのプロンプトを LLM で英語に訳す (サーバー・モデルはエンハンサーと同じ)
+TRANSLATE = "to_english"
 STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", TEXT: "追加テキスト", INSERT: "差し込み", GEN: "生成",
-                SAVE: "覚える", LOAD: "思い出す", FRAME: "最後のコマ", SPLIT: "増やす", GATE: "★を待つ", SUB: "置き換え"}
-STAGE_ORDER = (READ, ENHANCE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, GATE, FRAME, GEN)  # メニューに並べる順
+                SAVE: "覚える", LOAD: "思い出す", FRAME: "最後のコマ", SPLIT: "増やす", GATE: "★を待つ", SUB: "置き換え",
+                TRANSLATE: "英語に"}
+STAGE_ORDER = (READ, ENHANCE, TRANSLATE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, GATE, FRAME, GEN)  # メニューに並べる順
 MAX_SPLIT = 20  # 増やすの数の上限
 MEMO_TYPES = (SAVE, LOAD)
 DEFAULT_MEMO = "メモ 1"
@@ -222,7 +225,7 @@ def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set
                 problems.add(("needimage", i))  # テキストには★がない
         elif s.type == SPLIT:
             pass
-        elif s.type == SUB:
+        elif s.type in (SUB, TRANSLATE):
             if not has_text:
                 problems.add(("notext", i))
         elif s.type == READ:
@@ -267,7 +270,7 @@ def bypass_reason(stages: list, index: int, text_entry: bool = False) -> str:
     if any(isinstance(p, tuple) and p[0] == "needvideo" for p in new):
         return "あとの「最後のコマ」に要る動画がなくなるので、バイパスにできません。"
     if any(isinstance(p, tuple) and p[0] == "notext" for p in new):
-        return "あとの「置き換え」に要る文がなくなるので、バイパスにできません。"
+        return "あとの「置き換え」「英語に」に要る文がなくなるので、バイパスにできません。"
     return "あとの「盛る」の元になる文がなくなるので、バイパスにできません。"
 
 

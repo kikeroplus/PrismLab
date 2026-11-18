@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
                                QTextBrowser, QVBoxLayout, QWidget)
 
-from gencommon import comfy, inserts
+from gencommon import comfy, inserts, settings
 
 from . import engine, kinds, rating, recipes, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
@@ -49,6 +49,7 @@ def _memo_detail(stage_type: str, memo: str, mode) -> str:
 STAGE_HELP = {
     recipes.READ: "画像を LLM に見せて、説明のプロンプトを書かせます (.txt があればそれを使う)。",
     recipes.ENHANCE: "ここまでの文を LLM で盛ります。1 件ごとに違う盛り方になります。",
+    recipes.TRANSLATE: "ここまでの文 (日本語など) を LLM で英語にします。英語だけの文はそのまま。",
     recipes.TEXT: "決まった文をプロンプトに足します。{a|b|c} と書くと 1 件ごとにどれかを選びます。",
     recipes.INSERT: "フォルダの .txt (セリフ・アクションなど) を、1 件ごとに順に足します。",
     recipes.SUB: "プロンプトの語を置き換える・消します (1 行に「元 => 先」)。",
@@ -421,6 +422,8 @@ class LineView(QWidget):
                     v["detail"] = s["reader"].get("name", "")
                 elif s["type"] == recipes.ENHANCE:
                     v["detail"] = s["enhancer"].get("name", "")
+                elif s["type"] == recipes.TRANSLATE:
+                    v["detail"] = "LLM: " + str(s.get("model") or "(エンハンサーと同じ)")
                 elif s["type"] == recipes.TEXT:
                     v["detail"] = self._short(s.get("text", ""))
                 elif s["type"] == recipes.INSERT:
@@ -447,6 +450,8 @@ class LineView(QWidget):
                 v["detail"] = s.reader or "(読み取りプリセットを選んでください)"
             elif s.type == recipes.ENHANCE:
                 v["detail"] = s.enhancer or "(エンハンサーを選んでください)"
+            elif s.type == recipes.TRANSLATE:
+                v["detail"] = "LLM: " + settings.enhance_model()
             elif s.type == recipes.TEXT:
                 v["detail"] = self._short(s.text) if s.text.strip() else "(足す文を入れてください)"
             elif s.type == recipes.INSERT:
@@ -651,6 +656,8 @@ class LineView(QWidget):
                 card.set_color(kinds.LLM_LINE)
                 if v["type"] == recipes.READ:
                     card.io.setText(io_html([prev_out, "→", ("文字", kinds.TEXT_COLOR)]))
+                elif v["type"] == recipes.TRANSLATE:
+                    card.io.setText(io_html([("文字", kinds.TEXT_COLOR), "→", ("英語", kinds.TEXT_COLOR)]))
                 else:
                     card.io.setText(io_html([("文字", kinds.TEXT_COLOR), "→", ("文字", kinds.TEXT_COLOR)]))
                 has_text = True
@@ -671,7 +678,8 @@ class LineView(QWidget):
                 elif ("needvideo", i) in problems:
                     reason = "動画がまだありません (前に I2V などの動画の生成を置く)"
                 elif ("notext", i) in problems:
-                    reason = "置き換える文がありません (前に読み取り・盛る・追加テキストなどを置く)"
+                    reason = ("英語にする" if v["type"] == recipes.TRANSLATE else "置き換える") + \
+                        "文がありません (前に読み取り・盛る・追加テキストなどを置く)"
                 if reason:
                     card.io.setText(f'<span style="color:#ef5350; font-weight:bold">⚠ {html.escape(reason)}</span>')
                     card.io.setWordWrap(True)

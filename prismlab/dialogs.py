@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
                                QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
                                QSpinBox, QVBoxLayout)
 
-from gencommon import comfy, enhancer, inserts, reader
+from gencommon import comfy, enhancer, inserts, reader, settings
 from gencommon.comfy_dialogs import ComfySettingsDialog
 
 from . import kinds, recipes, theme
@@ -91,6 +91,20 @@ class StageDialog(QDialog):
                 box.addWidget(_hint("前の「覚える」で覚えた文を戻します。置き換えるときは覚えた時点の状態 (盛った文・足した文も) "
                                     "にそっくり戻します。後ろに足すときは、今の文 (読み取った説明など) のあとに、覚えた文をつなげます。"
                                     "このあとに「盛る」を置けば、それを盛ります。"))
+        elif stage.type == recipes.TRANSLATE:
+            edit = QPushButton("エンハンサーの設定...")
+            edit.clicked.connect(self._edit_llm)
+            self.model_label = QLabel()
+            row = QHBoxLayout()
+            row.addWidget(self.model_label, 1)
+            row.addWidget(edit)
+            form.addRow("LLM", row)
+            self._show_model()
+            box.addWidget(_hint("いまのプロンプト (読み取った文・盛った文・足した文) を LLM で英語にします。"
+                                "日本語などが入っている文だけを訳し、英語だけの文は送りません。"
+                                "同じ文は 1 回だけ訳します。(word:1.2) や <lora:...> はそのまま残すよう頼みます。\n"
+                                "サーバー・モデルはエンハンサーと同じものを使います。\n"
+                                "例: 追加テキスト (日本語) → 英語に → I2V。盛ったあとに置けば、盛った文も英語にします。"))
         elif stage.type == recipes.FRAME:
             box.addWidget(_hint("前の生成で出来た動画の最後のコマを画像にして、次のステップに渡します"
                                 " (出力フォルダ\\コマ に PNG で残します)。\n"
@@ -227,6 +241,13 @@ class StageDialog(QDialog):
         enhancer.EnhancerSettingsDialog(index, self).exec()
         self._fill_llm(enhancer.load_presets(), self.preset.currentData())
 
+    def _show_model(self) -> None:
+        self.model_label.setText(f"{settings.enhance_model()}  ({settings.llm_url()})")
+
+    def _edit_llm(self) -> None:
+        enhancer.EnhancerSettingsDialog(0, self).exec()
+        self._show_model()
+
     # 生成 -----------------------------------------------------------------
     def _fill_workflows(self, current: str) -> None:
         self.workflow.blockSignals(True)
@@ -291,7 +312,7 @@ class StageDialog(QDialog):
             s.memo = self.memo.currentText().strip() or recipes.DEFAULT_MEMO
             if s.type == recipes.LOAD:
                 s.mode = recipes.REPLACE if self.replace.isChecked() else recipes.APPEND
-        elif s.type == recipes.FRAME:
+        elif s.type in (recipes.FRAME, recipes.TRANSLATE):
             pass
         elif s.type == recipes.SPLIT:
             s.count = self.count.value()
