@@ -54,6 +54,9 @@ class Stage:
     memo: str = ""  # 覚える・思い出すのメモの名前
     mode: str = REPLACE  # 思い出すとき: 置き換える / 後ろに足す
     bypass: bool = False  # バイパス (このステップを飛ばして、前のものをそのまま次に渡す)
+    # 一緒にバイパスにしたまとまりの印 (2026-11-19 利用者の希望)。読み取りを外すと元の文がなくなる盛るも一緒に入り、
+    # どれかを外すとまとまりの全部が戻る。空 = 1 つだけで入れた
+    bypass_group: str = ""
     count: int = 2  # 増やす: いくつに分けるか
     stars: int = 3  # ★を待つ: いくつ以上で先へ進めるか
     rules: str = ""  # 置き換え: 1 行に「元 => 先」(先がなければ消す)
@@ -80,6 +83,7 @@ class Stage:
         s.memo = str(data.get("memo") or "")
         s.mode = APPEND if data.get("mode") == APPEND else REPLACE
         s.bypass = bool(data.get("bypass", False))
+        s.bypass_group = str(data.get("bypass_group") or "") if s.bypass else ""
         s.count = _int_in(data.get("count"), 2, 2, MAX_SPLIT)
         s.stars = _int_in(data.get("stars"), 3, 1, 5)
         s.rules = str(data.get("rules") or "")
@@ -192,8 +196,8 @@ def entry_is_text(source: str, picked: list) -> bool:
     return source == PICKED and bool(picked) and all(str(p).lower().endswith(TEXT_EXT) for p in picked)
 
 
-def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set:
-    """ラインが成り立たないところ (skip 番目もバイパスしたとして数える)。
+def line_problems(stages: list, skip=(), text_entry: bool = False) -> set:
+    """ラインが成り立たないところ (skip の番号 (1 つか、まとめて) もバイパスしたとして数える)。
     "nogen" = 生成のステップが 1 つも動かない。("enhance", i) = i 番目の盛るの前に、盛る元の文がない
     (読み取り・追加テキスト・差し込みのどれか。生成を通るとプロンプトは空に戻るので、直前の生成よりあとに要る)。
     ("needimage", i) = テキストの入口で、まだ画像がないのに i 番目が画像を要る (読み取り・I2I・I2V)。
@@ -207,8 +211,9 @@ def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set
     has_image = not text_entry
     video = False  # いま流れているのが動画か (ワークフローの種類が分からなければ None = 確かめない)
     memos = set()  # ここまでに覚えたメモの名前 (生成を通っても残る)
+    skip = {skip} if isinstance(skip, int) else set(skip)
     for i, s in enumerate(stages):
-        if s.bypass or i == skip:
+        if s.bypass or i in skip:
             continue
         if s.type == GEN:
             kind = kinds.kind_of(s.workflow)
@@ -250,28 +255,74 @@ def line_problems(stages: list, skip: int = -1, text_entry: bool = False) -> set
     return problems
 
 
+def bypass_set(stages: list, index: int, text_entry: bool = False) -> Optional[list]:
+    """index 番目をバイパスにするとき、一緒にバイパスにするステップの番号 (index を含む、小さい順)。
+    外すと動かなくなるあとのステップ (元の文がなくなる盛る・置き換え・英語に、文のない覚える、
+    覚えていないメモの思い出す、動画のない最後のコマ) も一緒に入れる (2026-11-19 利用者の希望)。
+    生成が 1 つもなくなる・画像の要るステップの画像がなくなる (テキストの入口) なら入れられない (None)。"""
+    if not 0 <= index < len(stages) or stages[index].bypass:
+        return None
+    base = line_problems(stages, text_entry=text_entry)
+    group = {index}
+    while True:
+        new = line_problems(stages, group, text_entry) - base
+        if not new:
+            return sorted(group)
+        if "nogen" in new or any(p[0] == "needimage" for p in new if isinstance(p, tuple)):
+            return None
+        more = {p[1] for p in new if isinstance(p, tuple)} - group
+        if not more:
+            return None
+        group |= more
+
+
 def can_bypass(stages: list, index: int, text_entry: bool = False) -> bool:
-    """index 番目をバイパスにできるか (バイパスにしても、ラインに新しい問題が出ない)。"""
-    return not stages[index].bypass and \
-        line_problems(stages, index, text_entry) <= line_problems(stages, text_entry=text_entry)
+    """index 番目をバイパスにできるか (困るあとのステップも一緒に入れて、ラインが成り立つ)。"""
+    return bypass_set(stages, index, text_entry) is not None
 
 
 def bypass_reason(stages: list, index: int, text_entry: bool = False) -> str:
     """バイパスにできない理由 (できるなら "")。"""
-    if can_bypass(stages, index, text_entry) or stages[index].bypass:
+    if stages[index].bypass or can_bypass(stages, index, text_entry):
         return ""
-    new = line_problems(stages, index, text_entry) - line_problems(stages, text_entry=text_entry)
+    group = {index}  # 一緒に入れられるものを入れたうえで、残る問題を言う
+    base = line_problems(stages, text_entry=text_entry)
+    while True:
+        new = line_problems(stages, group, text_entry) - base
+        more = {p[1] for p in new if isinstance(p, tuple) and p[0] != "needimage"} - group
+        if not more:
+            break
+        group |= more
     if "nogen" in new:
         return "生成のステップがなくなるので、バイパスにできません。"
-    if any(isinstance(p, tuple) and p[0] == "needimage" for p in new):
-        return "あとのステップに要る画像がなくなるので、バイパスにできません。"
-    if any(isinstance(p, tuple) and p[0] in ("memoempty", "norecall") for p in new):
-        return "あとの「覚える」「思い出す」に要る文・メモがなくなるので、バイパスにできません。"
-    if any(isinstance(p, tuple) and p[0] == "needvideo" for p in new):
-        return "あとの「最後のコマ」に要る動画がなくなるので、バイパスにできません。"
-    if any(isinstance(p, tuple) and p[0] == "notext" for p in new):
-        return "あとの「置き換え」「英語に」に要る文がなくなるので、バイパスにできません。"
-    return "あとの「盛る」の元になる文がなくなるので、バイパスにできません。"
+    return "あとのステップに要る画像がなくなる (テキストの入口で、最初の T2I / T2V を外す) ので、バイパスにできません。"
+
+
+def bypass_members(stages: list, index: int) -> list:
+    """index 番目のバイパスを外すとき、一緒に戻すステップの番号 (同じまとまり。まとまりがなければ index だけ)。"""
+    group = stages[index].bypass_group
+    if not group:
+        return [index]
+    return [i for i, s in enumerate(stages) if s.bypass and s.bypass_group == group]
+
+
+def new_bypass_group(stages: list, taken=()) -> str:
+    """まとまりの印 (レシピの中と taken に重ならないもの)。"""
+    used = {s.bypass_group for s in stages} | set(taken)
+    n = 1
+    while f"g{n}" in used:
+        n += 1
+    return f"g{n}"
+
+
+def renumber_bypass_groups(pasted: list, stages: list) -> None:
+    """貼り付けたステップのまとまりの印を、貼り付け先と重ならないものに付け直す (貼り付けたものの中では保つ)。"""
+    mapping = {}
+    for s in pasted:
+        if s.bypass_group:
+            if s.bypass_group not in mapping:
+                mapping[s.bypass_group] = new_bypass_group(stages, mapping.values())
+            s.bypass_group = mapping[s.bypass_group]
 
 
 # ----------------------------------------------------------------------

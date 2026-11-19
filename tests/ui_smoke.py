@@ -121,11 +121,25 @@ lv._change_stage_type(1, recipes.READ)
 assert [st.type for st in lv.recipe.stages] == ["read", "read", "enhance", "gen"]
 pump(0.5)
 assert len(lv.stage_cards) == 4 and lv.stage_cards[1].title.text() == "読み取り"
-# バイパス: 盛るは入れられる。読み取り (盛るの元) とただ 1 つの生成は入れられない (スイッチを出さない)
+# バイパス: スイッチはどのステップにも出す (2026-11-19)。読み取り (盛るの元) は盛ると一緒に入り、一緒に戻る。
+# ただ 1 つの生成は押しても入らない
 lv.recipe.stages = [recipes.Stage.from_dict(d) for d in saved]
 lv.refresh(rebuild=True)
 pump(0.3)
-assert [c.bypass.isVisibleTo(c) for c in lv.stage_cards] == [False, True, False],     [c.bypass.isVisibleTo(c) for c in lv.stage_cards]
+assert [c.bypass.isVisibleTo(c) for c in lv.stage_cards] == [True, True, True],     [c.bypass.isVisibleTo(c) for c in lv.stage_cards]
+assert "盛る" in lv.stage_cards[0].bypass.toolTip() and "生成" in lv.stage_cards[2].bypass.toolTip()
+lv.stage_cards[2].bypass.click()
+pump(0.5)
+assert not lv.recipe.stages[2].bypass and not lv.stage_cards[2].bypass.isChecked()
+lv.stage_cards[0].bypass.click()
+pump(0.5)
+assert [st.bypass for st in lv.recipe.stages] == [True, True, False]
+assert lv.recipe.stages[0].bypass_group and lv.recipe.stages[0].bypass_group == lv.recipe.stages[1].bypass_group
+assert lv.stage_cards[0]._bypassed and lv.stage_cards[1]._bypassed
+lv.stage_cards[1].bypass.click()  # 一緒に入ったほうを外しても、まとめて戻る
+pump(0.5)
+assert [st.bypass for st in lv.recipe.stages] == [False, False, False]
+assert not any(st.bypass_group for st in lv.recipe.stages)
 lv.stage_cards[1].bypass.click()
 pump(0.5)
 assert lv.recipe.stages[1].bypass and lv.stage_cards[1]._bypassed

@@ -220,13 +220,26 @@ S = recipes.Stage
 cn, rd, en, i2v = (S(recipes.GEN, workflow=str(WF / "cn.json")), S(recipes.READ, reader=READER),
                    S(recipes.ENHANCE, enhancer=ENHANCER), S(recipes.GEN, workflow=str(WF / "i2v.json")))
 line = [cn, rd, en, i2v]
-check([recipes.can_bypass(line, i) for i in range(4)] == [True, False, True, True],
-      "10: 入れられるステップ (読み取りは、あとの盛るが困るので不可)")
+check([recipes.can_bypass(line, i) for i in range(4)] == [True, True, True, True], "10: どのステップも入れられる")
+check(recipes.bypass_set(line, 1) == [1, 2] and recipes.bypass_set(line, 2) == [2],
+      "10: 読み取りを外すと、元の文がなくなる盛るも一緒に入る")
+check(recipes.bypass_set(line, 3) == [3], "10: 生成がほかにあれば、生成も 1 つだけ入れられる")
+st10 = recipes.Stage.from_dict({"type": "read", "bypass": True, "bypass_group": "g1"})
+check(st10.bypass_group == "g1" and recipes.Stage.from_dict({"bypass_group": "g1"}).bypass_group == "",
+      "10: まとまりの印は保存でき、バイパスでなければ持たない")
+grp = [recipes.Stage(recipes.READ, bypass=True, bypass_group="g1"), recipes.Stage(recipes.ENHANCE, bypass=True, bypass_group="g1"),
+       recipes.Stage(recipes.TEXT, bypass=True), recipes.Stage(recipes.GEN)]
+check(recipes.bypass_members(grp, 1) == [0, 1] and recipes.bypass_members(grp, 2) == [2],
+      "10: 外すときは、一緒に入れたものだけまとめて戻す")
+check(recipes.new_bypass_group(grp) == "g2", "10: 新しいまとまりの印は重ならない")
+pasted = [recipes.Stage(recipes.READ, bypass=True, bypass_group="g1"), recipes.Stage(recipes.ENHANCE, bypass=True, bypass_group="g1")]
+recipes.renumber_bypass_groups(pasted, grp)
+check(pasted[0].bypass_group == pasted[1].bypass_group == "g2", "10: 貼り付けたまとまりは、貼り付け先と重ならない印に付け直す")
 line10 = [S(recipes.READ, reader=READER), S(recipes.GEN, workflow=str(WF / "i2v.json"))]
 check(not recipes.can_bypass(line10, 1) and "生成" in recipes.bypass_reason(line10, 1),
       "10: ただ 1 つの生成はバイパスにできない")
 en.bypass = True
-check(recipes.can_bypass(line, 1), "10: 盛るをバイパスにすれば、読み取りもバイパスにできる")
+check(recipes.bypass_set(line, 1) == [1], "10: 盛るをバイパスにしてあれば、読み取りは 1 つだけで入る")
 src10 = make_images(TMP / "in10", 2)
 cn10 = S(recipes.GEN, workflow=str(WF / "cn.json"), bypass=True)
 en10 = S(recipes.ENHANCE, enhancer="(消えたエンハンサー)", bypass=True)  # バイパスなら中身は確かめない
@@ -420,8 +433,12 @@ load_m = S(recipes.LOAD, memo="T2I の文")
 check(("norecall", 0) in recipes.line_problems([load_m, i2v]) and "覚えていません" in recipes.entry_problem([load_m, i2v], False),
       "19: 覚えていないメモを思い出すステップは、理由を出して始めない")
 check(("memoempty", 0) in recipes.line_problems([save_m, i2v]), "19: 文がないところで覚えると知らせる")
-check(not recipes.can_bypass([S(recipes.ENHANCE, enhancer=ENHANCER), save_m, t2i, load_m, i2v], 1, text_entry=True),
-      "19: あとで思い出すメモの「覚える」はバイパスにできない")
+check(recipes.bypass_set([S(recipes.ENHANCE, enhancer=ENHANCER), save_m, t2i, load_m, i2v], 1, text_entry=True) == [1, 3],
+      "19: あとで思い出すメモの「覚える」を外すと、その「思い出す」も一緒に入る")
+check(recipes.bypass_set([t2i, S(recipes.TEXT, text="a"), S(recipes.SUB, rules="a => b"), S(recipes.TRANSLATE), i2v], 1) == [1, 2, 3],
+      "19: 追加テキストを外すと、文のなくなる置き換え・英語にも一緒に入る")
+check(recipes.bypass_set([S(recipes.FRAME), i2v, S(recipes.FRAME), i2v], 1) == [1, 2],
+      "19: 動画の生成を外すと、動画のなくなる最後のコマも一緒に入る")
 eng19 = engine.Engine()
 eng19.set_machines([a.url])
 # 置き換える: 盛る → 覚える → T2I → 思い出す → I2V で、I2V にも T2I と同じ文を送る

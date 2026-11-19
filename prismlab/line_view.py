@@ -684,8 +684,10 @@ class LineView(QWidget):
                     card.io.setText(f'<span style="color:#ef5350; font-weight:bold">⚠ {html.escape(reason)}</span>')
                     card.io.setWordWrap(True)
                     card.set_color("#ef5350")
-            can = not running_now and i < len(stages) and (stages[i].bypass or recipes.can_bypass(stages, i, self.recipe.texts))
-            card.bypass.setVisible(can)
+            # バイパスのスイッチはどのステップにも出す (2026-11-19 利用者の希望)。困るあとのステップは一緒に入る
+            card.bypass.setVisible(not running_now and i < len(stages))
+            if not running_now and i < len(stages):
+                card.bypass.setToolTip(self._bypass_tip(i))
             card.bypass_toggled.connect(lambda on, n=i: self._set_bypass(n, on))
             card.clicked.connect(lambda n=i: self._edit_stage(n))
             card.menu_requested.connect(lambda pos, n=i: self._stage_menu(n, pos))
@@ -760,6 +762,7 @@ class LineView(QWidget):
         stages = self.recipe.stages
         index = max(0, min(index, len(stages)))
         pasted = [recipes.Stage.from_dict(dict(d)) for d in LineView.clipboard]
+        recipes.renumber_bypass_groups(pasted, stages)
         stages[index:index] = pasted
         self._save_recipes()
         self.refresh(rebuild=True)
@@ -861,7 +864,7 @@ class LineView(QWidget):
         paste_left.setEnabled(has_clip)
         paste_right.setEnabled(has_clip)
         menu.addSeparator()
-        bypass = menu.addAction("バイパス")
+        bypass = menu.addAction("バイパス" + self._bypass_with_text(index))
         bypass.setCheckable(True)
         bypass.setChecked(stages[index].bypass)
         bypass.setEnabled(stages[index].bypass or recipes.can_bypass(stages, index, self.recipe.texts))
@@ -899,7 +902,9 @@ class LineView(QWidget):
             j = index - 1 if chosen is left else index + 1
             stages[index], stages[j] = stages[j], stages[index]
         elif chosen is duplicate:
-            stages.insert(index + 1, recipes.Stage.from_dict(stages[index].to_dict()))
+            copy_stage = recipes.Stage.from_dict(stages[index].to_dict())
+            copy_stage.bypass_group = ""  # 複製はまとまりに入れない (1 つだけのバイパスにする)
+            stages.insert(index + 1, copy_stage)
         elif chosen is delete:
             del stages[index]
         else:
@@ -907,16 +912,59 @@ class LineView(QWidget):
         self._save_recipes()
         self.refresh(rebuild=True)
 
+    def _others_text(self, indexes: list, index: int) -> str:
+        """一緒に入る・戻るステップの名前 (「盛る」「置き換え」)。"""
+        return "・".join(f"「{recipes.STAGE_TITLES[self.recipe.stages[j].type]}」" for j in indexes if j != index)
+
+    def _bypass_with_text(self, index: int) -> str:
+        """右クリックの「バイパス」に添える、一緒に入る・戻るもの。"""
+        stages = self.recipe.stages
+        if stages[index].bypass:
+            members = recipes.bypass_members(stages, index)
+            return f" (外すと {self._others_text(members, index)} も戻す)" if len(members) > 1 else ""
+        group = recipes.bypass_set(stages, index, self.recipe.texts) or [index]
+        return f" ({self._others_text(group, index)} も一緒に)" if len(group) > 1 else ""
+
+    def _bypass_tip(self, index: int) -> str:
+        """↷ に乗せたときの説明。"""
+        stages = self.recipe.stages
+        tip = "バイパス: このステップを飛ばして、前のものをそのまま次に渡します"
+        if stages[index].bypass:
+            members = recipes.bypass_members(stages, index)
+            if len(members) > 1:
+                tip += f"\n{self._others_text(members, index)} と一緒に入れました。外すと一緒に戻ります。"
+            return tip
+        group = recipes.bypass_set(stages, index, self.recipe.texts)
+        if group is None:
+            return tip + "\n" + recipes.bypass_reason(stages, index, self.recipe.texts)
+        if len(group) > 1:
+            tip += f"\nこれがないと動かない {self._others_text(group, index)} も一緒にバイパスにします。"
+        return tip
+
     def _set_bypass(self, index: int, on: bool) -> None:
-        """バイパスを入れる・切る。入れるのは、入れてもラインが成り立つステップだけ。"""
+        """バイパスを入れる・切る。入れるときは、外すと動かなくなるあとのステップも一緒に入れる (2026-11-19 利用者の希望)。
+        一緒に入れたものは、どれかを切るとまとめて戻す。生成や画像がなくなるなら入れない。"""
         stages = self.recipe.stages
         if self.locked() or index >= len(stages) or stages[index].bypass == on:
             return
-        if on and not recipes.can_bypass(stages, index, self.recipe.texts):
-            self.status.emit(recipes.bypass_reason(stages, index, self.recipe.texts))
-            QTimer.singleShot(0, lambda: self.refresh(rebuild=True))  # スイッチを戻す
-            return
-        stages[index].bypass = on
+        if on:
+            group = recipes.bypass_set(stages, index, self.recipe.texts)
+            if group is None:
+                self.status.emit(recipes.bypass_reason(stages, index, self.recipe.texts))
+                QTimer.singleShot(0, lambda: self.refresh(rebuild=True))  # スイッチを戻す
+                return
+            mark = recipes.new_bypass_group(stages) if len(group) > 1 else ""
+            for j in group:
+                stages[j].bypass, stages[j].bypass_group = True, mark
+            if len(group) > 1:
+                self.status.emit(f"{self._others_text(group, index)} も一緒にバイパスにしました "
+                                 f"(「{recipes.STAGE_TITLES[stages[index].type]}」がないと動かないため)。")
+        else:
+            members = recipes.bypass_members(stages, index)
+            for j in members:
+                stages[j].bypass, stages[j].bypass_group = False, ""
+            if len(members) > 1:
+                self.status.emit(f"一緒にバイパスにしていた {self._others_text(members, index)} も戻しました。")
         self._save_recipes()
         # 押したスイッチのカードも作り直すので、信号から抜けてから行う
         QTimer.singleShot(0, lambda: self.refresh(rebuild=True))
