@@ -567,6 +567,67 @@ class Engine(QObject):
                 pass
         self._save()
 
+    def update_stage(self, index: int, snap: dict) -> None:
+        """量産中にステップの中身を直す (2026-11-19 利用者の希望)。これからそのステップに来る件から効き、通った件はそのまま。
+        並び・種類・バイパス・ワークフローは変えられない (ワークフローのファイルは量産中は直さない運用)。
+        差し込みのフォルダが変われば、まだそこを通っていない件の割り当てを新しいフォルダで引き直す。
+        増やすの数が変われば、そのあとの差し込みで足りなくなる枝の割り当てを足す。合わなければ ValueError。"""
+        run = self.run
+        if run is None or not 0 <= index < len(run.stages):
+            raise ValueError("量産が動いていません。")
+        old = run.stages[index]
+        if old["type"] != snap.get("type") or bool(old.get("bypass")) != bool(snap.get("bypass")):
+            raise ValueError("量産中は、ステップの種類とバイパスは変えられません。")
+        if old["type"] == recipes.GEN and str(old.get("workflow", "")).lower() != str(snap.get("workflow", "")).lower():
+            raise ValueError("量産中は、ワークフローは変えられません。")
+        stages = list(run.stages)
+        stages[index] = snap
+        redo = set()  # 割り当てを引き直す差し込み
+        fill = set()  # 足りない枝だけ足す差し込み
+        live = [j for j, s in enumerate(stages) if s["type"] == recipes.INSERT and not s.get("bypass")]
+        if snap["type"] == recipes.INSERT and not snap.get("bypass") and snap.get("folder") != old.get("folder"):
+            redo.add(index)
+        if snap["type"] == recipes.SPLIT and not snap.get("bypass") and int(snap.get("count") or 2) != int(old.get("count") or 2):
+            fill.update(j for j in live if j > index)
+        try:
+            pickers = {j: inserts.Picker([inserts.Slot(stages[j]["name"], stages[j]["folder"], True, False)])
+                       for j in redo | fill}
+        except inserts.InsertError as exc:
+            raise ValueError(str(exc)) from exc
+        with self._cond:
+            if self.run is not run:
+                raise ValueError("量産が変わりました。")
+            planned = []  # (件, 鍵, 割り当て)。全部引けてから入れる (途中で失敗したら何も変えない)
+            try:
+                for it in run.items:
+                    if it.state in (DONE, CANCELED, SKIPPED):
+                        continue
+                    for j, picker in pickers.items():
+                        if it.stage > j or (it.stage == j and it.state == RUNNING):
+                            continue  # もう通った (通っている) 差し込み
+                        # ここから j までの増やすで、この件が何本に分かれるか
+                        branches = 1
+                        for k in range(it.stage, j):
+                            if stages[k]["type"] == recipes.SPLIT and not stages[k].get("bypass"):
+                                branches *= int(stages[k].get("count") or 2)
+                        for c in range(branches):
+                            key = plan_key(j, it.branch * branches + c)
+                            if j in redo or key not in it.plan:
+                                planned.append((it, key, picker.next()[0]))
+            except inserts.InsertError as exc:
+                raise ValueError(str(exc)) from exc
+            for it, key, slot in planned:
+                it.plan[key] = slot
+            run.stages = stages
+            self._cond.notify_all()
+        for picker in pickers.values():
+            if run.trial:
+                picker.discard()  # 試作では位置を進めない
+            else:
+                picker.commit()
+        self._save()
+        self.changed.emit()
+
     def snapshot(self) -> tuple[Optional[Run], list[Item], list[Machine]]:
         """画面に出すための写し。"""
         with self._cond:

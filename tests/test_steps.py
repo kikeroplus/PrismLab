@@ -274,6 +274,31 @@ pump(0.6)
 check(lv.gate_recheck_button.isVisible() and lv.gate_end_button.isVisible(), "★待ちがあればボタンを出す")
 check("★待ち 3" in lv.summary.text() and "★待ち 3" in lv.stage_cards[1].count.text(),
       f"★待ちの数を出す ({lv.stage_cards[1].count.text()})")
+# 量産中にステップの中身を直す (2026-11-19): 量産の写しとレシピの両方を直し、これから来る件から効く
+from prismlab import line_view  # noqa: E402
+check(lv.locked(), "量産中のレシピを見ている")
+dg = StageDialog(recipes.Stage(recipes.GEN, workflow=I2V), running=True)
+check(not dg.workflow.isEnabled() and dg.base.isEnabled(), "量産中の設定の窓では、ワークフローだけ選べない")
+
+
+class _EditText:
+    def __init__(self, stage, parent=None, running=False):
+        self.stage, self.running = stage, running
+
+    def exec(self):
+        self.stage.text = "zebra"
+        return self.running
+
+
+real_dialog = line_view.StageDialog
+line_view.StageDialog = _EditText
+lv._edit_stage(2)
+line_view.StageDialog = real_dialog
+check(lv.engine.run.stages[2]["text"] == "zebra" and lv.recipe.stages[2].text == "zebra"
+      and recipes.load()[0].stages[2].text == "zebra", "量産中に追加テキストを直すと、量産の写しとレシピを直す")
+check("zebra" in lv.stage_cards[2].io.text() or "zebra" in lv.stage_cards[2].toolTip()
+      or any("zebra" in w.text() for w in lv.stage_cards[2].findChildren(type(lv.summary))),
+      "直した中身を札に出す")
 stars[lv.engine.run.items[0].outputs[0]["path"]] = 5
 lv.rescan()  # 戻ったとき (J-Rate で★を付けて)
 end = time.time() + 40
@@ -281,6 +306,7 @@ while time.time() < end and not (lv.engine.run.items[0].state == engine.DONE and
                                  and lv.engine.run.items[1].state == engine.DONE):
     pump(0.2)
 items = lv.engine.run.items
+check("zebrc" in items[0].outputs[1]["sent"], f"直したあとに来た件は新しい文で進む (あとの置き換え a => c も通る) ({items[0].outputs[1]['sent']!r})")
 check(len(items) == 4 and items[0].state == items[1].state == engine.DONE and len(items[0].outputs) == 3,
       f"戻ったら★を読み直して続きを作る (増やすで 2 本) ({[(i.state, len(i.outputs)) for i in items]})")
 pump(0.5)

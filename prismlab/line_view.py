@@ -16,7 +16,7 @@ from typing import Callable, Optional
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListView,
-                               QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+                               QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QSpinBox,
                                QTextBrowser, QVBoxLayout, QWidget)
 
 from gencommon import comfy, inserts, settings
@@ -25,7 +25,7 @@ from . import engine, kinds, rating, recipes, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
 from .hover_preview import HoverPreview
 from .thumbs import MOVIE_EXTS, ThumbCache
-from .widgets import CARD_WIDTH, AddButton, Card, InsertArrow, MachineCard, io_html
+from .widgets import CARD_WIDTH, AddButton, Card, HScrollArea, InsertArrow, MachineCard, io_html
 
 CONFIRM_COUNT = 30  # これを超える件数で始めるときは確かめる (generation-standard 6 章)
 RESULT_ICON = QSize(128, 128)
@@ -164,7 +164,7 @@ class LineView(QWidget):
         self.flow = QHBoxLayout(self.flow_host)
         self.flow.setContentsMargins(2, 2, 2, 2)
         self.flow.setSpacing(0)
-        scroll = QScrollArea()
+        scroll = HScrollArea()
         scroll.setWidget(self.flow_host)
         scroll.setWidgetResizable(True)
         scroll.setFixedHeight(FLOW_MIN_HEIGHT)  # 札の高さに合わせて伸ばす (_fit_flow)
@@ -768,8 +768,7 @@ class LineView(QWidget):
 
     def _edit_stage(self, index: int) -> None:
         if self.locked():
-            self.status.emit("動いている量産のレシピは直せません (一時停止しても、始めたときの中身で続けます)。"
-                             "ほかのレシピは量産中も直せます。")
+            self._edit_running_stage(index)
             return
         stage = self.recipe.stages[index]
         edited = recipes.Stage.from_dict(stage.to_dict())
@@ -778,17 +777,57 @@ class LineView(QWidget):
             self._save_recipes()
             self.refresh(rebuild=True)
 
+    def _edit_running_stage(self, index: int) -> None:
+        """動いている量産のステップの中身を直す (2026-11-19 利用者の希望)。レシピと量産の写しの両方を直し、
+        これからそのステップに来る件から効く。並び・種類・バイパス・ワークフローは量産が終わってから。"""
+        run = self.engine.run
+        stages = self.recipe.stages
+        same = run is not None and len(run.stages) == len(stages) and all(
+            snap["type"] == st.type and bool(snap.get("bypass")) == st.bypass
+            and (st.type != recipes.GEN or str(snap.get("workflow", "")).lower() == st.workflow.lower())
+            for snap, st in zip(run.stages, stages))
+        if not same or index >= len(stages):
+            self.status.emit("このレシピは量産を始めたときと並びが違うので、量産が終わるまで直せません。")
+            return
+        if stages[index].bypass:
+            self.status.emit("バイパスしているステップは、量産が終わってから直してください。")
+            return
+        edited = recipes.Stage.from_dict(stages[index].to_dict())
+        if not StageDialog(edited, self, running=True).exec():
+            return
+        new_stages = list(stages)
+        new_stages[index] = edited
+        problem = recipes.entry_problem(new_stages, self.recipe.texts)
+        if problem:
+            QMessageBox.warning(self, "ステップの設定", problem)
+            return
+        try:
+            snap = engine.stage_snapshot(edited)
+            self.engine.update_stage(index, snap)
+        except Exception as exc:  # noqa: BLE001 - プリセットがない・差し込みのフォルダが読めないなど
+            QMessageBox.warning(self, "ステップの設定", f"量産中のステップを直せませんでした。\n{exc}")
+            return
+        stages[index] = edited
+        self._save_recipes()
+        self.refresh(rebuild=True)
+        self.status.emit(f"{index + 1} 番目のステップを直しました。これからそこに来る件から新しい中身で進みます。")
+
     def _stage_menu(self, index: int, pos) -> None:
         stages = self.recipe.stages
         if self.locked():
-            # 動いている量産のレシピは直せないが、コピーはできる (ほかのレシピに貼るため)
+            # 動いている量産のレシピは中身 (設定) だけ直せる。並びは変えられないが、コピーはできる (ほかのレシピに貼るため)
             if index < len(stages):
                 menu = QMenu(self)
+                edit = menu.addAction("設定...")
+                edit.setEnabled(not stages[index].bypass)
+                menu.addSeparator()
                 copy = menu.addAction("コピー")
                 copy_right = menu.addAction("ここから右をまとめてコピー")
                 copy_right.setEnabled(index < len(stages) - 1)
                 chosen = menu.exec(pos)
-                if chosen is copy:
+                if chosen is edit:
+                    self._edit_running_stage(index)
+                elif chosen is copy:
                     self._copy_stages(index, index + 1)
                 elif chosen is copy_right:
                     self._copy_stages(index, len(stages))
@@ -1507,7 +1546,7 @@ class LineView(QWidget):
         for b in self.recipe_group.buttons():
             r = self.recipes[self.recipe_group.id(b)] if self.recipe_group.id(b) < len(self.recipes) else None
             b.setText(("▶ " if r is not None and r is busy_recipe else "") + ((r.name if r else "") or "(名前なし)"))
-            b.setToolTip("量産中 (このレシピは直せません。ほかのレシピは直せます)" if r is not None and r is busy_recipe else "")
+            b.setToolTip("量産中 (このレシピはステップの中身だけ直せます。ほかのレシピは全部直せます)" if r is not None and r is busy_recipe else "")
 
         # 入口
         source = str(run.recipe.get("source") or recipes.FOLDER) if showing else self.recipe.source

@@ -448,6 +448,56 @@ check(eng19.run.items[0].state == engine.DONE and sent_b.startswith("a photo") a
       and sent_b.index("a photo") < sent_b.index("a red fox"), f"19: 後ろに足す: 読み取った説明のあとに覚えた文 ({sent_b!r})")
 eng19.stop_threads()
 
+# 20. 量産中にステップの中身を直す (2026-11-19): これからそのステップに来る件から効く。ワークフロー・種類は変えない
+eng20 = engine.Engine()
+eng20.set_machines([a.url])
+r20 = recipe("20", txt, [S(recipes.TEXT, text="old words"), t2i])
+r20.source = recipes.TEXTS
+run20 = engine.Run.create(r20, recipes.list_texts(str(txt))[:1])
+run20.paused = True  # 止めておいて直し、それから進める
+eng20.start(run20)
+eng20.update_stage(0, engine.stage_snapshot(S(recipes.TEXT, text="new words")))
+check(eng20.run.stages[0]["text"] == "new words", "20: 量産の写しを直す")
+try:
+    eng20.update_stage(1, engine.stage_snapshot(S(recipes.GEN, workflow=str(WF / "i2v.json"))))
+    check(False, "20: ワークフローは変えられない")
+except ValueError:
+    check(eng20.run.stages[1]["workflow"] == str(WF / "t2i.json"), "20: ワークフローは変えられない")
+try:
+    eng20.update_stage(0, engine.stage_snapshot(S(recipes.GATE, stars=2)))
+    check(False, "20: 種類は変えられない")
+except ValueError:
+    check(True, "20: 種類は変えられない")
+eng20.set_paused(False)
+wait(eng20)
+sent20 = eng20.run.items[0].outputs[0]["sent"]
+check(eng20.run.items[0].state == engine.DONE and "new words" in sent20 and "old words" not in sent20,
+      f"20: 直したあとに来た件は新しい文で進む ({sent20!r})")
+eng20.stop_threads()
+
+# 差し込みのフォルダ・増やすの数を直すと、まだ通っていない件の割り当てを引き直す・足す (動かさずに確かめる)
+lines20 = TMP / "lines20"
+lines20.mkdir()
+for n in (1, 2, 3):
+    (lines20 / f"{n}.txt").write_text(f"line {n}", encoding="utf-8")
+src20 = make_images(TMP / "in20", 2)
+r20b = recipe("20b", TMP / "in20", [S(recipes.SPLIT, count=2), S(recipes.INSERT, folder=str(lines)), i2v])
+run20b = engine.Run.create(r20b, src20, trial=True)
+eng20b = engine.Engine()
+eng20b.run = run20b
+check(sorted(run20b.items[0].plan) == ["1", "1/1"], "20: 始めたときは 2 本ぶん割り当てる")
+eng20b.update_stage(1, engine.stage_snapshot(S(recipes.INSERT, folder=str(lines20))))
+check(all(p["folder"] == str(lines20) for it in run20b.items for p in it.plan.values()),
+      "20: 差し込みのフォルダを直すと、まだ通っていない件は新しいフォルダで引き直す")
+eng20b.update_stage(0, engine.stage_snapshot(S(recipes.SPLIT, count=3)))
+check(all(sorted(it.plan) == ["1", "1/1", "1/2"] for it in run20b.items),
+      "20: 増やすの数を増やすと、足りない枝の差し込みを足す")
+run20b.items[1].stage, run20b.items[1].state = 2, engine.WAITING  # 差し込みを通った件
+before20 = dict(run20b.items[1].plan)
+eng20b.update_stage(1, engine.stage_snapshot(S(recipes.INSERT, folder=str(lines))))
+check(run20b.items[1].plan == before20 and run20b.items[0].plan["1"]["folder"] == str(lines),
+      "20: もう差し込みを通った件の割り当ては変えない")
+
 for s in (a, b, slow):
     s.close()
 llm.close()

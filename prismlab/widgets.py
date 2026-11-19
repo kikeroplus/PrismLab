@@ -4,8 +4,8 @@ from typing import Optional
 
 from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QFrame,QHBoxLayout, QLabel, QProgressBar, QSizePolicy, QToolButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel, QProgressBar, QScrollArea, QSizePolicy,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from . import theme
 
@@ -15,6 +15,27 @@ FAIL_COLOR = "#ef5350"
 DOWN_COLOR = "#ef5350"
 OK_DOT = "#66bb6a"
 BYPASS_COLOR = "#e0a000"  # バイパスのスイッチを入れたときの色
+
+
+class HScrollArea(QScrollArea):
+    """横に並べる欄 (ステップの並び・物語のシーン)。マウスホイールで横に送る (2026-11-19 利用者の希望)。
+    縦のスクロールバーが出ているときは Shift+ホイールで縦に送る。横に送る分がなければ普通どおり縦。"""
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta()
+        step = delta.y() or delta.x()
+        hbar, vbar = self.horizontalScrollBar(), self.verticalScrollBar()
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if not step or hbar.maximum() <= hbar.minimum() or (shift and vbar.maximum() > vbar.minimum()):
+            if shift and step and vbar.maximum() > vbar.minimum():
+                vbar.setValue(vbar.value() - round(step / 120 * vbar.singleStep() * 3))
+                event.accept()
+            else:
+                super().wheelEvent(event)
+            return
+        # 1 目盛り (120) で札の 3 分の 1 ほど進める
+        hbar.setValue(hbar.value() - round(step / 120 * CARD_WIDTH / 3))
+        event.accept()
 
 
 class KindChip(QLabel):

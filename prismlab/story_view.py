@@ -16,7 +16,7 @@ from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QSize, Qt, QTim
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut, QTextCursor
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFrame, QHBoxLayout, QLabel, QListView, QListWidget, QListWidgetItem,
-                               QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider,
+                               QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSlider,
                                QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from gencommon import comfy, enhancer, inserts, reader, store
@@ -24,7 +24,7 @@ from gencommon import comfy, enhancer, inserts, reader, store
 from . import engine, highlight, kinds, recipes, recycle, story, story_batch, theme, translate
 from .dialogs import ask_text
 from .thumbs import ThumbCache
-from .widgets import AddButton, with_inset
+from .widgets import AddButton, HScrollArea, with_inset
 
 ENGLISH = "英語に直し"  # LLM の仕事の名前 (「英語に直し中…」「英語に直しに失敗しました」)
 TRANSLATE_DELAY_MS = 900  # 送るプロンプトを直して、これだけ止まったら訳し直す
@@ -689,7 +689,7 @@ class StoryView(QWidget):
         self.board = QHBoxLayout(self.board_host)
         self.board.setContentsMargins(4, 4, 4, 4)
         self.board.setSpacing(0)
-        scroll = QScrollArea()
+        scroll = HScrollArea()
         scroll.setWidget(self.board_host)
         scroll.setWidgetResizable(True)
         scroll.setFixedHeight(190)

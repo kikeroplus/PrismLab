@@ -26,10 +26,11 @@ def _hint(text: str) -> QLabel:
 class StageDialog(QDialog):
     """1 つのステップの設定。OK で stage を書き換える。"""
 
-    def __init__(self, stage: recipes.Stage, parent=None):
+    def __init__(self, stage: recipes.Stage, parent=None, running: bool = False):
+        """running: 動いている量産のステップを直す (ワークフローは変えられない。これからそのステップに来る件から効く)。"""
         super().__init__(parent)
         self.stage = stage
-        self.setWindowTitle(f"ステップの設定: {recipes.STAGE_TITLES[stage.type]}")
+        self.setWindowTitle(f"ステップの設定: {recipes.STAGE_TITLES[stage.type]}" + (" (量産中)" if running else ""))
         self.resize(520, 0)
         box = QVBoxLayout(self)
         form = QFormLayout()
@@ -195,7 +196,14 @@ class StageDialog(QDialog):
             form.addRow("", self.base_text)
             self.workflow.currentIndexChanged.connect(self._workflow_changed)
             self._fill_workflows(stage.workflow)
+            if running:
+                # ワークフローは量産中は直さない運用 (2026-11-19)。長さ・ベースプロンプトは直せる
+                self.workflow.setEnabled(False)
+                edit.setEnabled(False)
 
+        if running:
+            box.addWidget(_hint("量産中です。OK すると、これからこのステップに来る件から新しい中身で進みます "
+                                "(もう通った件はそのまま)。"))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
@@ -333,7 +341,8 @@ class StageDialog(QDialog):
                 return
             s.folder = str(Path(folder))
         else:
-            s.workflow = str(self.workflow.currentData() or "")
+            if self.workflow.isEnabled():  # 量産中は変えない (一覧になくても元のまま)
+                s.workflow = str(self.workflow.currentData() or "")
             s.seconds = self.seconds.value() if self.use_seconds.isChecked() and self.use_seconds.isEnabled() else None
             s.base_prompt = self.base.isChecked()
         self.accept()
