@@ -35,7 +35,9 @@ STAGE_ORDER = (READ, ENHANCE, TRANSLATE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, G
 MAX_SPLIT = 20  # 増やすの数の上限
 MEMO_TYPES = (SAVE, LOAD)
 DEFAULT_MEMO = "メモ 1"
-REPLACE, APPEND = "replace", "append"  # 思い出すとき: 今の文を置き換える / 今の文の後ろに足す
+# 思い出すとき: 今の文を置き換える / 今の文の後ろに足す / 今の文の前に足す (前は 2026-11-20 利用者の希望)
+REPLACE, APPEND, PREPEND = "replace", "append", "prepend"
+MEMO_MODES = (REPLACE, APPEND, PREPEND)
 ADD_TYPES = (TEXT, INSERT)  # プロンプトに文を足すステップ (盛るより前なら一緒に盛り、あとならそのまま付ける)
 IMAGE_EXTS = reader.IMAGE_EXTS
 
@@ -52,7 +54,9 @@ class Stage:
     text: str = ""  # 追加テキストの文
     folder: str = ""  # 差し込みのフォルダ
     memo: str = ""  # 覚える・思い出すのメモの名前
-    mode: str = REPLACE  # 思い出すとき: 置き換える / 後ろに足す
+    mode: str = REPLACE  # 思い出すとき: 置き換える / 後ろに足す / 前に足す
+    front: bool = False  # 追加テキスト・差し込み: それまでの文の前に足す (2026-11-20 利用者の希望。既定は後ろ)
+    label: str = ""  # 追加テキスト・差し込みの名前 (2026-11-20 利用者の希望。中身が分かるように。空なら種類の名前)
     bypass: bool = False  # バイパス (このステップを飛ばして、前のものをそのまま次に渡す)
     # 一緒にバイパスにしたまとまりの印 (2026-11-19 利用者の希望)。読み取りを外すと元の文がなくなる盛るも一緒に入り、
     # どれかを外すとまとまりの全部が戻る。空 = 1 つだけで入れた
@@ -81,13 +85,25 @@ class Stage:
         s.text = str(data.get("text") or "")
         s.folder = str(data.get("folder") or "")
         s.memo = str(data.get("memo") or "")
-        s.mode = APPEND if data.get("mode") == APPEND else REPLACE
+        s.mode = data.get("mode") if data.get("mode") in MEMO_MODES else REPLACE
+        s.front = bool(data.get("front", False))
+        s.label = str(data.get("label") or "").strip()
         s.bypass = bool(data.get("bypass", False))
         s.bypass_group = str(data.get("bypass_group") or "") if s.bypass else ""
         s.count = _int_in(data.get("count"), 2, 2, MAX_SPLIT)
         s.stars = _int_in(data.get("stars"), 3, 1, 5)
         s.rules = str(data.get("rules") or "")
         return s
+
+
+def stage_title(stage) -> str:
+    """札などに出すステップの名前: 名前を付けた追加テキスト・差し込みはその名前、ほかは種類の名前。
+    stage は Stage か、量産の写し (dict)。"""
+    if isinstance(stage, dict):
+        t, label = stage.get("type"), str(stage.get("label") or "")
+    else:
+        t, label = stage.type, stage.label
+    return label if label and t in ADD_TYPES else STAGE_TITLES.get(t, "")
 
 
 def _int_in(value, default: int, low: int, high: int) -> int:

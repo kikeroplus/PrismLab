@@ -463,6 +463,48 @@ wait(eng19)
 sent_b = eng19.run.items[0].outputs[1]["sent"]
 check(eng19.run.items[0].state == engine.DONE and sent_b.startswith("a photo") and "a red fox in snow" in sent_b
       and sent_b.index("a photo") < sent_b.index("a red fox"), f"19: 後ろに足す: 読み取った説明のあとに覚えた文 ({sent_b!r})")
+# 前に足す (2026-11-20): 覚えた文 + 読み取った説明
+load_pre = S(recipes.LOAD, memo="T2I の文", mode=recipes.PREPEND)
+check(recipes.Stage.from_dict(load_pre.to_dict()).mode == recipes.PREPEND, "19: 前に足すを保存して読み戻せる")
+r19c = recipe("19c", txt, [save_m, t2i, S(recipes.READ, reader=READER, reread=True), load_pre, i2v])
+r19c.source = recipes.TEXTS
+eng19.start(engine.Run.create(r19c, recipes.list_texts(str(txt))[:1]))
+wait(eng19)
+sent_c = eng19.run.items[0].outputs[1]["sent"]
+check(eng19.run.items[0].state == engine.DONE and sent_c.startswith("a red fox in snow") and "a photo" in sent_c,
+      f"19: 前に足す: 覚えた文のあとに読み取った説明 ({sent_c!r})")
+# 追加テキスト・差し込みを前に足す: 盛る前は盛る元の文の前、盛ったあとは盛った文の前 (ベースプロンプトは最後のまま)
+r19d = recipe("19d", txt, [S(recipes.TEXT, text="FRONT_A", front=True), S(recipes.TEXT, text="BACK_A"),
+                           S(recipes.ENHANCE, enhancer=ENHANCER), S(recipes.TEXT, text="FRONT_B", front=True),
+                           S(recipes.INSERT, folder=str(lines), front=True), t2i])
+r19d.source = recipes.TEXTS
+check(recipes.Stage.from_dict(r19d.stages[0].to_dict()).front, "19: 前に足すを保存して読み戻せる (追加テキスト)")
+eng19.start(engine.Run.create(r19d, recipes.list_texts(str(txt))[:1]))
+wait(eng19)
+it_d = eng19.run.items[0]
+sent_d = it_d.outputs[0]["sent"] if it_d.outputs else ""
+first = sent_d.split("\n")
+# 偽の盛るは元の文の最後の行 + enhanced を返す → BACK_A が最後 (FRONT_A は前に入った)
+check(it_d.state == engine.DONE and len(first) >= 3 and first[0] == "says goodbye" and first[1] == "FRONT_B"
+      and first[2] == "BACK_A enhanced", f"19: 前に足す: 差し込み → 追加テキスト → 盛った文 ({sent_d!r})")
+# 名前 (2026-11-20): 札の名前を保存し、記録の name にも使う。空なら種類の名前
+named = S(recipes.TEXT, text="x", label="カメラワーク")
+check(recipes.Stage.from_dict(named.to_dict()).label == "カメラワーク" and recipes.stage_title(named) == "カメラワーク"
+      and recipes.stage_title(S(recipes.INSERT)) == "差し込み"
+      and recipes.stage_title(engine.stage_snapshot(named)) == "カメラワーク", "19: 追加テキスト・差し込みの名前")
+it_n = engine.Item("x.txt")
+eng19._add_text(it_n, engine.stage_snapshot(named))
+eng19._add_text(it_n, engine.stage_snapshot(S(recipes.TEXT, text="y", front=True)))
+check([(a["name"], bool(a.get("front"))) for a in it_n.adds] == [("カメラワーク", False), ("追加テキスト", True)],
+      f"19: 記録の name は付けた名前 (なければ種類の名前)・前に足す印 ({it_n.adds!r})")
+r19e = recipe("19e", txt, [S(recipes.TEXT, text="FRONT_A", front=True, label="前"), S(recipes.TEXT, text="BACK_A"),
+                           S(recipes.TEXT, text="FRONT_B", front=True), t2i])
+r19e.source = recipes.TEXTS
+eng19.start(engine.Run.create(r19e, recipes.list_texts(str(txt))[:1]))
+wait(eng19)
+sent_e = eng19.run.items[0].outputs[0]["sent"].split("\n")
+check(sent_e[:2] == ["FRONT_B", "FRONT_A"] and sent_e[2].startswith("a red fox in snow") and sent_e[3] == "BACK_A",
+      f"19: 前に足す: あとのものほど前、元の文のあとに後ろに足した文 ({sent_e!r})")
 eng19.stop_threads()
 
 # 20. 量産中にステップの中身を直す (2026-11-19): これからそのステップに来る件から効く。ワークフロー・種類は変えない

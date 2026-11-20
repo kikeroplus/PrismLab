@@ -162,6 +162,14 @@ titles = [c.title.text() for c in lv.stage_cards]
 assert titles == ["読み取り", "追加テキスト", "盛る", "差し込み", "生成"], titles
 assert "次: 001.txt (1 / 3)" in lv.stage_cards[3].detail.text(), lv.stage_cards[3].detail.text()
 window.grab().save(str(OUT / "prismlab_add_steps.png"))
+# 名前と前に足す (2026-11-20): 見出しは名前 (種類は重ねたときに出す)、説明の頭に [前に足す]
+lv.recipe.stages[1].label, lv.recipe.stages[3].label, lv.recipe.stages[3].front = "カメラ", "セリフ", True
+lv.refresh(rebuild=True)
+pump(0.5)
+titles = [c.title.text() for c in lv.stage_cards]
+assert titles == ["読み取り", "カメラ", "盛る", "セリフ", "生成"], titles
+assert lv.stage_cards[3].detail.text().startswith("[前に足す] "), lv.stage_cards[3].detail.text()
+window.grab().save(str(OUT / "prismlab_add_named.png"))
 lv.recipe.stages = [recipes.Stage.from_dict(d) for d in saved]
 lv._save_recipes()
 lv.refresh(rebuild=True)

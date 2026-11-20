@@ -5,9 +5,9 @@ from typing import Optional
 
 from pathlib import Path
 
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-                               QSpinBox, QVBoxLayout)
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+                               QPushButton, QRadioButton, QSpinBox, QVBoxLayout)
 
 from gencommon import comfy, enhancer, inserts, reader, settings
 from gencommon.comfy_dialogs import ComfySettingsDialog
@@ -23,6 +23,19 @@ def _hint(text: str) -> QLabel:
     return label
 
 
+def _choice_row(parent, labels: list[str], current: int):
+    """横に並べたラジオボタン (戻り値は (並び, グループ)。checkedId が選んだ番号)。"""
+    row = QHBoxLayout()
+    group = QButtonGroup(parent)
+    for n, text in enumerate(labels):
+        b = QRadioButton(text)
+        b.setChecked(n == current)
+        group.addButton(b, n)
+        row.addWidget(b)
+    row.addStretch(1)
+    return row, group
+
+
 class StageDialog(QDialog):
     """1 つのステップの設定。OK で stage を書き換える。"""
 
@@ -35,6 +48,11 @@ class StageDialog(QDialog):
         box = QVBoxLayout(self)
         form = QFormLayout()
         box.addLayout(form)
+        if stage.type in recipes.ADD_TYPES:
+            # 名前 (2026-11-20 利用者の希望): 札の見出しに出して、中身を分かりやすくする
+            self.label = QLineEdit(stage.label)
+            self.label.setPlaceholderText(f"(空なら「{recipes.STAGE_TITLES[stage.type]}」)  例: セリフ・カメラワーク・画質")
+            form.addRow("名前", self.label)
 
         if stage.type == recipes.READ:
             self.preset = QComboBox()
@@ -66,7 +84,9 @@ class StageDialog(QDialog):
             self.text.setPlaceholderText("例: slow camera pan, cinematic lighting")
             self.text.setMinimumHeight(120)
             form.addRow("足す文", self.text)
-            box.addWidget(_hint("前のステップまでのプロンプトに、改行してこの文を足します (どの画像にも同じ文)。"
+            row, self.place = _choice_row(self, ["後ろに足す", "前に足す"], 1 if stage.front else 0)
+            form.addRow("足す場所", row)
+            box.addWidget(_hint("前のステップまでのプロンプトの後ろ (前) に、改行してこの文を足します (どの画像にも同じ文)。"
                                 "「盛る」より前に置くと一緒に盛り、あとに置くと盛った文にそのまま付けます。\n"
                                 "ワイルドカード: {red|blue|white} と書くと、1 件ごとにどれか 1 つを選びます"
                                 " (入れ子もできます。| のない {…} はそのまま送ります)。"))
@@ -86,11 +106,12 @@ class StageDialog(QDialog):
                                     "あとの「思い出す」で同じ名前を選ぶと、その文を使えます"
                                     " (例: 盛る → 覚える → T2I → 思い出す → I2V で、T2I と同じ文を I2V にも送る)。"))
             else:
-                self.replace = QCheckBox("今の文を置き換える (外すと、今の文の後ろに足す)")
-                self.replace.setChecked(stage.mode != recipes.APPEND)
-                form.addRow("", self.replace)
+                row, self.place = _choice_row(self, ["今の文を置き換える", "今の文の後ろに足す", "今の文の前に足す"],
+                                              recipes.MEMO_MODES.index(stage.mode))
+                form.addRow("戻し方", row)
                 box.addWidget(_hint("前の「覚える」で覚えた文を戻します。置き換えるときは覚えた時点の状態 (盛った文・足した文も) "
-                                    "にそっくり戻します。後ろに足すときは、今の文 (読み取った説明など) のあとに、覚えた文をつなげます。"
+                                    "にそっくり戻します。後ろ (前) に足すときは、今の文 (読み取った説明など) のあと (前) に、"
+                                    "覚えた文をつなげます。"
                                     "このあとに「盛る」を置けば、それを盛ります。"))
         elif stage.type == recipes.TRANSLATE:
             edit = QPushButton("エンハンサーの設定...")
@@ -158,7 +179,10 @@ class StageDialog(QDialog):
             nrow.addWidget(self.next_note, 1)
             nrow.addWidget(self.restart)
             form.addRow("", nrow)
-            box.addWidget(_hint("フォルダの .txt を名前順に、1 枚ごとに 1 つずつ足します。最後まで使ったら最初に戻ります。"
+            row, self.place = _choice_row(self, ["後ろに足す", "前に足す"], 1 if stage.front else 0)
+            form.addRow("足す場所", row)
+            box.addWidget(_hint("フォルダの .txt を名前順に、1 枚ごとに 1 つずつ、それまでのプロンプトの後ろ (前) に足します。"
+                                "最後まで使ったら最初に戻ります。"
                                 "どこまで使ったかは PromptWordCrafter・ImageMimicArt・J-Rate の差し込みと共有で、"
                                 "次の量産はその続きから使います (「1 枚で試す」では進めません)。"
                                 "「盛る」より前に置くと一緒に盛り、あとに置くとそのまま付けます (セリフを一字一句守るならあと)。"))
@@ -305,6 +329,8 @@ class StageDialog(QDialog):
 
     def _accept(self) -> None:
         s = self.stage
+        if s.type in recipes.ADD_TYPES:
+            s.label = self.label.text().strip()
         if s.type == recipes.READ:
             s.reader = str(self.preset.currentData() or "")
             s.reread = self.reread.isChecked()
@@ -316,10 +342,11 @@ class StageDialog(QDialog):
                 QMessageBox.warning(self, "追加テキスト", "足す文を入れてください。")
                 return
             s.text = text
+            s.front = self.place.checkedId() == 1
         elif s.type in recipes.MEMO_TYPES:
             s.memo = self.memo.currentText().strip() or recipes.DEFAULT_MEMO
             if s.type == recipes.LOAD:
-                s.mode = recipes.REPLACE if self.replace.isChecked() else recipes.APPEND
+                s.mode = recipes.MEMO_MODES[max(0, self.place.checkedId())]
         elif s.type in (recipes.FRAME, recipes.TRANSLATE):
             pass
         elif s.type == recipes.SPLIT:
@@ -340,6 +367,7 @@ class StageDialog(QDialog):
                 QMessageBox.warning(self, "差し込み", str(exc))
                 return
             s.folder = str(Path(folder))
+            s.front = self.place.checkedId() == 1
         else:
             if self.workflow.isEnabled():  # 量産中は変えない (一覧になくても元のまま)
                 s.workflow = str(self.workflow.currentData() or "")

@@ -153,9 +153,10 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         elif stage.type == recipes.ENHANCE:
             snap["enhancer"] = {"name": stage.enhancer}
         elif stage.type == recipes.TEXT:
-            snap["text"] = stage.text
+            snap["text"], snap["front"], snap["label"] = stage.text, stage.front, stage.label
         elif stage.type == recipes.INSERT:
             snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name if stage.folder else ""
+            snap["front"], snap["label"] = stage.front, stage.label
         elif stage.type in recipes.MEMO_TYPES:
             snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
         elif stage.type in (recipes.FRAME, recipes.SPLIT, recipes.GATE, recipes.SUB, recipes.TRANSLATE):
@@ -181,13 +182,14 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
     elif stage.type == recipes.TEXT:
         if not stage.text.strip():
             raise ValueError("追加テキストのステップの文が空です。")
-        snap["text"] = stage.text.strip()
+        snap["text"], snap["front"], snap["label"] = stage.text.strip(), stage.front, stage.label
     elif stage.type == recipes.INSERT:
         try:
             inserts.list_files(stage.folder)
         except inserts.InsertError as exc:
             raise ValueError(f"差し込みのステップ: {exc}") from exc
         snap["folder"], snap["name"] = stage.folder, Path(stage.folder).name
+        snap["front"], snap["label"] = stage.front, stage.label
     elif stage.type in recipes.MEMO_TYPES:
         snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
     elif stage.type == recipes.FRAME:
@@ -395,8 +397,8 @@ def _cancel_prompts(pairs: list) -> None:
 
 def _sent_body(text: Optional[str], enhanced: Optional[str], adds: list) -> str:
     """その状態で生成に送る文 (ベースプロンプトは除く。GenRequest.full_prompt と同じ組み立て)。"""
-    head = enhanced if enhanced is not None else inserts.join(text, *inserts.texts(adds, True))
-    return inserts.join(head, *inserts.texts(adds, False))
+    head = enhanced if enhanced is not None else inserts.wrap(text, adds, True)
+    return inserts.wrap(head, adds, False)
 
 
 def needs_english(text) -> bool:
@@ -852,7 +854,7 @@ class Engine(QObject):
                     self.changed.emit()
                     return
             else:
-                source = inserts.join(it.text, *inserts.texts(it.adds, True))  # 読み取った文 + 盛る前に足した文
+                source = inserts.wrap(it.text, it.adds, True)  # 読み取った文 + 盛る前に足した文 (前に足すものは前)
                 if not source.strip():
                     raise llm.LLMError("盛る元の文がありません。前に読み取り・追加テキスト・差し込みのステップを置いてください。")
                 self._set_status(it, "AI で盛っています...")
@@ -871,24 +873,28 @@ class Engine(QObject):
             self.llm_status = ""
 
     def _add_text(self, it: Item, stage: dict) -> None:
-        """追加テキスト・差し込みの文を足す。まだ盛っていなければ盛る前 (このあとの盛るに渡す)、盛ったあとならそのまま付ける。"""
+        """追加テキスト・差し込みの文を足す。まだ盛っていなければ盛る前 (このあとの盛るに渡す)、盛ったあとならそのまま付ける。
+        front なら、それまでの文の前に足す (組み立ては inserts.wrap)。"""
         before = it.enhanced is None
         if stage["type"] == recipes.TEXT:
             # {a|b|c} は 1 件ごとに 1 つ選ぶ (選んだ文を記録に残す)
-            add = {"slot": -1, "name": "追加テキスト", "folder": "", "before": before, "file": "",
+            add = {"slot": -1, "name": recipes.stage_title(stage), "folder": "", "before": before, "file": "",
                    "text": recipes.expand_wildcards(str(stage.get("text") or ""))}
         else:
             planned = it.plan.get(plan_key(it.stage, it.branch)) or it.plan.get(str(it.stage))
             if not planned:
                 raise ValueError("差し込みのファイルが割り当てられていません (始め直してください)。")
-            add = {"slot": -1, "name": "差し込み", "folder": str(planned.get("folder") or ""), "before": before,
+            add = {"slot": -1, "name": recipes.stage_title(stage), "folder": str(planned.get("folder") or ""),
+                   "before": before,
                    "file": str(planned.get("file") or ""), "text": str(planned.get("text") or "")}
+        if stage.get("front"):
+            add["front"] = True
         with self._cond:
             it.adds.append(add)
 
     def _memo(self, it: Item, stage: dict) -> None:
         """覚える: その時点のプロンプト (元の文・盛った文・足した文) をメモに写す。
-        思い出す: メモから戻す。置き換えるならそっくり戻し、後ろに足すなら、今の状態で送る文の後ろに、
+        思い出す: メモから戻す。置き換えるならそっくり戻し、後ろに足す (前に足す) なら、今の状態で送る文の後ろ (前) に、
         メモの状態で送る文をつなげる (それを元の文にする。あとに盛るを置けば一緒に盛る)。"""
         name = str(stage.get("memo") or recipes.DEFAULT_MEMO)
         with self._cond:
@@ -901,8 +907,9 @@ class Engine(QObject):
             text, enhanced = memo.get("text"), memo.get("enhanced")
             adds = [dict(a) for a in memo.get("adds") or [] if isinstance(a, dict)]
             has_now = it.text is not None or it.enhanced is not None or bool(it.adds)
-            if stage.get("mode") == recipes.APPEND and has_now:
-                it.text = inserts.join(_sent_body(it.text, it.enhanced, it.adds), _sent_body(text, enhanced, adds))
+            if stage.get("mode") in (recipes.APPEND, recipes.PREPEND) and has_now:
+                now, mine = _sent_body(it.text, it.enhanced, it.adds), _sent_body(text, enhanced, adds)
+                it.text = inserts.join(mine, now) if stage.get("mode") == recipes.PREPEND else inserts.join(now, mine)
                 it.enhanced, it.adds = None, []
             else:
                 it.text, it.enhanced, it.adds = text, enhanced, adds

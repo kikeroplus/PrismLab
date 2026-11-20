@@ -42,7 +42,19 @@ def _memo_detail(stage_type: str, memo: str, mode) -> str:
     name = memo or recipes.DEFAULT_MEMO
     if stage_type == recipes.SAVE:
         return f"メモ「{name}」に覚える"
-    return f"メモ「{name}」から" + ("後ろに足す" if mode == recipes.APPEND else "戻す (置き換える)")
+    return f"メモ「{name}」から" + {recipes.APPEND: "後ろに足す", recipes.PREPEND: "前に足す"}.get(mode, "戻す (置き換える)")
+
+
+def _named_title(stage) -> str:
+    """名前を付けた追加テキスト・差し込みの見出し (名前だけ。札の幅に「種類: 名前」は入らないので、種類は重ねたときに出す)。
+    名前がなければ空 (種類の名前のまま)。"""
+    label = stage.get("label") if isinstance(stage, dict) else stage.label
+    return str(label or "")
+
+
+def _front_mark(front) -> str:
+    """追加テキスト・差し込みを前に足すときの印 (札の説明の頭に付ける)。"""
+    return "[前に足す] " if front else ""
 
 
 # ステップの種類の短い説明 (メニューの項目に重ねると横に出す。2026-11-18 利用者の希望)
@@ -54,7 +66,7 @@ STAGE_HELP = {
     recipes.INSERT: "フォルダの .txt (セリフ・アクションなど) を、1 件ごとに順に足します。",
     recipes.SUB: "プロンプトの語を置き換える・消します (1 行に「元 => 先」)。",
     recipes.SAVE: "この時点のプロンプトを名前のメモに覚えます (生成を通っても残る)。",
-    recipes.LOAD: "「覚える」で覚えたプロンプトを戻します (置き換える / 後ろに足す)。",
+    recipes.LOAD: "「覚える」で覚えたプロンプトを戻します (置き換える / 後ろに足す / 前に足す)。",
     recipes.SPLIT: "そこから先を N 本に分けます。前の読み取りは 1 回で、盛る・差し込みは 1 本ずつ変わります。",
     recipes.GATE: "J-Rate で★を付けたものだけ先へ進めます。ほかは★待ちで止めます。",
     recipes.FRAME: "前の生成で出来た動画の最後のコマを画像にして、次へ渡します。",
@@ -427,12 +439,17 @@ class LineView(QWidget):
                 elif s["type"] == recipes.TRANSLATE:
                     v["detail"] = "LLM: " + str(s.get("model") or "(エンハンサーと同じ)")
                 elif s["type"] == recipes.TEXT:
-                    v["detail"] = self._short(s.get("text", ""))
+                    v["detail"] = _front_mark(s.get("front")) + self._short(s.get("text", ""))
+                    v["front"] = bool(s.get("front"))
+                    v["title"] = _named_title(s)
                 elif s["type"] == recipes.INSERT:
-                    v["detail"] = "フォルダ: " + str(s.get("name", ""))
+                    v["detail"] = _front_mark(s.get("front")) + "フォルダ: " + str(s.get("name", ""))
+                    v["front"] = bool(s.get("front"))
+                    v["title"] = _named_title(s)
                 elif s["type"] in recipes.MEMO_TYPES:
                     v["detail"] = _memo_detail(s["type"], str(s.get("memo", "")), s.get("mode"))
-                    v["append"] = s.get("mode") == recipes.APPEND
+                    v["append"] = s.get("mode") in (recipes.APPEND, recipes.PREPEND)
+                    v["front"] = s.get("mode") == recipes.PREPEND
                 elif s["type"] in TOOL_TYPES:
                     rules = s.get("rules") or []
                     v["count"], v["stars"] = int(s.get("count") or 2), int(s.get("stars") or 1)
@@ -455,7 +472,8 @@ class LineView(QWidget):
             elif s.type == recipes.TRANSLATE:
                 v["detail"] = "LLM: " + settings.enhance_model()
             elif s.type == recipes.TEXT:
-                v["detail"] = self._short(s.text) if s.text.strip() else "(足す文を入れてください)"
+                v["detail"] = _front_mark(s.front) + self._short(s.text) if s.text.strip() else "(足す文を入れてください)"
+                v["front"], v["title"] = s.front, _named_title(s)
             elif s.type == recipes.INSERT:
                 if not s.folder:
                     v["detail"] = "(フォルダを選んでください)"
@@ -464,10 +482,12 @@ class LineView(QWidget):
                         nxt = inserts.peek(s.folder).describe()
                     except inserts.InsertError as exc:
                         nxt = str(exc)
-                    v["detail"] = f"フォルダ: {Path(s.folder).name}\n{nxt}"
+                    v["detail"] = f"{_front_mark(s.front)}フォルダ: {Path(s.folder).name}\n{nxt}"
+                v["front"], v["title"] = s.front, _named_title(s)
             elif s.type in recipes.MEMO_TYPES:
                 v["detail"] = _memo_detail(s.type, s.memo, s.mode)
-                v["append"] = s.mode == recipes.APPEND
+                v["append"] = s.mode in (recipes.APPEND, recipes.PREPEND)
+                v["front"] = s.mode == recipes.PREPEND
             elif s.type in TOOL_TYPES:
                 v["count"], v["stars"] = s.count, s.stars
                 v["detail"] = _tool_detail(s.type, s.count, s.stars, recipes.parse_rules(s.rules))
@@ -583,7 +603,9 @@ class LineView(QWidget):
         for i, v in enumerate(views):
             self.flow.addWidget(self._insert_arrow(i))
             card = Card()
-            card.title.setText(recipes.STAGE_TITLES[v["type"]])
+            card.title.setText(v.get("title") or recipes.STAGE_TITLES[v["type"]])
+            if v.get("title"):
+                card.title.setToolTip(f"{recipes.STAGE_TITLES[v['type']]}: {v['title']}")
             card.detail.setText(v["detail"] + (f"  ・ {v['seconds']:g} 秒" if v.get("seconds") else ""))
             if v["bypass"]:
                 # バイパス: 前のものをそのまま次に渡す (流れる中身は変えない)
@@ -614,8 +636,9 @@ class LineView(QWidget):
                 if v["type"] == recipes.SAVE:
                     card.io.setText(io_html([src, "→", src, "+", ("メモ", kinds.TEXT_COLOR)]))
                 else:
-                    card.io.setText(io_html(([src, "+"] if has_text and v.get("append") else [])
-                                            + [("メモ", kinds.TEXT_COLOR), "→", src]))
+                    memo = ("メモ", kinds.TEXT_COLOR)
+                    joined = [memo, "+", src] if v.get("front") else [src, "+", memo]
+                    card.io.setText(io_html((joined if has_text and v.get("append") else [memo]) + ["→", src]))
                     has_text = True
                 card.thumbs.hide()
             elif v["type"] == recipes.FRAME:
@@ -650,7 +673,9 @@ class LineView(QWidget):
                 card.chip.set("文字", kinds.TEXT_COLOR)
                 card.set_color(kinds.TEXT_COLOR)
                 src = ("文字", kinds.TEXT_COLOR)
-                card.io.setText(io_html(([src, "+"] if has_text else []) + [("足す", kinds.TEXT_COLOR), "→", src]))
+                add = ("足す", kinds.TEXT_COLOR)
+                joined = ([add, "+", src] if v.get("front") else [src, "+", add]) if has_text else [add]
+                card.io.setText(io_html(joined + ["→", src]))
                 has_text = True
                 card.thumbs.hide()
             else:
@@ -747,14 +772,14 @@ class LineView(QWidget):
             return
         LineView.clipboard = [s.to_dict() for s in stages]
         LineView.clipboard_from = self.recipe.name
-        what = recipes.STAGE_TITLES.get(stages[0].type, "") if len(stages) == 1 else f"{len(stages)} 個のステップ"
+        what = recipes.stage_title(stages[0]) if len(stages) == 1 else f"{len(stages)} 個のステップ"
         self.status.emit(f"「{what}」をコピーしました。ほかのレシピでも、ステップの右クリックか → の挿入で貼り付けられます。")
 
     @staticmethod
     def _paste_title() -> str:
         clip = LineView.clipboard
         if len(clip) == 1:
-            return f"貼り付け: {recipes.STAGE_TITLES.get(clip[0].get('type'), '?')}"
+            return f"貼り付け: {recipes.stage_title(clip[0]) or '?'}"
         return f"貼り付け: {len(clip)} 個のステップ"
 
     def _paste_stages(self, index: int) -> None:
@@ -916,7 +941,7 @@ class LineView(QWidget):
 
     def _others_text(self, indexes: list, index: int) -> str:
         """一緒に入る・戻るステップの名前 (「盛る」「置き換え」)。"""
-        return "・".join(f"「{recipes.STAGE_TITLES[self.recipe.stages[j].type]}」" for j in indexes if j != index)
+        return "・".join(f"「{recipes.stage_title(self.recipe.stages[j])}」" for j in indexes if j != index)
 
     def _bypass_with_text(self, index: int) -> str:
         """右クリックの「バイパス」に添える、一緒に入る・戻るもの。"""
