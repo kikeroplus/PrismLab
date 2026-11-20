@@ -11,10 +11,11 @@ from gencommon.diagram_dialog import LLM_LINE
 from gencommon.set_cards import KIND_COLORS
 
 __all__ = ["KIND_COLORS", "LLM_LINE", "TEXT_COLOR", "IMAGE_COLOR", "kind_of", "color_of", "is_video",
-           "has_reference", "has_last_frame"]
+           "has_reference", "has_last_frame", "needs_source", "REF_COLOR"]
 
 TEXT_COLOR = "#9aa3b3"  # 文字 (プロンプト) の札
 IMAGE_COLOR = KIND_COLORS["I2I"]  # 入口の画像の札 (画像は I2I と同じ緑)
+REF_COLOR = "#ffab91"  # リファレンス (顔) の札 (肌の色に近い淡いサーモン。ほかの種類の色と紛れないもの)
 
 _cache: dict = {}  # (パスの小文字, 更新日時) → 種類 ("" = 読めない)
 _lock = threading.Lock()
@@ -75,6 +76,18 @@ def has_reference(workflow_path: str) -> bool:
 def has_last_frame(workflow_path: str) -> bool:
     """ラストフレームを入れる LoadImage があるか (タイトルに last / end / ラスト など。comfy.last_frame_nodes)。"""
     return _has("last", comfy.has_last_frame, workflow_path)
+
+
+def _has_source_node(wf: dict) -> bool:
+    return any(not comfy.is_reference_node(n) and not comfy.is_last_frame_node(n) for n in comfy._load_image_nodes(wf))
+
+
+def needs_source(workflow_path: str) -> bool:
+    """元画像を入れる LoadImage (リファレンス用・ラストフレーム用でないもの) があるか。
+    ないもの (T2I にリファレンスの顔だけ入れる など) は、リファレンスを渡せば元画像なしで動く。読めなければ True。"""
+    if not workflow_path:
+        return True
+    return _has("source", _has_source_node, workflow_path) or not Path(workflow_path).is_file()
 
 
 def color_of(kind: str) -> str:

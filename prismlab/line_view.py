@@ -70,6 +70,8 @@ STAGE_HELP = {
     recipes.SPLIT: "そこから先を N 本に分けます。前の読み取りは 1 回で、盛る・差し込みは 1 本ずつ変わります。",
     recipes.GATE: "J-Rate で★を付けたものだけ先へ進めます。ほかは★待ちで止めます。",
     recipes.FRAME: "前の生成で出来た動画の最後のコマを画像にして、次へ渡します。",
+    recipes.REF_IMAGE: "決めた 1 枚の画像を、このあとの生成のリファレンス (顔など) に使います。",
+    recipes.REF_FOLDER: "フォルダの画像を 1 件ごとに 1 枚ずつ、このあとの生成のリファレンス (顔など) に使います。",
     recipes.GEN: "ComfyUI のワークフローで画像・動画を作ります (T2I / I2I / I2V など)。",
 }
 
@@ -92,6 +94,22 @@ def _tool_detail(stage_type: str, count: int, stars: int, rules: list) -> str:
         return "(置き換える語を入れてください)"
     first = f"{rules[0][0]} → {rules[0][1] or '(消す)'}"
     return first + (f" ほか {len(rules) - 1} 個" if len(rules) > 1 else "")
+
+
+def _ref_detail(stage_type: str, image: str, folder: str, shuffle: bool) -> str:
+    """リファレンスの札の説明。"""
+    if stage_type == recipes.REF_IMAGE:
+        return f"画像: {Path(image).name}" if image else "(画像を選んでください)"
+    if not folder:
+        return "(フォルダを選んでください)"
+    return f"フォルダ: {Path(folder).name}" + ("  ・ ランダム" if shuffle else "  ・ 名前順")
+
+
+def _ref_files(stage_type: str, image: str, folder: str) -> list[str]:
+    """リファレンスの札に並べる画像 (1 枚ならそれ、フォルダなら先頭の 3 枚)。"""
+    if stage_type == recipes.REF_IMAGE:
+        return [image] if image and Path(image).is_file() else []
+    return [str(p) for p in recipes.list_images(folder)[:3]] if folder else []
 
 
 def find_jrate() -> Optional[Path]:
@@ -450,6 +468,10 @@ class LineView(QWidget):
                     v["detail"] = _memo_detail(s["type"], str(s.get("memo", "")), s.get("mode"))
                     v["append"] = s.get("mode") in (recipes.APPEND, recipes.PREPEND)
                     v["front"] = s.get("mode") == recipes.PREPEND
+                elif s["type"] in recipes.REF_TYPES:
+                    image, folder = str(s.get("image") or ""), str(s.get("folder") or "")
+                    v["detail"] = _ref_detail(s["type"], image, folder, bool(s.get("shuffle")))
+                    v["refs"] = _ref_files(s["type"], image, folder)
                 elif s["type"] in TOOL_TYPES:
                     rules = s.get("rules") or []
                     v["count"], v["stars"] = int(s.get("count") or 2), int(s.get("stars") or 1)
@@ -488,6 +510,9 @@ class LineView(QWidget):
                 v["detail"] = _memo_detail(s.type, s.memo, s.mode)
                 v["append"] = s.mode in (recipes.APPEND, recipes.PREPEND)
                 v["front"] = s.mode == recipes.PREPEND
+            elif s.type in recipes.REF_TYPES:
+                v["detail"] = _ref_detail(s.type, s.image, s.folder, s.shuffle)
+                v["refs"] = _ref_files(s.type, s.image, s.folder)
             elif s.type in TOOL_TYPES:
                 v["count"], v["stars"] = s.count, s.stars
                 v["detail"] = _tool_detail(s.type, s.count, s.stars, recipes.parse_rules(s.rules))
@@ -595,6 +620,7 @@ class LineView(QWidget):
         self.flow.addWidget(self.entry)
 
         self.stage_cards: list[Card] = []
+        self._ref_thumbs: dict = {}  # リファレンスの札の番号 → 並べる画像
         views = self._stage_views()
         running_now = showing
         problems = set() if running_now else recipes.line_problems(self.recipe.stages, text_entry=texts)
@@ -648,6 +674,23 @@ class LineView(QWidget):
                 card.io.setText(io_html([prev_out, "→", ("画像", kinds.IMAGE_COLOR)]))
                 prev_out = ("画像", kinds.IMAGE_COLOR)
                 card.thumbs.hide()
+            elif v["type"] in recipes.REF_TYPES:
+                # リファレンス: 流れている画像・文はそのままで、あとの生成に渡すリファレンスを決める
+                # 見出しは「リファレンス」だけ (「リファレンス (フォルダ)」は札の幅に入らない)。1 枚 / フォルダは印で見せる
+                card.title.setText("リファレンス")
+                card.title.setToolTip(recipes.STAGE_TITLES[v["type"]])
+                card.chip.set("1 枚" if v["type"] == recipes.REF_IMAGE else "フォルダ", kinds.REF_COLOR)
+                card.set_color(kinds.REF_COLOR)
+                ref = ("リファレンス", kinds.REF_COLOR)
+                card.io.setText(io_html([prev_out, "+", ref, "→", "あとの生成へ"]))
+                if v["type"] == recipes.REF_IMAGE and not running_now:
+                    # エクスプローラー・J-Rate から画像を落とすと、その画像にする
+                    card.accept_files(recipes.IMAGE_EXTS)
+                    card.file_dropped.connect(lambda path, n=i: self._set_ref_image(n, path))
+                if not running_now and not v["bypass"] and not self._ref_used_later(i):
+                    card.detail.setText(v["detail"] + "\n⚠ このリファレンスを使う生成がありません (あとの生成のワークフローに、"
+                                        "タイトルが reference / face / 顔 などの LoadImage がない)")
+                self._ref_thumbs[i] = v.get("refs") or []
             elif v["type"] == recipes.SPLIT:
                 # 増やす: そこから先を N 通りに (中身はそのまま)
                 card.chip.set(f"×{v.get('count', 2)}", SPLIT_COLOR)
@@ -995,6 +1038,26 @@ class LineView(QWidget):
         self._save_recipes()
         # 押したスイッチのカードも作り直すので、信号から抜けてから行う
         QTimer.singleShot(0, lambda: self.refresh(rebuild=True))
+
+    def _ref_used_later(self, index: int) -> bool:
+        """index 番目のリファレンスのあとに、リファレンスの入口のある生成があるか (次のリファレンスまで。バイパスは数えない)。"""
+        for s in self.recipe.stages[index + 1:]:
+            if s.bypass:
+                continue
+            if s.type in recipes.REF_TYPES:
+                return False
+            if s.type == recipes.GEN and (not s.workflow or kinds.has_reference(s.workflow)):
+                return True  # ワークフローが未選択なら、まだ言わない
+        return False
+
+    def _set_ref_image(self, index: int, path: str) -> None:
+        """リファレンス (1 枚) の札に落とした画像を、そのステップの画像にする。"""
+        if self.locked() or index >= len(self.recipe.stages):
+            return
+        self.recipe.stages[index].image = str(Path(path))
+        self._save_recipes()
+        self.status.emit(f"リファレンスの画像を {Path(path).name} にしました。")
+        QTimer.singleShot(0, lambda: self.refresh(rebuild=True))  # 落とした札も作り直すので、信号から抜けてから
 
     def _add_stage(self, stage_type: str, index: Optional[int] = None) -> None:
         """ステップを足す (index なしは末尾)。設定の窓で OK したときだけ入れる。"""
@@ -1614,8 +1677,10 @@ class LineView(QWidget):
             if where[1] >= 0 and where[1] < len(it.outputs):
                 o = it.outputs[where[1]]
                 head = Path(o["path"]).name
-                rows = [("元", Path(o.get("from") or it.source).name),
-                        ("読み取った文", o.get("prompt") or "(なし)")]
+                rows = [("元", Path(o.get("from") or it.source).name)]
+                if o.get("reference"):
+                    rows.append(("リファレンス", str(o["reference"])))
+                rows.append(("読み取った文", o.get("prompt") or "(なし)"))
                 rows += self._add_rows(o.get("adds"), before=True)
                 rows.append(("盛った文", o.get("enhanced") or "(盛っていません)"))
                 rows += self._add_rows(o.get("adds"), before=False)
@@ -1765,6 +1830,8 @@ class LineView(QWidget):
         # ステップ
         total = len(items)
         for i, card in enumerate(self.stage_cards):
+            if i in self._ref_thumbs:
+                card.thumbs.set([self.thumbs.get(p) for p in self._ref_thumbs[i]])
             if card._bypassed:
                 card.bar.setValue(0)
                 card.count.setText("バイパス中")
@@ -1772,7 +1839,8 @@ class LineView(QWidget):
             if not show_stats:
                 card.bar.setValue(0)
                 card.count.setText("")
-                card.thumbs.set([])
+                if i not in self._ref_thumbs:
+                    card.thumbs.set([])
                 continue
             passed = sum(1 for it in items if it.stage > i)
             here = [it for it in items if it.stage == i and it.state == engine.RUNNING]

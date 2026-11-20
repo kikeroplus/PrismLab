@@ -161,6 +161,8 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
             snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
         elif stage.type in (recipes.FRAME, recipes.SPLIT, recipes.GATE, recipes.SUB, recipes.TRANSLATE):
             snap["count"], snap["stars"], snap["rules"] = stage.count, stage.stars, stage.rules
+        elif stage.type in recipes.REF_TYPES:
+            snap["image"], snap["folder"], snap["shuffle"] = stage.image, stage.folder, stage.shuffle
         else:
             snap["workflow"] = stage.workflow
             names = [w.name for w in comfy.workflows() if stage.workflow and w.value.lower() == stage.workflow.lower()]
@@ -201,6 +203,16 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         snap["count"] = max(2, min(recipes.MAX_SPLIT, int(stage.count)))
     elif stage.type == recipes.GATE:
         snap["stars"] = max(1, min(5, int(stage.stars)))
+    elif stage.type == recipes.REF_IMAGE:
+        if not stage.image:
+            raise ValueError("リファレンス (1 枚) のステップに画像が選ばれていません。")
+        if not Path(stage.image).is_file():
+            raise ValueError(f"リファレンスの画像が見つかりません: {stage.image}")
+        snap["image"] = stage.image
+    elif stage.type == recipes.REF_FOLDER:
+        if not recipes.list_images(stage.folder):
+            raise ValueError(f"リファレンスのフォルダに画像がありません: {stage.folder or '(未選択)'}")
+        snap["folder"], snap["shuffle"] = stage.folder, stage.shuffle
     elif stage.type == recipes.SUB:
         rules = recipes.parse_rules(stage.rules)
         if not rules:
@@ -223,6 +235,17 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
 def plan_key(stage: int, branch: int) -> str:
     """差し込みの割り当ての鍵 (枝 0 は前と同じ "ステップの番号")。"""
     return str(stage) if branch == 0 else f"{stage}/{branch}"
+
+
+PLANNED_TYPES = (recipes.INSERT, recipes.REF_FOLDER)  # 始めたときに 1 件ごとの割り当てを決めるステップ
+
+
+def make_picker(snap: dict):
+    """割り当てを引くもの (差し込み: フォルダの .txt、リファレンス (フォルダ): フォルダの画像)。
+    引けなければ inserts.InsertError か ValueError。"""
+    if snap["type"] == recipes.REF_FOLDER:
+        return recipes.RefPicker(str(snap.get("folder") or ""), bool(snap.get("shuffle")))
+    return inserts.Picker([inserts.Slot(snap["name"], snap["folder"], True, False)])
 
 
 def next_stage(stages: list, index: int) -> int:
@@ -275,16 +298,16 @@ class Run:
             if snap["type"] == recipes.SPLIT:
                 branches *= int(snap["count"])
                 continue
-            if snap["type"] != recipes.INSERT:
+            if snap["type"] not in PLANNED_TYPES:
                 continue
-            # 差し込み: 1 枚ごとに次のファイルを割り当てる (続きから始めても変わらない)。
+            # 差し込み・リファレンス (フォルダ): 1 枚ごとに次のファイルを割り当てる (続きから始めても変わらない)。
             # 増やすで分かれたあとなら、枝ごとに別のファイル (枝 0 は "i"、枝 k は "i/k")
             try:
-                picker = inserts.Picker([inserts.Slot(snap["name"], snap["folder"], True, False)])
+                picker = make_picker(snap)
                 for it in items:
                     for k in range(branches):
                         it.plan[plan_key(i, k)] = picker.next()[0]
-            except inserts.InsertError as exc:
+            except (inserts.InsertError, ValueError) as exc:
                 raise ValueError(str(exc)) from exc
             pickers.append(picker)
         if trial:
@@ -586,15 +609,17 @@ class Engine(QObject):
         stages[index] = snap
         redo = set()  # 割り当てを引き直す差し込み
         fill = set()  # 足りない枝だけ足す差し込み
-        live = [j for j, s in enumerate(stages) if s["type"] == recipes.INSERT and not s.get("bypass")]
+        live = [j for j, s in enumerate(stages) if s["type"] in PLANNED_TYPES and not s.get("bypass")]
         if snap["type"] == recipes.INSERT and not snap.get("bypass") and snap.get("folder") != old.get("folder"):
+            redo.add(index)
+        if snap["type"] == recipes.REF_FOLDER and not snap.get("bypass") and (
+                snap.get("folder") != old.get("folder") or bool(snap.get("shuffle")) != bool(old.get("shuffle"))):
             redo.add(index)
         if snap["type"] == recipes.SPLIT and not snap.get("bypass") and int(snap.get("count") or 2) != int(old.get("count") or 2):
             fill.update(j for j in live if j > index)
         try:
-            pickers = {j: inserts.Picker([inserts.Slot(stages[j]["name"], stages[j]["folder"], True, False)])
-                       for j in redo | fill}
-        except inserts.InsertError as exc:
+            pickers = {j: make_picker(stages[j]) for j in redo | fill}
+        except (inserts.InsertError, ValueError) as exc:
             raise ValueError(str(exc)) from exc
         with self._cond:
             if self.run is not run:
@@ -839,6 +864,8 @@ class Engine(QObject):
                 self._last_frame(it)
             elif stage["type"] == recipes.SPLIT:
                 self._split(it, stage)
+            elif stage["type"] in recipes.REF_TYPES:
+                self._reference(it, stage)
             elif stage["type"] == recipes.SUB:
                 self._substitute(it, stage)
             elif stage["type"] == recipes.TRANSLATE:
@@ -913,6 +940,21 @@ class Engine(QObject):
                 it.enhanced, it.adds = None, []
             else:
                 it.text, it.enhanced, it.adds = text, enhanced, adds
+
+    def _reference(self, it: Item, stage: dict) -> None:
+        """リファレンス: このあとの生成に渡すリファレンス画像を決める (生成を通っても残る。次のリファレンスで置き換え)。
+        ワークフローにリファレンス用の LoadImage がなければ、渡しても使われない。"""
+        if stage["type"] == recipes.REF_IMAGE:
+            path = str(stage.get("image") or "")
+        else:
+            planned = it.plan.get(plan_key(it.stage, it.branch)) or it.plan.get(str(it.stage))
+            if not planned:
+                raise ValueError("リファレンスの画像が割り当てられていません (始め直してください)。")
+            path = str(planned.get("file") or "")
+        if not path or not Path(path).is_file():
+            raise ValueError(f"リファレンスの画像が見つかりません: {path or '(なし)'}")
+        with self._cond:
+            it.reference = path
 
     def _last_frame(self, it: Item) -> None:
         """最後のコマ: 動画の最後のコマを (出力フォルダ)\\コマ に PNG で書き、次のステップにはその画像を渡す。"""
@@ -1099,13 +1141,16 @@ class Engine(QObject):
 
         for out in outputs:
             comfy.add_history(out, it.current, req)
+        # 使ったリファレンス (ワークフローにリファレンスの入口があるときだけ。結果の欄に出す)
+        used_ref = it.reference if it.reference and kinds.has_reference(str(stage.get("workflow", ""))) else ""
         with self._cond:
             now = time.time()
             for out in outputs:
                 # 使ったプロンプトも残す (このあと空に戻すので、結果の欄で見られるように)
                 it.outputs.append({"stage": it.stage, "path": out, "time": now, "from": it.current,
                                    "prompt": it.text or "", "enhanced": it.enhanced or "",
-                                   "adds": [dict(a) for a in it.adds], "sent": req.full_prompt or ""})
+                                   "adds": [dict(a) for a in it.adds], "sent": req.full_prompt or "",
+                                   **({"reference": used_ref} if used_ref else {})})
             it.current = outputs[0]
             it.text, it.enhanced, it.read_name = None, None, ""  # 新しいファイルには新しい説明が要る
             it.adds = []

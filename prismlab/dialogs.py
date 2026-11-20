@@ -5,6 +5,8 @@ from typing import Optional
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
                                QPushButton, QRadioButton, QSpinBox, QVBoxLayout)
@@ -14,6 +16,9 @@ from gencommon.comfy_dialogs import ComfySettingsDialog
 
 from . import kinds, recipes, theme
 from .widgets import KindChip, use_label
+
+
+REF_PREVIEW = 72  # リファレンスの設定の窓に並べる画像の大きさ
 
 
 def _hint(text: str) -> QLabel:
@@ -162,6 +167,36 @@ class StageDialog(QDialog):
                                 "大文字・小文字は区別しません。消したあとに残る「, ,」は詰めます。# で始まる行は飛ばします。\n"
                                 "いまのプロンプト (読み取った文・盛った文・足した文) のすべてに使います。"
                                 "盛ったあとに置けば、LLM が入れがちな語を消せます。"))
+        elif stage.type in recipes.REF_TYPES:
+            self.ref_path = QLineEdit(stage.image if stage.type == recipes.REF_IMAGE else stage.folder)
+            single = stage.type == recipes.REF_IMAGE
+            self.ref_path.setPlaceholderText("顔などのリファレンス画像" if single else "リファレンス画像を入れたフォルダ")
+            browse = QPushButton("参照...")
+            browse.clicked.connect(self._browse_ref)
+            row = QHBoxLayout()
+            row.addWidget(self.ref_path, 1)
+            row.addWidget(browse)
+            form.addRow("画像" if single else "フォルダ", row)
+            self.ref_preview = QLabel()
+            self.ref_preview.setFixedHeight(REF_PREVIEW)
+            self.ref_preview.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.ref_note = _hint("")
+            form.addRow("", self.ref_preview)
+            form.addRow("", self.ref_note)
+            if not single:
+                row, self.place = _choice_row(self, ["名前順", "ランダム"], 1 if stage.shuffle else 0)
+                form.addRow("使う順", row)
+            box.addWidget(_hint(
+                ("この画像を、" if single else
+                 "フォルダの画像を 1 件ごとに 1 枚ずつ (名前順か、ランダムな順で一巡ずつ。最後まで使ったら最初から)、") +
+                "このあとの生成のリファレンスに使います。入れる先は、ワークフローの LoadImage のうち、"
+                "タイトルに reference / ref / face / 参照 / リファレンス / 顔 を含むものです"
+                " (ないワークフローには使われません)。\n"
+                "生成を通っても残り、次のリファレンスのステップまで、あとの生成すべてに使います。"
+                + ("" if single else "\n増やすのあとに置くと、分かれた 1 本ごとに別の画像になります。"
+                                     "量産ごとに最初 (ランダムなら新しい順) から使います。")))
+            self.ref_path.textChanged.connect(self._ref_changed)
+            self._ref_changed()
         elif stage.type == recipes.INSERT:
             self.folder = QLineEdit(stage.folder)
             self.folder.setPlaceholderText("セリフやアクションの .txt を入れたフォルダ")
@@ -232,6 +267,54 @@ class StageDialog(QDialog):
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         box.addWidget(buttons)
+
+    # リファレンス ---------------------------------------------------------
+    def _browse_ref(self) -> None:
+        now = self.ref_path.text().strip()
+        if self.stage.type == recipes.REF_IMAGE:
+            exts = " ".join("*" + e for e in sorted(recipes.IMAGE_EXTS))
+            path, _ = QFileDialog.getOpenFileName(self, "リファレンスの画像を選ぶ", str(Path(now).parent) if now else "",
+                                                  f"画像 ({exts})")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "リファレンスのフォルダを選ぶ", now)
+        if path:
+            self.ref_path.setText(str(Path(path)))
+
+    def _ref_files(self) -> list:
+        """選んでいる画像 (1 枚ならそれ、フォルダなら中の画像)。"""
+        path = self.ref_path.text().strip()
+        if self.stage.type == recipes.REF_IMAGE:
+            ok = bool(path) and Path(path).is_file() and Path(path).suffix.lower() in recipes.IMAGE_EXTS
+            return [Path(path)] if ok else []
+        return recipes.list_images(path) if path else []
+
+    def _ref_changed(self) -> None:
+        files = self._ref_files()
+        path = self.ref_path.text().strip()
+        if self.stage.type == recipes.REF_IMAGE:
+            note = "" if files else ("画像を選んでください。" if not path else "画像が見つかりません。")
+        else:
+            note = (f"画像 {len(files)} 枚" if files else
+                    "フォルダを選んでください。" if not path else "このフォルダには画像がありません。")
+        self.ref_note.setText(note)
+        self.ref_note.setStyleSheet("" if files else "color: #ef5350;")
+        # 先頭の何枚かを小さく並べる (どの顔か分かるように)
+        shown = files[:6]
+        width = REF_PREVIEW * max(1, len(shown)) + 4 * max(0, len(shown) - 1)
+        canvas = QPixmap(width, REF_PREVIEW)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        x = 0
+        for f in shown:
+            pix = QPixmap(str(f))
+            if not pix.isNull():
+                pix = pix.scaled(REF_PREVIEW, REF_PREVIEW, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+                painter.drawPixmap(x + (REF_PREVIEW - pix.width()) // 2, (REF_PREVIEW - pix.height()) // 2, pix)
+            x += REF_PREVIEW + 4
+        painter.end()
+        self.ref_preview.setPixmap(canvas if shown else QPixmap())
+        self.ref_preview.setVisible(bool(shown))
 
     # 差し込み -------------------------------------------------------------
     def _browse_folder(self) -> None:
@@ -359,6 +442,16 @@ class StageDialog(QDialog):
                 QMessageBox.warning(self, "置き換え", "置き換える語を入れてください (1 行に「元 => 先」)。")
                 return
             s.rules = text
+        elif s.type in recipes.REF_TYPES:
+            if not self._ref_files():
+                QMessageBox.warning(self, recipes.STAGE_TITLES[s.type], self.ref_note.text() or "画像を選んでください。")
+                return
+            path = str(Path(self.ref_path.text().strip()))
+            if s.type == recipes.REF_IMAGE:
+                s.image = path
+            else:
+                s.folder = path
+                s.shuffle = self.place.checkedId() == 1
         elif s.type == recipes.INSERT:
             folder = self.folder.text().strip()
             try:
