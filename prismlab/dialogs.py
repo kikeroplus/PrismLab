@@ -13,7 +13,7 @@ from gencommon import comfy, enhancer, inserts, reader, settings
 from gencommon.comfy_dialogs import ComfySettingsDialog
 
 from . import kinds, recipes, theme
-from .widgets import KindChip
+from .widgets import KindChip, use_label
 
 
 def _hint(text: str) -> QLabel:
@@ -368,8 +368,10 @@ class MachinesDialog(QDialog):
         self.uses: list[QCheckBox] = []
         for n in range(recipes.MAX_MACHINES):
             combo = QComboBox()
-            use = QCheckBox("使う")
-            use.setChecked(not (n < len(urls) and urls[n].lower() in (off or set())))
+            on = not (n < len(urls) and urls[n].lower() in (off or set()))
+            use = QCheckBox(use_label(on))
+            use.setChecked(on)
+            use.toggled.connect(lambda checked, b=use: b.setText(use_label(checked)))
             row = QHBoxLayout()
             row.addWidget(combo, 1)
             row.addWidget(use)

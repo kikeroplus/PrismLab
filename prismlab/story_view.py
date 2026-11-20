@@ -1933,22 +1933,6 @@ class StoryView(QWidget):
             return True
         return super().eventFilter(obj, event)
 
-    @staticmethod
-    def _captions(paths: list[Path]) -> list[Path]:
-        """一緒に消す説明の .txt (同じ名前の別のファイルが残るときは残す。ui-standard 8 章)。"""
-        out = []
-        for p in paths:
-            txt = p.with_suffix(".txt")
-            if not txt.is_file() or txt in out:
-                continue
-            try:
-                others = [q for q in p.parent.glob(p.stem + ".*") if q != txt and q not in paths]
-            except OSError:
-                continue
-            if not others:
-                out.append(txt)
-        return out
-
     def _delete_candidates(self) -> None:
         """選んでいる候補のファイルをごみ箱へ。1 つなら確かめず、複数かごみ箱に入らないときは確かめる (ui-standard 7 章)。"""
         if self.scene is None or getattr(self, "_deleting", False):
@@ -1979,7 +1963,7 @@ class StoryView(QWidget):
             while self.thumbs.busy(paths) and time.monotonic() < end:
                 QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 50)
                 time.sleep(0.02)
-            error = recycle.send_to_recycle_bin(paths + self._captions(paths))
+            error = recycle.send_to_recycle_bin(paths + recycle.captions(paths))
         finally:
             self._deleting = False
         gone = [p for p in paths if not p.exists()]

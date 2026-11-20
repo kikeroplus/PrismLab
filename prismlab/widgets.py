@@ -280,6 +280,11 @@ class InsertArrow(QToolButton):
         super().leaveEvent(event)
 
 
+def use_label(on: bool) -> str:
+    """台の「使う」チェックの文字。外しても「使う」のままだと紛らわしいので、今の状態を出す (2026-11-20 利用者の希望)。"""
+    return "使う" if on else "使わない"
+
+
 class MachineCard(QFrame):
     """台の札 (状態の丸・名前・出来た数・使うのチェック・いまの進み具合)。"""
 
@@ -302,6 +307,7 @@ class MachineCard(QFrame):
         self.use.setToolTip("外すと、この台を一時的に使いません (台の設定には残します)。"
                             "いま動いている件は最後まで作り、新しい件は送りません。")
         self.use.clicked.connect(self.use_toggled)  # 人が押したときだけ (set_on では出さない)
+        self.use.toggled.connect(lambda on: self.use.setText(use_label(on)))
         head.addWidget(self.dot)
         head.addWidget(self.name, 1)
         head.addWidget(self.done)
@@ -317,6 +323,7 @@ class MachineCard(QFrame):
         """「使う」のチェックを合わせる (shown=False で隠す。台が決まっていない札など)。"""
         self.use.setVisible(shown)
         self.use.setChecked(on)
+        self.use.setText(use_label(on))
         self.name.setEnabled(on)  # 休みの台は名前を薄く
 
     def set_down(self, down: bool, color: str = OK_DOT) -> None:

@@ -26,6 +26,22 @@ def can_recycle(path: Path) -> bool:
         return True
 
 
+def captions(paths: list[Path]) -> list[Path]:
+    """一緒に消す説明の .txt (同じ名前の別のファイルが残るときは残す。ui-standard 8 章)。"""
+    out = []
+    for p in paths:
+        txt = p.with_suffix(".txt")
+        if not txt.is_file() or txt in out:
+            continue
+        try:
+            others = [q for q in p.parent.glob(p.stem + ".*") if q != txt and q not in paths]
+        except OSError:
+            continue
+        if not others:
+            out.append(txt)
+    return out
+
+
 class _SHFILEOPSTRUCTW(ctypes.Structure):
     _fields_ = [
         ("hwnd", wintypes.HWND),

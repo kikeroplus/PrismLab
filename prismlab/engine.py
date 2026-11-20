@@ -628,6 +628,27 @@ class Engine(QObject):
         self._save()
         self.changed.emit()
 
+    def in_use(self, paths) -> set[str]:
+        """paths のうち、終わっていない件が次のステップに渡すもの (小文字のパス)。消すと続きが作れない。"""
+        keys = {str(p).lower() for p in paths}
+        with self._cond:
+            if self.run is None:
+                return set()
+            return {it.current.lower() for it in self.run.items if not it.finished and it.current.lower() in keys}
+
+    def forget_outputs(self, paths) -> None:
+        """消したファイルを結果から外す (件の outputs から除いて保存する)。"""
+        keys = {str(p).lower() for p in paths}
+        if not keys:
+            return
+        with self._cond:
+            if self.run is None:
+                return
+            for it in self.run.items:
+                it.outputs = [o for o in it.outputs if str(o.get("path") or "").lower() not in keys]
+        self._save()
+        self.changed.emit()
+
     def snapshot(self) -> tuple[Optional[Run], list[Item], list[Machine]]:
         """画面に出すための写し。"""
         with self._cond:

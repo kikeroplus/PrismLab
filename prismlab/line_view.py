@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListView,
                                QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QSpinBox,
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 from gencommon import comfy, inserts, settings
 
-from . import engine, kinds, rating, recipes, theme
+from . import engine, kinds, rating, recipes, recycle, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
 from .hover_preview import HoverPreview
 from .thumbs import MOVIE_EXTS, ThumbCache
@@ -267,6 +267,8 @@ class LineView(QWidget):
         self.results.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results.customContextMenuRequested.connect(self._result_menu)
         self.results.itemDoubleClicked.connect(self._open_result)
+        self.results.installEventFilter(self)  # Del で削除
+        self._deleting = False
         # 乗せると大きく出す (失敗の項目は出さない)
         self.hover = HoverPreview(self.results, lambda index: "" if index.data(Qt.ItemDataRole.UserRole + 1)
                                   else index.data(Qt.ItemDataRole.UserRole), self.thumbs)
@@ -1460,7 +1462,71 @@ class LineView(QWidget):
             menu.addAction("開く", lambda: self._open_result(current))
             menu.addAction("エクスプローラーで表示",
                            lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(path)]))  # noqa: S603,S607
+        menu.addSeparator()
+        count = len(picked)
+        delete = menu.addAction(f"削除 (ごみ箱へ){f' ― {count} 個' if count > 1 else ''}\tDel")
+        delete.setEnabled(count > 0)
+        delete.triggered.connect(self._delete_results)
         menu.exec(self.results.mapToGlobal(pos))
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.results and event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Delete:
+            if not event.isAutoRepeat():  # 押しっぱなしで続けて消えないように
+                self._delete_results()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _delete_results(self) -> None:
+        """選んでいる結果のファイルをごみ箱へ。1 つなら確かめず、複数かごみ箱に入らないときは確かめる (ui-standard 7 章)。
+        失敗の項目は除く。終わっていない件が次のステップに渡すもの (★を待つ・続きの生成) は消さない。"""
+        if self._deleting:
+            return
+        items = [i for i in self.results.selectedItems() if not i.data(Qt.ItemDataRole.UserRole + 1)]
+        if not items:
+            return
+        busy = self.engine.in_use(str(i.data(Qt.ItemDataRole.UserRole)) for i in items)
+        if busy:
+            items = [i for i in items if str(i.data(Qt.ItemDataRole.UserRole)).lower() not in busy]
+            if not items:
+                self.status.emit("このあとのステップで使っているので削除できません (その件が終わってから消してください)。")
+                return
+        paths = [Path(str(i.data(Qt.ItemDataRole.UserRole))) for i in items]
+        recyclable = all(recycle.can_recycle(p) for p in paths)
+        if len(paths) > 1 or not recyclable or busy:
+            what = paths[0].name if len(paths) == 1 else f"選んでいる {len(paths)} 個の結果"
+            text = f"{what}を削除 (ごみ箱へ) しますか？"
+            if not recyclable:
+                text = f"{what}を削除しますか？\n\nこの場所のファイルはごみ箱に入らず、完全に消えます。"
+            if busy:
+                text += f"\n\nこのあとのステップで使っている {len(busy)} 個は残します。"
+            if QMessageBox.question(self, "結果を削除", text) != QMessageBox.StandardButton.Yes:
+                return
+        first_row = min(self.results.row(i) for i in items)
+        self.hover.hide()  # 再生している動画を手放してから消す
+        self._deleting = True
+        try:
+            # サムネールを読んでいる途中なら、読み終わるのを待つ (読んでいるあいだは消せない)
+            end = time.monotonic() + 3
+            while (self.thumbs.busy(paths) or self.hover.big.busy(paths)) and time.monotonic() < end:
+                QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 50)
+                time.sleep(0.02)
+            error = recycle.send_to_recycle_bin(paths + recycle.captions(paths))
+        finally:
+            self._deleting = False
+        gone = [p for p in paths if not p.exists()]
+        for p in gone:
+            self.thumbs.forget(str(p))
+            self.hover.big.forget(str(p))
+        self.engine.forget_outputs(gone)
+        self.refresh(rebuild=True)
+        if self.results.count():  # 消したあとは、同じ位置 (= 次) のものを選ぶ
+            self.results.setCurrentRow(min(first_row, self.results.count() - 1))
+        if error and len(gone) < len(paths):
+            self.status.emit(f"{error}  (残った {len(paths) - len(gone)} 個 / ごみ箱へ移動 {len(gone)} 個)")
+        elif len(gone) == 1:
+            self.status.emit(f"ごみ箱へ移動しました: {gone[0].name}")
+        elif gone:
+            self.status.emit(f"ごみ箱へ移動しました: {len(gone)} 個")
 
     def _refresh_results(self, items: list) -> None:
         entries = []  # (時刻, パス, 失敗の理由, 見出し, (件の番号, 出力の番号 / -1 = 失敗))

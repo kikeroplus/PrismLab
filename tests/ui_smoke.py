@@ -299,6 +299,68 @@ QApplication.sendEvent(vp, QEvent(QEvent.Type.Leave))
 pump(0.1)
 assert not popup.isVisible(), "離れたら消す"
 
+# 台の札のチェック: 外すと「使わない」、戻すと「使う」(2026-11-20)
+mc = lv.machine_cards[0]
+assert mc.use.text() == "使う" and mc.use.isChecked(), mc.use.text()
+mc.use.click()
+pump(0.3)
+assert mc.use.text() == "使わない" and not mc.use.isChecked(), mc.use.text()
+mc.use.click()
+pump(0.3)
+assert mc.use.text() == "使う" and mc.use.isChecked(), mc.use.text()
+
+# 結果の削除: Del で選んでいる結果をごみ箱へ (ごみ箱は差し替え)。1 つは確かめない、複数は確かめる
+from PySide6.QtGui import QKeyEvent  # noqa: E402
+from PySide6.QtWidgets import QMessageBox  # noqa: E402
+
+from prismlab import recycle  # noqa: E402
+
+binned = []
+
+
+def fake_bin(paths, timeout=3.0):
+    for p in paths:
+        binned.append(Path(p))
+        Path(p).unlink(missing_ok=True)
+    return None
+
+
+real_bin, recycle.send_to_recycle_bin = recycle.send_to_recycle_bin, fake_bin
+asked = []
+real_question = QMessageBox.question
+QMessageBox.question = staticmethod(lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.Yes)
+# 3 個にしておく (最後の量産は 2 件なので、写しを 1 つ結果に足す)
+first_out = Path(window.engine.run.items[0].outputs[-1]["path"])
+extra = first_out.with_name("extra" + first_out.suffix)
+shutil.copy(first_out, extra)
+window.engine.run.items[0].outputs.append({**window.engine.run.items[0].outputs[-1], "path": str(extra)})
+lv.refresh(rebuild=True)
+pump(0.5)
+before = lv.results.count()
+assert before >= 3, before
+lv.results.clearSelection()
+lv.results.setCurrentRow(0)
+lv.results.item(0).setSelected(True)
+victim = Path(lv.results.item(0).data(Qt.ItemDataRole.UserRole))
+lv.results.setFocus()
+QApplication.sendEvent(lv.results, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier))
+pump(0.5)
+assert not asked, asked
+assert not victim.exists() and victim in binned
+assert lv.results.count() == before - 1, (lv.results.count(), before)
+assert all(o["path"] != str(victim) for it in window.engine.run.items for o in it.outputs)
+assert lv.results.currentRow() == 0
+lv.results.clearSelection()
+lv.results.item(0).setSelected(True)
+lv.results.item(1).setSelected(True)
+lv._delete_results()
+pump(0.5)
+assert asked and "2 個の結果" in asked[0], asked
+assert lv.results.count() == before - 3, (lv.results.count(), before)
+QMessageBox.question = real_question
+recycle.send_to_recycle_bin = real_bin
+print("結果の削除: OK")
+
 window.engine.stop_threads()
 for s in (a, b, llm):
     s.close()
