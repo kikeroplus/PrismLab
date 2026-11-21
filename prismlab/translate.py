@@ -27,6 +27,10 @@ _COMMON = (
 )
 SYSTEM = _TARGET.format(lang="英語") + _COMMON
 SYSTEM_JA = _TARGET.format(lang="日本語") + _COMMON
+# 長い英文だと、上の指示では訳さずに元の文を返すモデルがある (2026-11-21 qwen3.5-9b で確認。短い指示なら訳す)。
+# 日本語が 1 文字もない返事のときだけ、この短い指示でもう一度頼む
+# (重み付け・タグを残す、と書き足すとまた訳さなくなったので、書き足さない)
+SYSTEM_JA_SHORT = "ユーザーの文章を自然な日本語に訳してください。訳文だけを出力してください。"
 
 
 def snapshot() -> dict:
@@ -41,9 +45,16 @@ def to_english(snap: dict, text: str) -> str:
     return reply
 
 
+def has_japanese(text: str) -> bool:
+    return any("\u3040" <= c <= "\u30ff" or "\u4e00" <= c <= "\u9fff" for c in text)
+
+
 def to_japanese(snap: dict, text: str) -> str:
     """送るプロンプトの訳を見るため (見るだけ。欄の文は変えない)。"""
-    reply = llm.chat(str(snap.get("url", "")), str(snap.get("model", "")), SYSTEM_JA, text, TEMPERATURE).strip()
+    url, model = str(snap.get("url", "")), str(snap.get("model", ""))
+    reply = llm.chat(url, model, SYSTEM_JA, text, TEMPERATURE).strip()
+    if not has_japanese(reply) and not has_japanese(text):
+        reply = llm.chat(url, model, SYSTEM_JA_SHORT, text, TEMPERATURE).strip() or reply  # 訳さずに返された
     if not reply:
         raise llm.LLMError("LLM の返事が空でした。")
     return reply

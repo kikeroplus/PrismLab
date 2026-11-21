@@ -2,8 +2,8 @@
 
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel, QProgressBar, QScrollArea, QSizePolicy,
                                QToolButton, QVBoxLayout, QWidget)
 
@@ -111,6 +111,7 @@ class Card(QFrame):
     clicked = Signal()
     menu_requested = Signal(object)
     bypass_toggled = Signal(bool)
+    move_requested = Signal(int)  # 下の ◀ ▶ を押した (-1 = 左へ、+1 = 右へ)
     file_dropped = Signal(str)  # accept_files() したときに、落とされた画像のパス
 
     def __init__(self, parent=None):
@@ -170,6 +171,32 @@ class Card(QFrame):
         self.count.setStyleSheet(f"background: transparent; color: {theme.TEXT_DIM}; font-size: 11px;")
         self.box.addWidget(self.count)
         self.box.addStretch(1)
+
+        # 左へ・右へ (2026-11-21 利用者の希望。右クリックの「◀ 左へ」「右へ ▶」と同じ)。札の下の端にそろえる
+        moves = QHBoxLayout()
+        moves.setSpacing(4)
+        self.move_left, self.move_right = QToolButton(), QToolButton()
+        for b, text, tip, step in ((self.move_left, "◀", "このステップを左へ", -1),
+                                   (self.move_right, "▶", "このステップを右へ", 1)):
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedSize(26, 18)
+            b.setStyleSheet(
+                "QToolButton { background: transparent; border: 1px solid #444; border-radius: 4px;"
+                f" color: {theme.TEXT_DIM}; font-size: 10px; padding: 0px; }}"
+                "QToolButton:hover { border-color: #999; color: white; background: #333; }"
+                "QToolButton:disabled { border-color: #333; color: #444; }")
+            b.clicked.connect(lambda _=False, s=step: self.move_requested.emit(s))
+        moves.addWidget(self.move_left)
+        moves.addStretch(1)
+        moves.addWidget(self.move_right)
+        self.moves = QWidget()
+        self.moves.setStyleSheet("background: transparent;")
+        self.moves.setLayout(moves)
+        moves.setContentsMargins(0, 0, 0, 0)
+        self.moves.hide()  # ステップだけに出す (入口には出さない)
+        self.box.addWidget(self.moves)
         self._restyle()
 
     def set_color(self, color: str, active: bool = False) -> None:
@@ -244,40 +271,148 @@ def arrow() -> QLabel:
     return label
 
 
+ARROW_WIDTH = 46  # ステップのあいだの矢印の幅 (流れの線が見えるように、前の 22 より広く)
+LANE_TOP = 30  # 流れの線の 1 段目の高さ (札の「画像 + 文字 → 動画」の行のあたり)
+LANE_STEP = 13  # 段のあいだ
+
+
 class InsertArrow(QToolButton):
-    """ステップのあいだの矢印。マウスを乗せると「＋」になり、押すと挿入するステップの種類を選ぶメニューを出す。"""
+    """ステップのあいだの矢印。流れるもの (flow.Gap) があれば、画像・動画・文字・メモ・リファレンスを色の線で描く
+    (2026-11-21 利用者の希望)。マウスを乗せると「＋」を重ね、押すと挿入するステップの種類を選ぶメニューを出す。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setText("→")
-        self.setFixedWidth(22)
+        self.setText("")
+        self.setFixedWidth(ARROW_WIDTH)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.setToolTip("ここにステップを挿入")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet("QToolButton { background: transparent; border: none; padding: 0px;"
-                           f" color: {theme.TEXT_DIM}; font-size: 16px; }}"
-                           "QToolButton:hover { color: white; font-weight: bold; }"
-                           "QToolButton:disabled { color: #555; }")
+        self.setStyleSheet("QToolButton { background: transparent; border: none; padding: 0px; }")
         # setMenu を使うと ▼ の場所を取られて矢印が欠けるので、押したときに自分でメニューを出す
         self._menu = None
+        self._gap = None
+        self._hover = False
         self.clicked.connect(self._popup)
 
     def set_menu(self, menu) -> None:
         self._menu = menu
+
+    def set_gap(self, gap, tip: str = "") -> None:
+        """流れるもの (flow.Gap) と説明。"""
+        self._gap = gap
+        self.setToolTip((tip + "\n\n" if tip else "") + "押すと、ここにステップを挿入します")
+        self.update()
 
     def _popup(self) -> None:
         if self._menu is not None:
             self._menu.popup(self.mapToGlobal(self.rect().center()))
 
     def enterEvent(self, event) -> None:
-        if self.isEnabled():
-            self.setText("＋")
+        self._hover = self.isEnabled()
+        self.update()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        self.setText("→")
+        self._hover = False
+        self.update()
         super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        from . import flow
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        gap = self._gap
+        if gap is None:
+            # 流れが分からないとき (前の見た目): 灰色の → だけ
+            p.setPen(QColor(theme.TEXT_DIM if self.isEnabled() else "#555"))
+            f = p.font()
+            f.setPixelSize(16)
+            p.setFont(f)
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "→")
+        else:
+            x0, x1 = 3, w - 3
+            for n, lane in enumerate(flow.LANES):
+                y = LANE_TOP + n * LANE_STEP
+                if lane in gap.gone:
+                    _cross(p, x0 + 4, y, "#9e9e9e")  # 直前のステップで消えた
+                line = gap.lines.get(lane)
+                if line is None:
+                    continue
+                color = QColor(line.color)
+                start = x0 + (11 if lane in gap.gone else 0)
+                end = x1 - 11 if line.cut else x1 - 1
+                # 点線・破線は「使っていない (バイパス)」に見えるので使わない (2026-11-21 利用者の指摘)。
+                # メモは二重線 (文字を取っておいている)、ほかは実線
+                pen = QPen(color, {"thick": 6.0, "double": 1.6}.get(line.style, 3.0))
+                pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+                p.setPen(pen)
+                tip = end - (0 if line.cut else 7)
+                if line.style == "double":
+                    p.drawLine(QPointF(start, y - 2.5), QPointF(tip, y - 2.5))
+                    p.drawLine(QPointF(start, y + 2.5), QPointF(tip, y + 2.5))
+                else:
+                    p.drawLine(QPointF(start, y), QPointF(tip, y))
+                if line.new:
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(color)
+                    p.drawEllipse(QPointF(start + 2, y), 4, 4)
+                if line.cut:
+                    _cross(p, x1 - 5, y, "#ef5350")  # 次には入らずに捨てる
+                else:
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(color)
+                    head = 4.5 if line.style != "thick" else 6
+                    p.drawPolygon(QPolygonF([QPointF(end - 8, y - head), QPointF(end, y), QPointF(end - 8, y + head)]))
+            if gap.copies > 1:
+                p.setPen(QColor(theme.TEXT_DIM))
+                f = p.font()
+                f.setPixelSize(10)
+                f.setBold(True)
+                p.setFont(f)
+                p.drawText(QRectF(0, LANE_TOP - 22, w, 12), Qt.AlignmentFlag.AlignCenter, f"×{gap.copies}")
+        if self._hover:
+            # 挿入の印 (線の下、札の真ん中の高さ)
+            cy = max(LANE_TOP + len(flow.LANES) * LANE_STEP + 12, self.height() / 2)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#3a3a3a"))
+            p.drawEllipse(QPointF(w / 2, cy), 11, 11)
+            p.setPen(QColor("white"))
+            f = p.font()
+            f.setPixelSize(16)
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(QRectF(0, cy - 11, w, 22), Qt.AlignmentFlag.AlignCenter, "＋")
+        p.end()
+
+
+def _cross(p: QPainter, x: float, y: float, color: str) -> None:
+    """消える印の ✕。"""
+    pen = QPen(QColor(color), 2.2)
+    p.setPen(pen)
+    p.drawLine(QPointF(x - 4, y - 4), QPointF(x + 4, y + 4))
+    p.drawLine(QPointF(x - 4, y + 4), QPointF(x + 4, y - 4))
+
+
+def flow_legend() -> str:
+    """流れの線の見方 (並びの上に出す)。"""
+    from . import kinds
+
+    def seg(color, style, label):
+        return (f'<span style="color:{color}; font-weight:bold">'
+                f'{"══" if style == "double" else "━━"}</span>'
+                f'<span style="color:{theme.TEXT_DIM}"> {label}</span>')
+    items = [seg(kinds.IMAGE_COLOR, "solid", "画像"),
+             f'<span style="color:{kinds.color_of("I2V")}; font-size:15px; font-weight:900">━━</span>'
+             f'<span style="color:{theme.TEXT_DIM}"> 動画 (太い線)</span>',
+             seg(kinds.TEXT_COLOR, "solid", "文字"),
+             seg(kinds.TEXT_COLOR, "double", "メモ (二重線)"),
+             seg(kinds.REF_COLOR, "solid", "リファレンス"),
+             f'<span style="color:{theme.TEXT_DIM}">● 作る・変える　'
+             f'<span style="color:#ef5350">✕</span> 使わずに捨てる　✕ 使い終わって消える　'
+             f'(線の色は生成の種類の色。矢印にマウスを乗せると説明)</span>']
+    return "&nbsp;&nbsp;&nbsp;".join(items)
 
 
 def use_label(on: bool) -> str:

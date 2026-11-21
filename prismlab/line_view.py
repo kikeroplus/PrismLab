@@ -21,11 +21,12 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 from gencommon import comfy, inserts, settings
 
-from . import engine, kinds, rating, recipes, recycle, theme
+from . import engine, flow, kinds, rating, recipes, recycle, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
 from .hover_preview import HoverPreview
+from .text_popup import TextPopup
 from .thumbs import MOVIE_EXTS, ThumbCache
-from .widgets import CARD_WIDTH, AddButton, Card, HScrollArea, InsertArrow, MachineCard, io_html
+from .widgets import CARD_WIDTH, AddButton, Card, HScrollArea, InsertArrow, MachineCard, flow_legend, io_html
 
 CONFIRM_COUNT = 30  # これを超える件数で始めるときは確かめる (generation-standard 6 章)
 RESULT_ICON = QSize(128, 128)
@@ -189,11 +190,18 @@ class LineView(QWidget):
         top.addStretch(1)
         root.addLayout(top)
 
+        # 流れの線の見方 (ステップのあいだの矢印の色・線の形)
+        self.legend = QLabel(flow_legend())
+        self.legend.setTextFormat(Qt.TextFormat.RichText)
+        self.legend.setStyleSheet("font-size: 11px;")
+        root.addWidget(self.legend)
+
         # ステップの並び
         self.flow_host = QWidget()
         self.flow = QHBoxLayout(self.flow_host)
         self.flow.setContentsMargins(2, 2, 2, 2)
         self.flow.setSpacing(0)
+        self.text_popup = TextPopup(self)  # 文のステップの札に乗せると、全文と日本語訳を出す
         scroll = HScrollArea()
         scroll.setWidget(self.flow_host)
         scroll.setWidgetResizable(True)
@@ -458,14 +466,17 @@ class LineView(QWidget):
                     v["detail"] = "LLM: " + str(s.get("model") or "(エンハンサーと同じ)")
                 elif s["type"] == recipes.TEXT:
                     v["detail"] = _front_mark(s.get("front")) + self._short(s.get("text", ""))
+                    v["full"] = str(s.get("text") or "")
                     v["front"] = bool(s.get("front"))
                     v["title"] = _named_title(s)
                 elif s["type"] == recipes.INSERT:
                     v["detail"] = _front_mark(s.get("front")) + "フォルダ: " + str(s.get("name", ""))
+                    v["folder"] = str(s.get("folder") or "")
                     v["front"] = bool(s.get("front"))
                     v["title"] = _named_title(s)
                 elif s["type"] in recipes.MEMO_TYPES:
                     v["detail"] = _memo_detail(s["type"], str(s.get("memo", "")), s.get("mode"))
+                    v["memo"] = str(s.get("memo") or "")
                     v["append"] = s.get("mode") in (recipes.APPEND, recipes.PREPEND)
                     v["front"] = s.get("mode") == recipes.PREPEND
                 elif s["type"] in recipes.REF_TYPES:
@@ -474,6 +485,10 @@ class LineView(QWidget):
                     v["refs"] = _ref_files(s["type"], image, folder)
                 elif s["type"] in TOOL_TYPES:
                     rules = s.get("rules") or []
+                    if s["type"] == recipes.SUB:
+                        v["full"] = "\n".join(f"{r[0]} => {r[1]}" for r in rules
+                                              if isinstance(r, (list, tuple)) and len(r) == 2) \
+                            if isinstance(rules, list) else str(rules)
                     v["count"], v["stars"] = int(s.get("count") or 2), int(s.get("stars") or 1)
                     v["detail"] = _tool_detail(s["type"], v["count"], v["stars"],
                                                [tuple(r) for r in rules] if isinstance(rules, list) else
@@ -495,6 +510,7 @@ class LineView(QWidget):
                 v["detail"] = "LLM: " + settings.enhance_model()
             elif s.type == recipes.TEXT:
                 v["detail"] = _front_mark(s.front) + self._short(s.text) if s.text.strip() else "(足す文を入れてください)"
+                v["full"] = s.text
                 v["front"], v["title"] = s.front, _named_title(s)
             elif s.type == recipes.INSERT:
                 if not s.folder:
@@ -505,9 +521,11 @@ class LineView(QWidget):
                     except inserts.InsertError as exc:
                         nxt = str(exc)
                     v["detail"] = f"{_front_mark(s.front)}フォルダ: {Path(s.folder).name}\n{nxt}"
+                v["folder"] = s.folder
                 v["front"], v["title"] = s.front, _named_title(s)
             elif s.type in recipes.MEMO_TYPES:
                 v["detail"] = _memo_detail(s.type, s.memo, s.mode)
+                v["memo"] = s.memo
                 v["append"] = s.mode in (recipes.APPEND, recipes.PREPEND)
                 v["front"] = s.mode == recipes.PREPEND
             elif s.type in recipes.REF_TYPES:
@@ -516,6 +534,8 @@ class LineView(QWidget):
             elif s.type in TOOL_TYPES:
                 v["count"], v["stars"] = s.count, s.stars
                 v["detail"] = _tool_detail(s.type, s.count, s.stars, recipes.parse_rules(s.rules))
+                if s.type == recipes.SUB:
+                    v["full"] = s.rules
             else:
                 v["kind"] = kinds.kind_of(s.workflow)
                 names = [p.name for p in comfy.workflows() if s.workflow and p.value.lower() == s.workflow.lower()]
@@ -531,6 +551,7 @@ class LineView(QWidget):
         return one if len(one) <= limit else one[:limit] + "…"
 
     def _rebuild_flow(self) -> None:
+        self.text_popup.hide()
         while self.flow.count():
             w = self.flow.takeAt(0).widget()
             if w is not None:
@@ -626,8 +647,10 @@ class LineView(QWidget):
         problems = set() if running_now else recipes.line_problems(self.recipe.stages, text_entry=texts)
         prev_out = ("文字", kinds.TEXT_COLOR) if texts else ("画像", kinds.IMAGE_COLOR)
         has_text = texts  # テキストの入口は、初めから文がある
+        lanes = flow.gaps(views, text_entry=texts)  # 矢印ごとに流れるもの (色の線で描く)
+        names = ["入口"] + [v.get("title") or recipes.STAGE_TITLES[v["type"]] for v in views] + ["出力"]
         for i, v in enumerate(views):
-            self.flow.addWidget(self._insert_arrow(i))
+            self.flow.addWidget(self._insert_arrow(i, lanes[i], f"{names[i]} → {names[i + 1]}"))
             card = Card()
             card.title.setText(v.get("title") or recipes.STAGE_TITLES[v["type"]])
             if v.get("title"):
@@ -759,12 +782,21 @@ class LineView(QWidget):
             if not running_now and i < len(stages):
                 card.bypass.setToolTip(self._bypass_tip(i))
             card.bypass_toggled.connect(lambda on, n=i: self._set_bypass(n, on))
+            if v["type"] in recipes.ADD_TYPES or v["type"] == recipes.SUB:
+                # 札の上の端から処理バーの上までに乗せたときだけ (2026-11-21 利用者の希望)
+                self.text_popup.attach(card, lambda v=v: self._popup_text(v),
+                                       lambda c=card: c.bar.geometry().top())
+            # 左へ・右へ (量産が動いているレシピでは並びを直せないので出さない)
+            card.moves.setVisible(not running_now and i < len(stages))
+            card.move_left.setEnabled(i > 0)
+            card.move_right.setEnabled(i < len(stages) - 1)
+            card.move_requested.connect(lambda step, n=i: QTimer.singleShot(0, lambda: self._move_stage(n, step)))
             card.clicked.connect(lambda n=i: self._edit_stage(n))
             card.menu_requested.connect(lambda pos, n=i: self._stage_menu(n, pos))
             self.flow.addWidget(card)
             self.stage_cards.append(card)
 
-        self.flow.addWidget(self._insert_arrow(len(views)))
+        self.flow.addWidget(self._insert_arrow(len(views), lanes[-1], f"{names[-2]} → 出力フォルダ"))
         self.add_stage = AddButton("＋ ステップ")
         self.add_stage.setMenu(self._type_menu(self.add_stage, lambda t: self._add_stage(t),
                                                paste_at=lambda: len(self.recipe.stages)))
@@ -795,9 +827,11 @@ class LineView(QWidget):
         menu.aboutToShow.connect(fill)
         return menu
 
-    def _insert_arrow(self, index: int) -> InsertArrow:
-        """index の位置 (0 = 入口のすぐあと) にステップを挿入する矢印。"""
+    def _insert_arrow(self, index: int, gap=None, where: str = "") -> InsertArrow:
+        """index の位置 (0 = 入口のすぐあと) にステップを挿入する矢印。gap (flow.Gap) があれば流れるものを線で描く。"""
         button = InsertArrow()
+        if gap is not None:
+            button.set_gap(gap, flow.describe(gap, where))
         button.set_menu(self._type_menu(button, lambda t: self._add_stage(t, index), paste_at=lambda: index))
         button.setEnabled(not self.locked())
         return button
@@ -969,9 +1003,9 @@ class LineView(QWidget):
             self._paste_stages(index if chosen is paste_left else index + 1)
             return
         if chosen in (left, right):
-            j = index - 1 if chosen is left else index + 1
-            stages[index], stages[j] = stages[j], stages[index]
-        elif chosen is duplicate:
+            self._move_stage(index, -1 if chosen is left else 1)
+            return
+        if chosen is duplicate:
             copy_stage = recipes.Stage.from_dict(stages[index].to_dict())
             copy_stage.bypass_group = ""  # 複製はまとまりに入れない (1 つだけのバイパスにする)
             stages.insert(index + 1, copy_stage)
@@ -979,6 +1013,29 @@ class LineView(QWidget):
             del stages[index]
         else:
             return
+        self._save_recipes()
+        self.refresh(rebuild=True)
+
+    @staticmethod
+    def _popup_text(v: dict) -> tuple:
+        """文のステップの札に乗せたときに出す (見出し, 文)。差し込みは次に使う .txt の中身。"""
+        if v["type"] == recipes.INSERT:
+            folder = v.get("folder") or ""
+            if not folder:
+                return "", ""
+            nxt = inserts.peek(folder).next_file
+            return f"差し込み — 次に使う: {nxt.name}", nxt.read_text(encoding="utf-8-sig", errors="replace")
+        if v["type"] == recipes.SUB:
+            return "置き換えの決まり", v.get("full") or ""
+        return recipes.STAGE_TITLES[v["type"]] + (f" — {v['title']}" if v.get("title") else ""), v.get("full") or ""
+
+    def _move_stage(self, index: int, step: int) -> None:
+        """index 番目のステップを左 (-1) か右 (+1) の隣と入れ替える (札の ◀ ▶ と右クリックの「左へ」「右へ」)。"""
+        stages = self.recipe.stages
+        j = index + step
+        if self.locked() or not (0 <= index < len(stages)) or not (0 <= j < len(stages)):
+            return
+        stages[index], stages[j] = stages[j], stages[index]
         self._save_recipes()
         self.refresh(rebuild=True)
 
