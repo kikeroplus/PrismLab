@@ -304,7 +304,7 @@ PromptWordCrafter・ImageMimicArt・J-Rate の「作る」部分をまとめる�
 
 ## 6. ほかのアプリのレシピで生成する (2026-11-22 利用者の決定)
 
-生成の設定はすべて PrismLab で行う。PromptWordCrafter・MuseFactory・J-Rate は、PrismLab が出したレシピを選んで生成するだけにする (「選んでポン」)。PrismLab の画面は出さない。各アプリの「生成の設定」「図で設定」は、新しい形で困らないと確かめてから外す (7 章の 4)。
+生成の設定はすべて PrismLab で行う。PromptWordCrafter・MuseFactory・J-Rate は、PrismLab が出したレシピを選んで生成するだけにする (「選んでポン」)。PrismLab の画面は出さない。PWC・MuseFactory の「生成する」「生成ジョブ」「生成の設定」「図で設定」は外した (2026-11-22。利用者が本物の ComfyUI で生成できるのを確かめてから。右クリックの生成・MuseFactory の作業タブの「保存して生成する...」もレシピを選ぶ形にした)。
 
 ### 出すレシピ (PrismLab)
 
@@ -343,7 +343,7 @@ PromptWordCrafter・ImageMimicArt・J-Rate の「作る」部分をまとめる�
 3. 物語 (この版で最初の形。実機で使いながら直す)
 4. 旧アプリから生成を外す — **PrismLab が安定するまで保留** (2026-11-15 利用者が決定。2026-11-16 にも PWC の生成は残すと確認)。それまで PromptWordCrafter・ImageMimicArt・J-Rate の生成は今のまま残し、並べて使う。
 5. ほかのアプリから送る (5 章。2026-11-16)
-6. ほかのアプリのレシピで生成する (6 章。2026-11-22): PWC・MuseFactory は済み。J-Rate (C#) はこれから。新しい形で困らないと確かめたら、PWC・MuseFactory の「生成する」「生成の設定」「図で設定」を外す
+6. ほかのアプリのレシピで生成する (6 章。2026-11-22): PWC・MuseFactory は済み (前の生成の画面も外した)。J-Rate (C#) はこれから
 
 ## 8. まだやっていないこと (この版)
 
