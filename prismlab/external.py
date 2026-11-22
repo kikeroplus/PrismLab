@@ -24,7 +24,8 @@ from . import engine, recipes
 EXT_DIR = "external"
 STATUS_FILE = "external_status.json"
 KEEP_FINISHED = 30 * 60  # 終わったものも、これだけのあいだは進み具合に残す (頼んだアプリが「完了」を見られるように)
-RESULTS_DIR = "生成結果"  # PromptWordCrafter・MuseFactory の出力の置き場所 (テキストのフォルダの中)
+RESULTS_DIR = "生成結果"
+MAX_PATHS = 1000  # 進み具合に書く出来たファイルの数の上限  # PromptWordCrafter・MuseFactory の出力の置き場所 (テキストのフォルダの中)
 
 
 def out_dir_for(app: str, source: str) -> str:
@@ -66,6 +67,8 @@ class Request:
                                 for m in self.engine.machines]
             run = self.engine.run
             data["errors"] = [it.error.splitlines()[0] for it in (run.items if run else []) if it.error][:5]
+            # 出来たファイル (J-Rate はこれを読んで、開いているフォルダの一覧に足す)
+            data["paths"] = [o["path"] for it in (run.items if run else []) for o in it.outputs][:MAX_PATHS]
         return data
 
 

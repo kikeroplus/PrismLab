@@ -146,7 +146,9 @@ def handle(window: MainWindow, data: bytes) -> None:
     if not isinstance(message, dict):
         return
     cmd = message.get("cmd")
-    if cmd == "send":
+    if cmd == "show":
+        window.bring_to_front()
+    elif cmd == "send":
         QTimer.singleShot(0, lambda: window.receive(message))
     elif cmd == "run":
         # その場で受け付ける (後回しにすると、裏で終わろうとしているときに受け付けずに消えることがある)
