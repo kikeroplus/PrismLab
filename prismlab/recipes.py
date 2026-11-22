@@ -12,6 +12,12 @@ from typing import Optional
 from gencommon import reader, store
 
 RECIPES_FILE = "recipes.json"
+# ほかのアプリに出すレシピ (2026-11-22 利用者の決定: 設定はすべて PrismLab で行い、PromptWordCrafter・MuseFactory・J-Rate は
+# 出してもらったレシピを選んで生成するだけ)。レシピを保存するたびに書く。ほかのアプリはこれだけを読む (spec 6 章)
+PUBLISHED_FILE = "published.json"
+APPS = ("PromptWordCrafter", "MuseFactory", "J-Rate")  # レシピを出せるアプリ
+TEXT_APPS = ("PromptWordCrafter", "MuseFactory")  # テキストを入口にするアプリ (J-Rate は画像)
+APP_SHORT = {"PromptWordCrafter": "PWC", "MuseFactory": "MuseFactory", "J-Rate": "J-Rate"}
 LAST_FILE = "last_recipe.txt"
 MACHINES_FILE = "machines.txt"  # 台 (1 行に 1 つ、接続先の URL)。最大 3 台
 MACHINES_OFF_FILE = "machines_off.txt"  # 休みの台 (1 行に 1 つ)。台の設定には残したまま、一時的に使わない
@@ -143,12 +149,13 @@ class Recipe:
     picked: list = field(default_factory=list)  # 送られたファイル (画像だけか .txt だけ)。もう一度送ると置き換える
     picked_from: str = ""  # 送ったアプリ (J-Rate / PromptWordCrafter)
     picked_back: str = ""  # 送られる前の入口の種類 (「× 外す」で戻る)
+    apps: list = field(default_factory=list)  # このレシピを出すアプリ (APPS のどれか。空 = どこにも出さない)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "folder": self.folder, "min_stars": self.min_stars,
                 "output_dir": self.output_dir, "source": self.source, "image": self.image, "repeat": self.repeat,
                 "inherit": self.inherit, "picked": list(self.picked), "picked_from": self.picked_from,
-                "picked_back": self.picked_back,
+                "picked_back": self.picked_back, "apps": list(self.apps),
                 "stages": [s.to_dict() for s in self.stages]}
 
     @property
@@ -187,6 +194,8 @@ class Recipe:
         r.picked = [str(p) for p in picked if p] if isinstance(picked, list) else []
         r.picked_from = str(data.get("picked_from") or "")
         r.picked_back = data.get("picked_back") if data.get("picked_back") in (FOLDER, SINGLE, TEXTS) else ""
+        apps = data.get("apps")
+        r.apps = [a for a in APPS if isinstance(apps, list) and a in apps]
         if r.source == PICKED and not r.picked:
             r.source = r.picked_back or FOLDER
         try:
@@ -437,6 +446,49 @@ def load() -> list[Recipe]:
 def save(recipes: list[Recipe]) -> None:
     store.write_text(store.app_file(RECIPES_FILE),
                      json.dumps([r.to_dict() for r in recipes], ensure_ascii=False, indent=2))
+    write_published(recipes)
+
+
+def flow_summary(stages: list) -> str:
+    """「読み取り → 盛る → 生成 (動画)」(バイパスしたものは除く)。"""
+    from . import kinds
+    parts = []
+    for st in stages:
+        if st.bypass:
+            continue
+        title = stage_title(st)
+        if st.type == GEN:
+            kind = kinds.kind_of(st.workflow)
+            name = Path(st.workflow).stem if st.workflow else ""
+            title += f" ({name})" if name else ""
+            title += " 🎬" if kind and kinds.is_video(kind) else ""
+        parts.append(title)
+    return " → ".join(parts)
+
+
+def published_entries(recipes: list[Recipe]) -> list[dict]:
+    """ほかのアプリに出すレシピ。入口に合わない (テキストのアプリに画像の要るレシピなど) ものは ok を False にして理由を添える。"""
+    items = []
+    for index, r in enumerate(recipes):
+        if not r.apps:
+            continue
+        item = {"name": r.name, "index": index, "apps": list(r.apps), "flow": flow_summary(r.stages),
+                "repeat": r.repeat, "problems": {}}
+        for app in r.apps:
+            text = app in TEXT_APPS
+            if line_problems(r.stages, text_entry=text):
+                item["problems"][app] = ("このレシピはテキストからは始められません (画像の要るステップがあります)" if text
+                                         else "このレシピは画像からは始められません")
+        items.append(item)
+    return items
+
+
+def write_published(recipes: list[Recipe]) -> None:
+    try:
+        store.write_text(store.app_file(PUBLISHED_FILE),
+                         json.dumps({"version": 1, "recipes": published_entries(recipes)}, ensure_ascii=False, indent=1))
+    except OSError:
+        pass
 
 
 def last_index() -> int:

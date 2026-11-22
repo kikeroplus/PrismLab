@@ -78,6 +78,9 @@ class Item:
     prompt_id: str = ""
     # 増やすで分かれた枝の番号 (0 から)。差し込みの割り当て (plan) を枝ごとに引くのに使う
     branch: int = 0
+    # この件の出力フォルダ (空なら量産の出力フォルダ)。ほかのアプリから頼まれた生成で、そのアプリの決まりの場所に出すとき
+    # (PromptWordCrafter・MuseFactory: テキストのフォルダの「生成結果」、J-Rate: 元画像と同じフォルダ。spec 6 章)
+    out_dir: str = ""
     status: str = ""  # 進み具合の文 (保存しない)
     at: str = ""  # いま動いている台の URL (保存しない)
     skips: int = 0  # 同じワークフローを寄せるために後回しにした回数 (保存しない)
@@ -94,7 +97,7 @@ class Item:
         if not isinstance(data, dict) or not data.get("source"):
             return None
         it = Item(str(data["source"]))
-        for key in ("current", "error", "machine", "prompt_id", "read_name", "reference", "last_frame"):
+        for key in ("current", "error", "machine", "prompt_id", "read_name", "reference", "last_frame", "out_dir"):
             setattr(it, key, str(data.get(key) or ""))
         it.current = it.current or it.source
         for key in ("text", "enhanced", "origin_text"):
@@ -981,7 +984,8 @@ class Engine(QObject):
                              state=DONE if nxt >= len(run.stages) else WAITING,
                              text=it.text, origin_text=it.origin_text, enhanced=it.enhanced, read_name=it.read_name,
                              adds=[dict(a) for a in it.adds], reference=it.reference, last_frame=it.last_frame,
-                             memos=json.loads(json.dumps(it.memos)), plan=dict(it.plan), branch=it.branch * count + c)
+                             memos=json.loads(json.dumps(it.memos)), plan=dict(it.plan), branch=it.branch * count + c,
+                             out_dir=it.out_dir)
                 clones.append(clone)
             it.branch *= count
             at = run.items.index(it) + 1
@@ -1079,7 +1083,7 @@ class Engine(QObject):
             reference=it.reference or None,
             last_frame=it.last_frame or None,
             reader={"name": it.read_name} if it.read_name else None,
-            output_dir=run.output_dir,
+            output_dir=it.out_dir or run.output_dir,
         )
         if self.run_file is not None:
             # 量産・試作: 入口のファイルを記録に残す (PromptWordCrafter の生成結果の帯がテキストからたどる)

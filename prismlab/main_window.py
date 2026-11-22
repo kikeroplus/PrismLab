@@ -2,13 +2,13 @@
 
 import time
 
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, Signal
 from PySide6.QtWidgets import QMainWindow, QMessageBox, QPushButton, QTabWidget, QToolBar
 
 from gencommon import enhancer, reader
 from gencommon.comfy_dialogs import ComfySettingsDialog
 
-from . import engine, recipes, settings, theme
+from . import engine, external, recipes, settings, theme
 from .line_view import LineView
 from .story_view import StoryView
 
@@ -16,11 +16,19 @@ AWAY_SECONDS = 1.0  # これより長くほかのウィンドウにいたら、�
 
 
 class MainWindow(QMainWindow):
+    closed_to_tray = Signal()  # 頼まれた生成が動いているので、閉じずに隠した
+
     def __init__(self, notice: str = ""):
         super().__init__()
         self.setWindowTitle("PrismLab")
         self.engine = engine.Engine(self)
         self.engine.set_machines(recipes.machines())
+        # ほかのアプリから頼まれた生成 (spec 6 章)。画面を出していなくても裏で動く
+        self.external = external.ExternalRuns(self)
+        # 裏で起動した (--background) ときは、量産・物語の「続きから始める」を、画面を初めて出すときに聞く
+        self.background_start = False
+        self._resume_offered = False
+        recipes.write_published(recipes.load())  # ほかのアプリに出すレシピ (保存していなくても今の中身で書いておく)
 
         self.line = LineView(self.engine)
         self.tabs = QTabWidget()
@@ -71,6 +79,21 @@ class MainWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
+        if self.background_start and not self._resume_offered:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self.offer_resume)
+
+    def busy(self) -> bool:
+        """量産ライン・物語・ほかのアプリから頼まれた生成のどれかが動いているか。"""
+        run = self.engine.run
+        line = run is not None and run.unfinished > 0 and self.engine.active
+        return bool(line or self.story.batch.active or self.story.busy() or self.external.active())
+
+    def quit_quietly(self) -> None:
+        """画面を出していないときに終わる (動いているものがないとき。裏で起動して、頼まれたものが終わった)。"""
+        self.engine.stop_threads()
+        self.story.shutdown()
+        self.external.stop_threads()
 
     # ほかのアプリから送られたもの (spec 5 章) ------------------------------------
     def receive(self, message: dict) -> None:
@@ -132,6 +155,9 @@ class MainWindow(QMainWindow):
 
     # 続きから始める ---------------------------------------------------------
     def offer_resume(self) -> None:
+        if self._resume_offered:
+            return
+        self._resume_offered = True
         self._offer_line_resume()
         self.story.offer_batch_resume()
 
@@ -166,6 +192,13 @@ class MainWindow(QMainWindow):
 
     # 閉じる -----------------------------------------------------------------
     def closeEvent(self, event) -> None:
+        if self.external.active():
+            # ほかのアプリから頼まれた生成が動いている: 画面を閉じるだけにして、裏で続ける (量産・物語も止めない)
+            event.ignore()
+            settings.save_geometry(self)
+            self.hide()
+            self.closed_to_tray.emit()
+            return
         if self.story.batch.active:
             # バッチは待ち行列に残すが、今作っている候補は受け取れない
             if QMessageBox.question(self, "閉じる", "物語のバッチを作っています。閉じると、今作っている候補は受け取れません"
@@ -209,6 +242,11 @@ class MainWindow(QMainWindow):
         else:
             self.engine.stop_threads()
         self.story.shutdown()
+        self.external.stop_threads()
         settings.save_geometry(self)
         event.accept()
+        # 画面を閉じても終わらない設定にしてある (裏で続けるため) ので、ここで終わる
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+        QTimer.singleShot(0, lambda: QApplication.instance().exit(0))
 

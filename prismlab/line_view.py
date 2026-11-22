@@ -222,7 +222,20 @@ class LineView(QWidget):
         self.inherit_box = QCheckBox("元の★を引き継ぐ")
         self.inherit_box.setToolTip("1 件が終わった時点の元の★を、その件で出来たファイルに付けます (更新日時は変えません)。")
         self.inherit_box.toggled.connect(self._inherit_changed)
+        # ほかのアプリに出す (2026-11-22。PromptWordCrafter・MuseFactory・J-Rate のレシピの一覧に出す)
+        self.apps_button = QPushButton()
+        self.apps_button.setToolTip("このレシピを、ほかのアプリ (PromptWordCrafter・MuseFactory・J-Rate) のレシピの一覧に出します。"
+                                    "出したアプリでは、ファイルを選んでレシピを押すと、PrismLab の画面を出さずに裏で生成します。")
+        self.apps_menu = QMenu(self)
+        self.apps_actions = {}
+        for name in recipes.APPS:
+            action = self.apps_menu.addAction(name)
+            action.setCheckable(True)
+            action.toggled.connect(lambda on, n=name: self._app_toggled(n, on))
+            self.apps_actions[name] = action
+        self.apps_button.setMenu(self.apps_menu)
         out_row.addWidget(self.out_label, 1)
+        out_row.addWidget(self.apps_button)
         out_row.addWidget(self.inherit_box)
         out_row.addWidget(self.out_change)
         out_row.addWidget(self.out_reset)
@@ -1158,6 +1171,23 @@ class LineView(QWidget):
         else:
             self._choose_folder()
 
+    def _app_toggled(self, name: str, on: bool) -> None:
+        apps = [a for a in recipes.APPS if (a == name and on) or (a != name and a in self.recipe.apps)]
+        if apps != self.recipe.apps:
+            self.recipe.apps = apps
+            self._save_recipes()
+            self._show_apps()
+            shown = "・".join(recipes.APP_SHORT[a] for a in apps)
+            self.status.emit(f"「{self.recipe.name}」を出すアプリ: {shown or 'なし'}")
+
+    def _show_apps(self) -> None:
+        apps = self.recipe.apps
+        self.apps_button.setText("ほかのアプリに出す: " + (" · ".join(recipes.APP_SHORT[a] for a in apps) if apps else "なし"))
+        for name, action in self.apps_actions.items():
+            action.blockSignals(True)
+            action.setChecked(name in apps)
+            action.blockSignals(False)
+
     def _inherit_changed(self, on: bool) -> None:
         if self.recipe.inherit != on:
             self.recipe.inherit = on
@@ -1841,6 +1871,7 @@ class LineView(QWidget):
         else:
             self.breakdown.setText("" if showing else self._star_breakdown(self._scanned_files))
         self.rate_button.setVisible(not showing and source == recipes.FOLDER)
+        self._show_apps()
         self.inherit_box.blockSignals(True)
         self.inherit_box.setChecked(bool(run.recipe.get("inherit", True)) if showing else self.recipe.inherit)
         self.inherit_box.setEnabled(not showing and not texts)  # テキストには★がない
