@@ -2004,6 +2004,9 @@ class LineView(QWidget):
                 text = " / ".join(f"{Path(it.current).name}: {it.status or '準備中'}" for it in mine)
             else:
                 text = "待機中" if running else ""
+                others = self.engine.pool.used(url)  # ほかのアプリの頼み・物語がこの台で動かしている数
+                if others:
+                    text = (text + " · " if text else "") + f"ほかの生成が {others} 件使っています"
             card.status.setText(text)
             card.set_down(m.state != engine.UP)
 

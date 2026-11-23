@@ -5,7 +5,8 @@ PromptWordCrafter・MuseFactory・J-Rate は、PrismLab が出したレシピ (p
 頼まれた 1 件ごとに自分の生成の窓口 (Engine) を作って裏で動かす。台の空きは量産ライン・物語と分け合う (engine.POOL)。
 
 - 出来たファイルはそのアプリの決まりの場所に置く (PWC・MuseFactory: テキストのフォルダの「生成結果」、J-Rate: 元画像と同じフォルダ)。
-- 台は頼んだアプリが選んだもの (アプリごとに違う台を使える)。
+- 台は頼んだアプリが選んだもの (アプリごとに違う台を使える)。動いているあいだにそのアプリで台の設定を変えると
+  {"cmd": "machines", "from", "machines"} が来て、そのアプリの動いている頼みの台も入れ替える。
 - 進み具合は %APPDATA%\\PrismLab\\external_status.json に書く (頼んだアプリが読んで出す)。
 - 終わっていないものは %APPDATA%\\PrismLab\\external\\(番号).json に書き、次に PrismLab が起動したときに聞かずに続ける。
 """
@@ -168,6 +169,28 @@ class ExternalRuns(QObject):
         eng.finished.connect(lambda r=req: self._finished(r))
         req.engine = eng
         eng.start(run)
+
+    def set_machines(self, message: dict) -> int:
+        """{"cmd": "machines", "from", "machines"}: そのアプリで台の設定を変えた。動いている頼みの台も入れ替える
+        (2026-11-23 利用者の希望: PWC で台を変えたら、動いている生成もその台で続ける)。
+        外した台で動いている件は最後まで動かし、その台の待ち行列に入れただけの件はほかの台で頼み直す。戻り値は入れ替えた頼みの数。"""
+        app = str(message.get("from") or "")
+        urls = [str(u).rstrip("/") for u in message.get("machines") or [] if isinstance(u, str) and u.strip()]
+        urls = urls[:recipes.MAX_MACHINES]
+        count = 0
+        for req in self.requests.values():
+            if req.app != app or req.engine is None or req.finished_at is not None or req.canceled or req.error:
+                continue
+            eng = req.engine
+            if eng.run is not None:
+                ext = eng.run.recipe.get("external")
+                if isinstance(ext, dict):
+                    ext["machines"] = list(urls)  # 次に PrismLab が起動して続けるときも、この台で
+            eng.set_machines(urls)
+            eng._save()  # noqa: SLF001 - 続きのファイルにも新しい台を書く
+            count += 1
+        self._schedule()
+        return count
 
     def resume(self) -> int:
         """前に終わらなかった頼みを続ける (聞かない)。戻り値は続けた数。"""

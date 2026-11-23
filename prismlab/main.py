@@ -153,6 +153,8 @@ def handle(window: MainWindow, data: bytes) -> None:
     elif cmd == "run":
         # その場で受け付ける (後回しにすると、裏で終わろうとしているときに受け付けずに消えることがある)
         window.external.receive(message)
+    elif cmd == "machines":  # ほかのアプリで台の設定を変えた: 動いている頼みの台も入れ替える
+        QTimer.singleShot(0, lambda: window.external.set_machines(message))
     elif cmd == "run_cancel":
         QTimer.singleShot(0, lambda: window.external.cancel(str(message.get("id") or "")))
 
