@@ -7,6 +7,7 @@
 - 状態が変わるたびに %APPDATA%\\PrismLab\\line_run.json に書く (続きから始めるため)。
 """
 
+import itertools
 import json
 import threading
 import time
@@ -29,6 +30,10 @@ SEEN_SECONDS = 3.0  # これより前に空きを求められていない台は�
 # 同じワークフローを同じ台に寄せる (2026-11-18 利用者の希望。画像と動画が混じるレシピで、ComfyUI がモデルを読み直す回数を
 # 減らす)。緩い重み付け: 台が空いたら、待っている生成の先頭から AFFINITY_LOOKAHEAD 件のうち、その台が最後に動かした
 # ワークフローと同じものを先に取る。先頭の件は AFFINITY_MAX_SKIPS 回まで後回しにしたら、次は必ず取る (待たせすぎない)
+# 「英語に」で LLM に繋がらなかったら、訳さずに先へ進める (2026-11-23 利用者の希望: LLM が落ちていても、
+# LLM の要らないレシピは止めない)。繋がらなかったあと、これだけのあいだは確かめずに飛ばす (件ごとに待たないように)
+LLM_DOWN_SKIP = 60.0
+ENGLISH_SKIPPED = "LLM に繋がらないので、英語にせずに送りました"
 AFFINITY_LOOKAHEAD = 6
 AFFINITY_MAX_SKIPS = 3
 _last_workflow: dict = {}  # 台の URL の小文字 → 最後に送ったワークフローのパスの小文字 (量産ラインと物語で共通)
@@ -74,6 +79,8 @@ class Item:
     plan: dict = field(default_factory=dict)  # 差し込みの割り当て (ステップの番号の文字 → 枠の形)。始めたときに決める
     error: str = ""
     error_stage: int = -1
+    # 知らせ (失敗ではない)。いまは「LLM に繋がらないので英語にせずに進めた」だけ (2026-11-23 利用者の希望)
+    warning: str = ""
     machine: str = ""  # 頼み済みの台の URL (prompt_id とセット)
     prompt_id: str = ""
     # 増やすで分かれた枝の番号 (0 から)。差し込みの割り当て (plan) を枝ごとに引くのに使う
@@ -97,7 +104,8 @@ class Item:
         if not isinstance(data, dict) or not data.get("source"):
             return None
         it = Item(str(data["source"]))
-        for key in ("current", "error", "machine", "prompt_id", "read_name", "reference", "last_frame", "out_dir"):
+        for key in ("current", "error", "warning", "machine", "prompt_id", "read_name", "reference", "last_frame",
+                    "out_dir"):
             setattr(it, key, str(data.get(key) or ""))
         it.current = it.current or it.source
         for key in ("text", "enhanced", "origin_text"):
@@ -358,58 +366,129 @@ def load_run() -> Optional[Run]:
         return None
 
 
+class _Client:
+    """台の空きを求めるエンジン 1 つ (量産ライン・物語・ほかのアプリの頼み 1 件ごと)。"""
+
+    def __init__(self, first: bool):
+        self.first = first  # 先にする側 (物語)
+        self.free = 0  # 生成を待っている件のうち、どの台にも頼んでいないもの
+        self.pinned: dict[str, int] = {}  # 台の URL の小文字 → その台に頼み済みで続きを待つ件数
+        self.seen: dict[str, float] = {}  # 台 → このエンジンが最後にその台の空きを見に来た時刻 (その台を使える)
+        self.served = 0.0  # 最後に空きをもらった時刻 (同じ数を使っているときは、長く待っている側が先)
+        self.wake: Optional[Callable[[], None]] = None
+
+
 class SlotPool:
-    """台の空き (1 台に同時に SLOTS_PER_MACHINE 件まで) を、量産ラインと物語のエンジンで分け合う (2026-11-17 利用者の決定)。
-    両方が待っているときは、先にする側 (物語) に次の空きを渡す: 先にする側に生成を待っている件があるあいだは、
-    もう一方はその件数ぶんの空きを残す。追い出しはしない (動いているものは最後まで)。"""
+    """台の空き (1 台に同時に SLOTS_PER_MACHINE 件まで) を、PrismLab の中のエンジン全部
+    (量産ライン・物語・ほかのアプリの頼み) で分け合う。
+
+    2026-11-17 利用者の決定: 物語が先 (両方が待っているときは、空いた台を物語に渡す)。
+    2026-11-23 利用者の希望: 後から頼んだ側 (例: 量産ラインが台を埋めているときの PWC) をずっと待たせない。
+    台に空きが出たら、その台を使える・生成を待っている側のうち、**使っている数がいちばん少ない側**に渡す
+    (同じなら、長く待っている側)。台が 2 台・量産ラインが 4 件使っているところに PWC が頼むと、次に空いた空きは PWC に行き、
+    やがて 2 件ずつになる (PWC の 1 件目は、その台の待ち行列の 2 番目に入る)。追い出しはしない (動いているものは最後まで)。
+    空きが出たら待っている側を起こすので、台を空けたらすぐに使う。"""
 
     def __init__(self, slots: int = SLOTS_PER_MACHINE):
         self.slots = slots
         self._lock = threading.Lock()
-        self._used: dict[str, int] = {}  # 台の URL の小文字 → 使っている数
-        self._first_demand = 0  # 先にする側で、生成を待っている件数 (先にする側のエンジンが知らせる)
-        self._seen: dict[str, float] = {}  # 台 → 最後に空きを求められた時刻 (その台は動いている)
+        self._used: dict[str, int] = {}  # 台の URL の小文字 → 使っている数 (全員で)
+        self._held: dict[tuple, int] = {}  # (エンジン, 台) → そのエンジンが使っている数
+        self._clients: dict[int, _Client] = {}
         self.peak: dict[str, int] = {}  # 台ごとの同時に使った最大の数 (テストで見る)
 
-    def set_demand(self, count: int) -> None:
-        with self._lock:
-            self._first_demand = max(0, count)
+    # ------------------------------------------------------------------
+    def _client(self, key: int, first: bool = False) -> _Client:
+        c = self._clients.get(key)
+        if c is None:
+            c = self._clients[key] = _Client(first)
+        return c
 
-    def take(self, url: str, first: bool, balance: bool = True) -> bool:
+    def set_demand(self, key: int, first: bool, free: int, pinned: dict, wake=None) -> None:
+        """そのエンジンで生成を待っている件数を知らせる (free: どの台にも頼んでいない件、pinned: 台 → 頼み済みの件)。"""
+        with self._lock:
+            c = self._client(key, first)
+            c.first = first
+            c.free = max(0, free)
+            c.pinned = {u.lower(): n for u, n in pinned.items() if n > 0}
+            if wake is not None:
+                c.wake = wake
+
+    def forget(self, key: int) -> None:
+        """終わったエンジン (使っている空きがなければ外す)。"""
+        with self._lock:
+            if not any(n for (k, _u), n in self._held.items() if k == key):
+                self._clients.pop(key, None)
+
+    def alive(self, key: int, url: str) -> None:
+        """そのエンジンはその台を使える (エンジンのスレッドが見回るたびに知らせる)。"""
+        with self._lock:
+            self._client(key).seen[url.lower()] = time.monotonic()
+
+    def _held_total(self, key: int) -> int:
+        return sum(n for (k, _u), n in self._held.items() if k == key)
+
+    def _wants(self, c: _Client, url: str, now: float) -> bool:
+        return (c.free > 0 or c.pinned.get(url, 0) > 0) and now - c.seen.get(url, -1e9) <= SEEN_SECONDS
+
+    def _winner(self, url: str, now: float) -> Optional[int]:
+        """その台に次の空きを渡す相手 (ロックを持って呼ぶ)。"""
+        cands = [(k, c) for k, c in self._clients.items() if self._wants(c, url, now)]
+        if any(c.first for _k, c in cands):
+            cands = [(k, c) for k, c in cands if c.first]
+        if not cands:
+            return None
+        return min(cands, key=lambda kc: (self._held_total(kc[0]), kc[1].served))[0]
+
+    def take(self, key: int, url: str, pinned: bool = False) -> bool:
         """空きをもらう。もらえなければ False。
-        balance: 使っている数がもっと少ない台が動いていれば (ここ数秒、その台に空きを求めてきた)、そちらに譲る
-        (2 台あるのに 1 台に 2 件たまり、もう 1 台が遊ぶことがないように)。頼み済みの件 (その台で続きを待つ) は譲らない。"""
-        key = url.lower()
+        pinned: その台に頼み済みの件 (ComfyUI の待ち行列に入っているので、空きがあれば順番は見ない)。
+        そうでなければ、その台の次の番がこのエンジンのときだけ。さらに、このエンジンが使える台のうち
+        使っている数がもっと少ない台でも次の番なら、そちらに譲る (2 台あるのに 1 台に 2 件たまり、もう 1 台が遊ばないように)。"""
+        k = url.lower()
         now = time.monotonic()
         with self._lock:
-            self._seen[key] = now
-            used = self._used.get(key, 0)
-            room = self.slots if first else self.slots - min(self._first_demand, self.slots)
-            if used >= room:
+            c = self._client(key)
+            c.seen[k] = now
+            used = self._used.get(k, 0)
+            if used >= self.slots:
                 return False
-            if balance and any(self._used.get(k, 0) < used for k, t in self._seen.items()
-                               if k != key and now - t <= SEEN_SECONDS):
-                return False
-            self._used[key] = used + 1
-            self.peak[key] = max(self.peak.get(key, 0), used + 1)
+            if not pinned:
+                if self._winner(k, now) != key:
+                    return False
+                for other, t in c.seen.items():
+                    if other != k and now - t <= SEEN_SECONDS and self._used.get(other, 0) < used \
+                            and self._winner(other, now) == key:
+                        return False
+            self._used[k] = used + 1
+            self._held[(key, k)] = self._held.get((key, k), 0) + 1
+            c.served = now
+            self.peak[k] = max(self.peak.get(k, 0), used + 1)
             return True
 
-    def alive(self, url: str) -> None:
-        """その台は動いている (エンジンのスレッドが見回るたびに知らせる。譲る先を決めるため)。"""
+    def put_back(self, key: int, url: str) -> None:
+        k = url.lower()
         with self._lock:
-            self._seen[url.lower()] = time.monotonic()
-
-    def put_back(self, url: str) -> None:
-        key = url.lower()
-        with self._lock:
-            self._used[key] = max(0, self._used.get(key, 0) - 1)
+            self._used[k] = max(0, self._used.get(k, 0) - 1)
+            n = self._held.get((key, k), 0) - 1
+            if n > 0:
+                self._held[(key, k)] = n
+            else:
+                self._held.pop((key, k), None)
+            wakes = [c.wake for c in self._clients.values() if c.wake is not None]
+        for wake in wakes:  # 空きが出た: 待っている側をすぐに起こす (ロックの外で)
+            try:
+                wake()
+            except RuntimeError:  # 消えたエンジン
+                pass
 
     def used(self, url: str) -> int:
         with self._lock:
             return self._used.get(url.lower(), 0)
 
 
-POOL = SlotPool()  # アプリの中で 1 つ (量産ラインと物語のエンジンが共有する)
+POOL = SlotPool()  # PrismLab の中で 1 つ (量産ライン・物語・ほかのアプリの頼みが共有する)
+_keys = itertools.count(1)
 
 
 def _cancel_prompts(pairs: list) -> None:
@@ -463,7 +542,8 @@ class Engine(QObject):
         super().__init__(parent)
         self.run_file = run_file  # 続きから始めるための書き出し先 (None = 書かない。物語の候補づくりなど)
         self.first = first  # 台の空きを先にもらう側 (物語。量産ラインと両方が待っているとき)
-        self.pool = pool or POOL  # 台の空き (量産ラインと物語で共有)
+        self.pool = pool or POOL  # 台の空き (PrismLab の中のエンジン全部で共有)
+        self._key = next(_keys)  # 台の空きの置き場での、このエンジンの番号
         self.run: Optional[Run] = None
         self.machines: list[Machine] = []
         self.llm_status = ""
@@ -474,6 +554,7 @@ class Engine(QObject):
         self._save_failed = False
         self._passed: Optional[Item] = None  # _pick が後回しにした先頭の件 (ロックを持って使う)
         self._english: dict = {}  # 英語に: 訳した文の覚え (元の文 → 訳。LLM のスレッドだけが使う)
+        self._llm_down_until = 0.0  # 英語に: LLM に繋がらなかった。この時刻までは確かめずに訳さずに進める
 
     # ------------------------------------------------------------------
     # 外から呼ぶもの (画面のスレッド)
@@ -798,10 +879,10 @@ class Engine(QObject):
                         break
                     self._publish()
                     if m.state == UP:
-                        self.pool.alive(url)
+                        self.pool.alive(self._key, url)
                         it = self._pick(gen=True, url=url)
-                        # 台の空きは量産ラインと物語で分け合う (1 台に合わせて 2 件まで。物語が先)
-                        if it is not None and self.pool.take(url, self.first, balance=not it.machine):
+                        # 台の空きはエンジン全部で分け合う (1 台に合わせて 2 件まで。物語が先、あとは使っている数の少ない側)
+                        if it is not None and self.pool.take(self._key, url, pinned=bool(it.machine)):
                             if self._passed is not None:
                                 self._passed.skips += 1
                             _set_last_workflow(url, str(self.run.stages[it.stage].get("workflow", "")))
@@ -817,10 +898,9 @@ class Engine(QObject):
             try:
                 self._run_gen(it, m, cancel)
             finally:
-                self.pool.put_back(url)
-                if self.first:
-                    with self._cond:
-                        self._publish()
+                with self._cond:
+                    self._publish()
+                self.pool.put_back(self._key, url)
 
     def _recheck(self, m: Machine) -> None:
         ok = comfy.test_connection(m.url) is None
@@ -1008,10 +1088,19 @@ class Engine(QObject):
         todo = [t for t in dict.fromkeys(parts) if needs_english(t) and t not in self._english]
         snap = {"url": stage.get("url") or settings.llm_url(), "model": stage.get("model") or settings.enhance_model()}
         for n, text in enumerate(todo):
+            if time.monotonic() < self._llm_down_until:
+                it.warning = ENGLISH_SKIPPED
+                break
             self._set_status(it, "英語にしています..." + (f" ({n + 1}/{len(todo)})" if len(todo) > 1 else ""))
             self.llm_status = f"英語に: {Path(it.current).name}"
             # 訳す指示は物語の「英語に」と同じ ([セリフ] の見出し・<lora:...> などは残す)
-            self._english[text] = _cancellable(lambda: translate.to_english(snap, text), cancel)
+            try:
+                self._english[text] = _cancellable(lambda: translate.to_english(snap, text), cancel)
+            except llm.LLMOffline:
+                # LLM が落ちている: 訳さずにそのまま送る (止めない。知らせは件・まとめ・頼んだアプリに出す)
+                self._llm_down_until = time.monotonic() + LLM_DOWN_SKIP
+                it.warning = ENGLISH_SKIPPED
+                break
 
         def en(t):
             return self._english.get(t, t) if needs_english(t) else t
@@ -1206,20 +1295,32 @@ class Engine(QObject):
                 return
             self._stop = True
             self._cond.notify_all()
+        self.pool.forget(self._key)  # 台の空きの置き場から外す (また始めれば、知らせたときに戻る)
         self.finished.emit()
 
-    def _demand(self) -> int:
-        """生成を待っている件数 (ロックを持って呼ぶ)。一時停止・止めるときは 0。"""
+    def _demand(self) -> tuple[int, dict]:
+        """生成を待っている件数 (ロックを持って呼ぶ): (どの台にも頼んでいない件, 台 → 頼み済みの件)。一時停止・止めるときは 0。"""
         run = self.run
+        free, pinned = 0, {}
         if run is None or run.paused or self._stop:
-            return 0
-        return sum(1 for it in run.items if it.state == WAITING and it.stage < len(run.stages)
-                   and run.stages[it.stage]["type"] == recipes.GEN)
+            return free, pinned
+        for it in run.items:
+            if it.state == WAITING and it.stage < len(run.stages) and run.stages[it.stage]["type"] == recipes.GEN:
+                if it.machine:
+                    pinned[it.machine.lower()] = pinned.get(it.machine.lower(), 0) + 1
+                else:
+                    free += 1
+        return free, pinned
 
     def _publish(self) -> None:
-        """先にする側なら、生成を待っている件数を台の空きの置き場に知らせる (ロックを持って呼ぶ)。"""
-        if self.first:
-            self.pool.set_demand(self._demand())
+        """生成を待っている件数を台の空きの置き場に知らせる (ロックを持って呼ぶ)。"""
+        free, pinned = self._demand()
+        self.pool.set_demand(self._key, self.first, free, pinned, self._wake)
+
+    def _wake(self) -> None:
+        """ほかのエンジンが台を空けた: 空きを見に行く。"""
+        with self._cond:
+            self._cond.notify_all()
 
     def _save(self) -> None:
         with self._cond:

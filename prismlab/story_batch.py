@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from gencommon import comfy, enhancer, store
+from gencommon import comfy, enhancer, llm, store
 
 from . import engine, kinds, recipes, story, theme, translate
 
@@ -156,6 +156,7 @@ class Entry:
     folders: list = field(default_factory=list)  # 作りかけの物語 (一時停止・落ちたあとは、ここから続きを作る)
     made: list = field(default_factory=list)  # 最後まで出来た物語の名前
     failed: list = field(default_factory=list)  # 途中で止まった物語 (名前: 理由)
+    untranslated: int = 0  # 「英語に」で LLM に繋がらず、訳さずに送ったシーンの数 (2026-11-23)
     added: float = field(default_factory=time.time)
     ended: float = 0.0
 
@@ -171,7 +172,7 @@ class Entry:
         if not isinstance(data, dict) or not isinstance(data.get("plan"), dict):
             return None
         entry = Entry(Plan.from_dict(data["plan"]))
-        for key in ("id", "state", "run_index", "folders", "made", "failed", "added", "ended"):
+        for key in ("id", "state", "run_index", "folders", "made", "failed", "untranslated", "added", "ended"):
             if key in data:
                 setattr(entry, key, data[key])
         if data.get("folder") and not data.get("folders"):  # 2026-11-17 までの形: 作りかけは 1 本、run_index はその本
@@ -186,6 +187,8 @@ class Entry:
         line = f"{self.plan.name}: 出来た物語 {len(self.made)} / {self.plan.runs} 本"
         if self.failed:
             line += " (途中で止まったもの: " + " / ".join(self.failed) + ")"
+        if self.untranslated:
+            line += f" (LLM に繋がらないので、英語にせずに送ったシーン {self.untranslated})"
         return line
 
 
@@ -460,6 +463,7 @@ class StoryWorker(QObject):
     ended = Signal(object, str, str)
     changed = Signal()  # 進んだ (帯・待ち行列の窓を描き直す)
     _llm = Signal(int, str, str)  # (頼んだ番号, 文, 失敗の理由)
+    _skipped = Signal(int)  # (頼んだ番号) 英語に: LLM に繋がらないので訳さなかった
 
     def __init__(self, parent, should_pause: Callable[[], bool]):
         super().__init__(parent)
@@ -477,6 +481,8 @@ class StoryWorker(QObject):
         self._ticket = 0  # LLM の頼みの番号 (止めたあとに届いたものは捨てる)
         self._job = ("", "", "")  # (送った文, 元のプロンプト, リファレンス)
         self._llm.connect(self._on_llm)
+        self._skipped.connect(self._on_skipped)
+        self._untranslated = False  # いま頼んでいるシーンを、英語にせずに送る
 
     @property
     def winding_down(self) -> bool:
@@ -581,7 +587,11 @@ class StoryWorker(QObject):
                 try:
                     out = text
                     if snap_en is not None:
-                        out = translate.to_english(snap_en, out)
+                        try:
+                            out = translate.to_english(snap_en, out)
+                        except llm.LLMOffline:
+                            # LLM が落ちている: 英語にせずに進める (2026-11-23 利用者の希望。盛るは LLM が要るので止まる)
+                            self._skipped.emit(ticket)
                     if snap_enh is not None:
                         out = enhancer.enhance_with(snap_enh, out)
                     self._llm.emit(ticket, out.strip(), "")
@@ -592,6 +602,14 @@ class StoryWorker(QObject):
             return
         self._make(scene)
 
+    def _on_skipped(self, ticket: int) -> None:
+        if ticket != self._ticket or not self.active:
+            return
+        self._untranslated = True
+        if self.entry is not None:
+            self.entry.untranslated += 1
+        self._set_status("LLM に繋がらないので、英語にせずに送ります")
+
     def _on_llm(self, ticket: int, text: str, error: str) -> None:
         if ticket != self._ticket or not self.active:
             return
@@ -600,7 +618,9 @@ class StoryWorker(QObject):
             return
         scene = self.story.scenes[self.scene_index]
         scene.prompt = text
-        scene.record("バッチで送る文 (英語に / 盛る)", text)
+        scene.record("バッチで送る文 (英語に / 盛る)" + (" (LLM に繋がらないので英語にしていない)" if self._untranslated
+                                                          else ""), text)
+        self._untranslated = False
         if self._save():
             self._make(scene)
 

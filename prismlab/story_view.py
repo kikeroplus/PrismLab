@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSlider,
                                QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
-from gencommon import comfy, enhancer, inserts, reader, store
+from gencommon import comfy, enhancer, inserts, llm, reader, store
 
 from . import engine, highlight, kinds, recipes, recycle, story, story_batch, theme, translate
 from .dialogs import ask_text
@@ -593,6 +593,7 @@ class StoryView(QWidget):
         self.scene: Optional[story.Scene] = None
         self._before: dict[str, str] = {}  # シーンの id → 読み取る・盛るを始めたときの文 (うまくいったら履歴に残す)
         self._llm_busy = ""
+        self._untranslated: set = set()  # 英語に: LLM に繋がらないので、元の文のまま足すシーンの id (裏のスレッドが入れる)
         self._llm_done.connect(self._on_llm_done)
         self._translated.connect(self._on_translated)
         self._loading = False
@@ -1410,7 +1411,17 @@ class StoryView(QWidget):
             return
         if self.to_english.isChecked():  # LLM で英語に直してから足す (_on_llm_done で足す)
             snap, text = translate.snapshot(), self.scene.original.strip()
-            self._run_llm(ENGLISH, lambda: translate.to_english(snap, text))
+            scene_id = self.scene.id
+
+            def work():
+                try:
+                    return translate.to_english(snap, text)
+                except llm.LLMOffline:
+                    # LLM が落ちている: 元の文のまま足して知らせる (2026-11-23 利用者の希望。LLM がなくても進められるように)
+                    self._untranslated.add(scene_id)
+                    return text
+
+            self._run_llm(ENGLISH, work)
             return
         self.scene.record("元の文を足す前の文", self.prompt.toPlainText(), before=True)
         self._set_prompt(inserts.join(self.prompt.toPlainText(), self.scene.original))
@@ -1525,9 +1536,15 @@ class StoryView(QWidget):
                 self._set_prompt(joined)  # Ctrl+Z で戻せるように
             else:
                 scene.prompt = joined
-            scene.record("英語にした元の文", text.strip())
-            self._save_timer.start()
-            self.status.emit("元の文を英語に直して足しました (元に戻す / Ctrl+Z で前の文に)。")
+            if scene_id in self._untranslated:
+                self._untranslated.discard(scene_id)
+                scene.record("元の文 (LLM に繋がらないので英語にしていない)", text.strip())
+                self._save_timer.start()
+                self.status.emit("⚠ LLM に繋がらないので、元の文を英語にせずに足しました (元に戻す / Ctrl+Z で前の文に)。")
+            else:
+                scene.record("英語にした元の文", text.strip())
+                self._save_timer.start()
+                self.status.emit("元の文を英語に直して足しました (元に戻す / Ctrl+Z で前の文に)。")
         else:
             label = "読み取り" if what == "読み取り" else "盛る"
             scene.record(f"{label}の前の文", before, before=True)

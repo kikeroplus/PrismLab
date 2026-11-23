@@ -2072,6 +2072,10 @@ class LineView(QWidget):
             text += f" ・ 失敗 {failed}"
         if canceled:
             text += f" ・ 取り消し {canceled}"
+        untranslated = sum(1 for i in items if i.warning)
+        if untranslated:  # 「英語に」で LLM に繋がらず、訳さずに送った件 (止めずに進める。2026-11-23)
+            text += (f' ・ <span style="color:#ff9800; font-weight:bold">英語にせず {untranslated}</span>'
+                     " (LLM に繋がりません。訳さずに送りました)")
         if running:
             if run.paused:
                 text = '<span style="color:#ff9800; font-weight:bold">一時停止中</span>  ' + text

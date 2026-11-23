@@ -56,6 +56,7 @@ class Request:
                    engine.RUNNING: "running", engine.GATED: "gated"}.get(it.state, "waiting")
             c[key] += 1
         c["outputs"] = sum(len(it.outputs) for it in items)
+        c["untranslated"] = sum(1 for it in items if it.warning)  # 「英語に」で LLM に繋がらず、訳さずに送った件
         return c
 
     def to_status(self) -> dict:
@@ -67,6 +68,8 @@ class Request:
                                 for m in self.engine.machines]
             run = self.engine.run
             data["errors"] = [it.error.splitlines()[0] for it in (run.items if run else []) if it.error][:5]
+            if data["untranslated"]:
+                data["warning"] = f"{engine.ENGLISH_SKIPPED} ({data['untranslated']} 件)"
             # 出来たファイル (J-Rate はこれを読んで、開いているフォルダの一覧に足す)
             data["paths"] = [o["path"] for it in (run.items if run else []) for o in it.outputs][:MAX_PATHS]
         return data
