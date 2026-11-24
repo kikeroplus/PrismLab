@@ -96,6 +96,14 @@ def gaps(views: list, text_entry: bool = False) -> list:
             elif t == recipes.FRAME:
                 media = Line("画像", kinds.IMAGE_COLOR)
                 made[MEDIA] = "動画の最後のコマの画像"
+            elif t in recipes.IMG_TYPES:
+                if MEDIA in before.lines:
+                    # 流れてきた画像・動画は使わない: このステップの前で捨てる
+                    before.lines[MEDIA].cut = True
+                    before.lines[MEDIA].why = f"画像を差し替えるので、流れてきた{before.lines[MEDIA].label}はここで捨てます"
+                media = Line("画像", kinds.IMAGE_COLOR)
+                made[MEDIA] = ("決めた 1 枚の画像" if t == recipes.IMG_ONE else "フォルダから 1 件ごとに選んだ画像") + \
+                    (" (文はそのまま)" if text else "")
             elif t == recipes.READ:
                 made[TEXT] = "画像を読み取った文" + (" (前の文と入れ替え)" if text else "")
                 text = True

@@ -172,7 +172,7 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
             snap["memo"], snap["mode"] = stage.memo or recipes.DEFAULT_MEMO, stage.mode
         elif stage.type in (recipes.FRAME, recipes.SPLIT, recipes.GATE, recipes.SUB, recipes.TRANSLATE):
             snap["count"], snap["stars"], snap["rules"] = stage.count, stage.stars, stage.rules
-        elif stage.type in recipes.REF_TYPES:
+        elif stage.type in recipes.PICK_TYPES:
             snap["image"], snap["folder"], snap["shuffle"] = stage.image, stage.folder, stage.shuffle
         else:
             snap["workflow"] = stage.workflow
@@ -214,15 +214,16 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         snap["count"] = max(2, min(recipes.MAX_SPLIT, int(stage.count)))
     elif stage.type == recipes.GATE:
         snap["stars"] = max(1, min(5, int(stage.stars)))
-    elif stage.type == recipes.REF_IMAGE:
+    elif stage.type in recipes.PICK_ONE:
+        title = recipes.STAGE_TITLES[stage.type]
         if not stage.image:
-            raise ValueError("リファレンス (1 枚) のステップに画像が選ばれていません。")
+            raise ValueError(f"{title} のステップに画像が選ばれていません。")
         if not Path(stage.image).is_file():
-            raise ValueError(f"リファレンスの画像が見つかりません: {stage.image}")
+            raise ValueError(f"{title} のステップの画像が見つかりません: {stage.image}")
         snap["image"] = stage.image
-    elif stage.type == recipes.REF_FOLDER:
+    elif stage.type in recipes.PICK_TYPES:
         if not recipes.list_images(stage.folder):
-            raise ValueError(f"リファレンスのフォルダに画像がありません: {stage.folder or '(未選択)'}")
+            raise ValueError(f"{recipes.STAGE_TITLES[stage.type]} のフォルダに画像がありません: {stage.folder or '(未選択)'}")
         snap["folder"], snap["shuffle"] = stage.folder, stage.shuffle
     elif stage.type == recipes.SUB:
         rules = recipes.parse_rules(stage.rules)
@@ -248,13 +249,13 @@ def plan_key(stage: int, branch: int) -> str:
     return str(stage) if branch == 0 else f"{stage}/{branch}"
 
 
-PLANNED_TYPES = (recipes.INSERT, recipes.REF_FOLDER)  # 始めたときに 1 件ごとの割り当てを決めるステップ
+PLANNED_TYPES = (recipes.INSERT, recipes.REF_FOLDER, recipes.IMG_FOLDER)  # 始めたときに 1 件ごとの割り当てを決めるステップ
 
 
 def make_picker(snap: dict):
     """割り当てを引くもの (差し込み: フォルダの .txt、リファレンス (フォルダ): フォルダの画像)。
     引けなければ inserts.InsertError か ValueError。"""
-    if snap["type"] == recipes.REF_FOLDER:
+    if snap["type"] in (recipes.REF_FOLDER, recipes.IMG_FOLDER):
         return recipes.RefPicker(str(snap.get("folder") or ""), bool(snap.get("shuffle")))
     return inserts.Picker([inserts.Slot(snap["name"], snap["folder"], True, False)])
 
@@ -696,7 +697,7 @@ class Engine(QObject):
         live = [j for j, s in enumerate(stages) if s["type"] in PLANNED_TYPES and not s.get("bypass")]
         if snap["type"] == recipes.INSERT and not snap.get("bypass") and snap.get("folder") != old.get("folder"):
             redo.add(index)
-        if snap["type"] == recipes.REF_FOLDER and not snap.get("bypass") and (
+        if snap["type"] in (recipes.REF_FOLDER, recipes.IMG_FOLDER) and not snap.get("bypass") and (
                 snap.get("folder") != old.get("folder") or bool(snap.get("shuffle")) != bool(old.get("shuffle"))):
             redo.add(index)
         if snap["type"] == recipes.SPLIT and not snap.get("bypass") and int(snap.get("count") or 2) != int(old.get("count") or 2):
@@ -949,6 +950,8 @@ class Engine(QObject):
                 self._split(it, stage)
             elif stage["type"] in recipes.REF_TYPES:
                 self._reference(it, stage)
+            elif stage["type"] in recipes.IMG_TYPES:
+                self._load_image(it, stage)
             elif stage["type"] == recipes.SUB:
                 self._substitute(it, stage)
             elif stage["type"] == recipes.TRANSLATE:
@@ -1038,6 +1041,20 @@ class Engine(QObject):
             raise ValueError(f"リファレンスの画像が見つかりません: {path or '(なし)'}")
         with self._cond:
             it.reference = path
+
+    def _load_image(self, it: Item, stage: dict) -> None:
+        """画像: 流れている画像を、決めた 1 枚 (フォルダなら割り当てた 1 枚) に差し替える。文はそのまま。"""
+        if stage["type"] == recipes.IMG_ONE:
+            path = str(stage.get("image") or "")
+        else:
+            planned = it.plan.get(plan_key(it.stage, it.branch)) or it.plan.get(str(it.stage))
+            if not planned:
+                raise ValueError("画像が割り当てられていません (始め直してください)。")
+            path = str(planned.get("file") or "")
+        if not path or not Path(path).is_file():
+            raise ValueError(f"画像が見つかりません: {path or '(なし)'}")
+        with self._cond:
+            it.current = path
 
     def _last_frame(self, it: Item) -> None:
         """最後のコマ: 動画の最後のコマを (出力フォルダ)\\コマ に PNG で書き、次のステップにはその画像を渡す。"""

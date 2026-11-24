@@ -167,10 +167,12 @@ class StageDialog(QDialog):
                                 "大文字・小文字は区別しません。消したあとに残る「, ,」は詰めます。# で始まる行は飛ばします。\n"
                                 "いまのプロンプト (読み取った文・盛った文・足した文) のすべてに使います。"
                                 "盛ったあとに置けば、LLM が入れがちな語を消せます。"))
-        elif stage.type in recipes.REF_TYPES:
-            self.ref_path = QLineEdit(stage.image if stage.type == recipes.REF_IMAGE else stage.folder)
-            single = stage.type == recipes.REF_IMAGE
-            self.ref_path.setPlaceholderText("顔などのリファレンス画像" if single else "リファレンス画像を入れたフォルダ")
+        elif stage.type in recipes.PICK_TYPES:
+            single = stage.type in recipes.PICK_ONE
+            is_ref = stage.type in recipes.REF_TYPES
+            self.ref_path = QLineEdit(stage.image if single else stage.folder)
+            self.ref_path.setPlaceholderText(("顔などのリファレンス画像" if single else "リファレンス画像を入れたフォルダ") if is_ref
+                                             else ("次へ渡す画像" if single else "次へ渡す画像を入れたフォルダ"))
             browse = QPushButton("参照...")
             browse.clicked.connect(self._browse_ref)
             row = QHBoxLayout()
@@ -187,6 +189,13 @@ class StageDialog(QDialog):
                 row, self.place = _choice_row(self, ["名前順", "ランダム"], 1 if stage.shuffle else 0)
                 form.addRow("使う順", row)
             box.addWidget(_hint(
+                ("この画像を、" if single else
+                 "フォルダの画像を 1 件ごとに 1 枚ずつ (名前順か、ランダムな順で一巡ずつ。最後まで使ったら最初から)、") +
+                "流れている画像の代わりに次のステップへ渡します (このあとの I2I・I2V・読み取りの元になります)。"
+                "ここまでの文 (プロンプト) はそのまま残ります。流れてきた画像・動画はここで捨てます。\n"
+                "テキストの入口 (PromptWordCrafter などから) でも、文 + この画像で I2I・I2V ができます。"
+                + ("" if single else "\n増やすのあとに置くと、分かれた 1 本ごとに別の画像になります。"
+                                     "量産ごとに最初 (ランダムなら新しい順) から使います。")) if not is_ref else _hint(
                 ("この画像を、" if single else
                  "フォルダの画像を 1 件ごとに 1 枚ずつ (名前順か、ランダムな順で一巡ずつ。最後まで使ったら最初から)、") +
                 "このあとの生成のリファレンスに使います。入れる先は、ワークフローの LoadImage のうち、"
@@ -271,19 +280,20 @@ class StageDialog(QDialog):
     # リファレンス ---------------------------------------------------------
     def _browse_ref(self) -> None:
         now = self.ref_path.text().strip()
-        if self.stage.type == recipes.REF_IMAGE:
+        what = "リファレンス" if self.stage.type in recipes.REF_TYPES else "次へ渡す"
+        if self.stage.type in recipes.PICK_ONE:
             exts = " ".join("*" + e for e in sorted(recipes.IMAGE_EXTS))
-            path, _ = QFileDialog.getOpenFileName(self, "リファレンスの画像を選ぶ", str(Path(now).parent) if now else "",
+            path, _ = QFileDialog.getOpenFileName(self, f"{what}の画像を選ぶ", str(Path(now).parent) if now else "",
                                                   f"画像 ({exts})")
         else:
-            path = QFileDialog.getExistingDirectory(self, "リファレンスのフォルダを選ぶ", now)
+            path = QFileDialog.getExistingDirectory(self, f"{what}画像のフォルダを選ぶ", now)
         if path:
             self.ref_path.setText(str(Path(path)))
 
     def _ref_files(self) -> list:
         """選んでいる画像 (1 枚ならそれ、フォルダなら中の画像)。"""
         path = self.ref_path.text().strip()
-        if self.stage.type == recipes.REF_IMAGE:
+        if self.stage.type in recipes.PICK_ONE:
             ok = bool(path) and Path(path).is_file() and Path(path).suffix.lower() in recipes.IMAGE_EXTS
             return [Path(path)] if ok else []
         return recipes.list_images(path) if path else []
@@ -291,7 +301,7 @@ class StageDialog(QDialog):
     def _ref_changed(self) -> None:
         files = self._ref_files()
         path = self.ref_path.text().strip()
-        if self.stage.type == recipes.REF_IMAGE:
+        if self.stage.type in recipes.PICK_ONE:
             note = "" if files else ("画像を選んでください。" if not path else "画像が見つかりません。")
         else:
             note = (f"画像 {len(files)} 枚" if files else
@@ -442,12 +452,12 @@ class StageDialog(QDialog):
                 QMessageBox.warning(self, "置き換え", "置き換える語を入れてください (1 行に「元 => 先」)。")
                 return
             s.rules = text
-        elif s.type in recipes.REF_TYPES:
+        elif s.type in recipes.PICK_TYPES:
             if not self._ref_files():
                 QMessageBox.warning(self, recipes.STAGE_TITLES[s.type], self.ref_note.text() or "画像を選んでください。")
                 return
             path = str(Path(self.ref_path.text().strip()))
-            if s.type == recipes.REF_IMAGE:
+            if s.type in recipes.PICK_ONE:
                 s.image = path
             else:
                 s.folder = path

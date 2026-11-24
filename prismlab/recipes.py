@@ -38,10 +38,17 @@ TRANSLATE = "to_english"
 # 1 枚を決めて使う / フォルダの画像を 1 件ごとに順に (かランダムに) 使う。以降の生成すべてに使う (次のリファレンスまで)
 REF_IMAGE, REF_FOLDER = "ref_image", "ref_folder"
 REF_TYPES = (REF_IMAGE, REF_FOLDER)
+# 画像 (2026-11-24 利用者の希望): 流れている画像を、決めた 1 枚 / フォルダの画像 (1 件ごとに順かランダムに 1 枚) に差し替える。
+# 文 (プロンプト) はそのまま残す。テキストの入口でも、このあとの I2I・I2V・読み取りに画像を渡せる
+IMG_ONE, IMG_FOLDER = "image_one", "image_folder"
+IMG_TYPES = (IMG_ONE, IMG_FOLDER)
+PICK_TYPES = REF_TYPES + IMG_TYPES  # 画像を選ぶステップ (1 枚は image、フォルダは folder・shuffle を使う)
+PICK_ONE = (REF_IMAGE, IMG_ONE)  # そのうち 1 枚のもの
 STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", TEXT: "追加テキスト", INSERT: "差し込み", GEN: "生成",
                 SAVE: "覚える", LOAD: "思い出す", FRAME: "最後のコマ", SPLIT: "増やす", GATE: "★を待つ", SUB: "置き換え",
-                TRANSLATE: "英語に", REF_IMAGE: "リファレンス (1 枚)", REF_FOLDER: "リファレンス (フォルダ)"}
-STAGE_ORDER = (READ, ENHANCE, TRANSLATE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, GATE, FRAME, REF_IMAGE, REF_FOLDER, GEN)  # メニューに並べる順
+                TRANSLATE: "英語に", REF_IMAGE: "リファレンス (1 枚)", REF_FOLDER: "リファレンス (フォルダ)",
+                IMG_ONE: "画像 (1 枚)", IMG_FOLDER: "画像 (フォルダ)"}
+STAGE_ORDER = (READ, ENHANCE, TRANSLATE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, GATE, FRAME, IMG_ONE, IMG_FOLDER, REF_IMAGE, REF_FOLDER, GEN)  # メニューに並べる順
 MAX_SPLIT = 20  # 増やすの数の上限
 MEMO_TYPES = (SAVE, LOAD)
 DEFAULT_MEMO = "メモ 1"
@@ -74,8 +81,8 @@ class Stage:
     count: int = 2  # 増やす: いくつに分けるか
     stars: int = 3  # ★を待つ: いくつ以上で先へ進めるか
     rules: str = ""  # 置き換え: 1 行に「元 => 先」(先がなければ消す)
-    image: str = ""  # リファレンス (1 枚) の画像 (フォルダのほうは folder を使う)
-    shuffle: bool = False  # リファレンス (フォルダ): ランダムな順に使う (既定は名前順)
+    image: str = ""  # リファレンス (1 枚)・画像 (1 枚) の画像 (フォルダのほうは folder を使う)
+    shuffle: bool = False  # リファレンス (フォルダ)・画像 (フォルダ): ランダムな順に使う (既定は名前順)
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -269,6 +276,8 @@ def line_problems(stages: list, skip=(), text_entry: bool = False) -> set:
             pass
         elif s.type in REF_TYPES:
             has_ref = True
+        elif s.type in IMG_TYPES:
+            has_image, video = True, False  # 文はそのまま
         elif s.type in (SUB, TRANSLATE):
             if not has_text:
                 problems.add(("notext", i))
@@ -618,14 +627,14 @@ def list_images(folder: str) -> list[Path]:
 
 
 class RefPicker:
-    """リファレンス (フォルダ) の画像を 1 件ごとに割り当てる (名前順か、ランダムな順で一巡ずつ)。
+    """リファレンス (フォルダ)・画像 (フォルダ) の画像を 1 件ごとに割り当てる (名前順か、ランダムな順で一巡ずつ)。
     差し込みの inserts.Picker と同じ使い方 (next()[0] が割り当て)。位置はほかのアプリと共有しない (量産ごとに最初から)。"""
 
     def __init__(self, folder: str, shuffle: bool = False, rng=None):
         import random
         self.files = [str(p) for p in list_images(folder)]
         if not self.files:
-            raise ValueError(f"リファレンスのフォルダに画像がありません: {folder or '(未選択)'}")
+            raise ValueError(f"フォルダに画像がありません: {folder or '(未選択)'}")
         self.shuffle = shuffle
         self.rng = rng or random.Random()
         self._order: list = []
