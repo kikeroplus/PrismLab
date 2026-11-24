@@ -150,12 +150,13 @@ class Recipe:
     picked_from: str = ""  # 送ったアプリ (J-Rate / PromptWordCrafter)
     picked_back: str = ""  # 送られる前の入口の種類 (「× 外す」で戻る)
     apps: list = field(default_factory=list)  # このレシピを出すアプリ (APPS のどれか。空 = どこにも出さない)
+    group: str = ""  # まとまり (上のタブ。空 = まとまりなし =「その他」)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "folder": self.folder, "min_stars": self.min_stars,
                 "output_dir": self.output_dir, "source": self.source, "image": self.image, "repeat": self.repeat,
                 "inherit": self.inherit, "picked": list(self.picked), "picked_from": self.picked_from,
-                "picked_back": self.picked_back, "apps": list(self.apps),
+                "picked_back": self.picked_back, "apps": list(self.apps), "group": self.group,
                 "stages": [s.to_dict() for s in self.stages]}
 
     @property
@@ -196,6 +197,7 @@ class Recipe:
         r.picked_back = data.get("picked_back") if data.get("picked_back") in (FOLDER, SINGLE, TEXTS) else ""
         apps = data.get("apps")
         r.apps = [a for a in APPS if isinstance(apps, list) and a in apps]
+        r.group = str(data.get("group") or "").strip()
         if r.source == PICKED and not r.picked:
             r.source = r.picked_back or FOLDER
         try:
@@ -449,6 +451,27 @@ def save(recipes: list[Recipe]) -> None:
     write_published(recipes)
 
 
+OTHER_GROUP = "その他"  # まとまりのないレシピのタブ
+
+
+def group_order(recipes: list[Recipe]) -> list[str]:
+    """まとまりの並び (レシピの並びで先に出た順)。まとまりのないレシピ ("") は最後。"""
+    order = []
+    for r in recipes:
+        if r.group and r.group not in order:
+            order.append(r.group)
+    if any(not r.group for r in recipes):
+        order.append("")
+    return order
+
+
+def sort_by_group(recipes: list[Recipe], order: Optional[list] = None) -> list[Recipe]:
+    """同じまとまりのレシピを隣どうしに寄せる (まとまりの中の順は変えない)。"""
+    order = order if order is not None else group_order(recipes)
+    rank = {g: i for i, g in enumerate(order)}
+    return sorted(recipes, key=lambda r: rank.get(r.group, len(order)))
+
+
 def flow_summary(stages: list) -> str:
     """「読み取り → 盛る → 生成 (動画)」(バイパスしたものは除く)。"""
     from . import kinds
@@ -472,7 +495,7 @@ def published_entries(recipes: list[Recipe]) -> list[dict]:
     for index, r in enumerate(recipes):
         if not r.apps:
             continue
-        item = {"name": r.name, "index": index, "apps": list(r.apps), "flow": flow_summary(r.stages),
+        item = {"name": r.name, "index": index, "apps": list(r.apps), "group": r.group, "flow": flow_summary(r.stages),
                 "repeat": r.repeat, "problems": {}}
         for app in r.apps:
             text = app in TEXT_APPS

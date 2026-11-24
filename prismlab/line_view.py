@@ -157,6 +157,9 @@ class LineView(QWidget):
         self.recipes = recipes.load()
         if not self.recipes:
             self.recipes = recipes.default_recipes()
+        self.recipes = recipes.sort_by_group(self.recipes)  # 同じまとまりを隣どうしに (保存はいつも寄せた順)
+        self._group_pick: dict = {}  # まとまり → そのタブで最後に見ていたレシピ (タブを押したときに出す)
+        self._group_tabs: dict = {}  # まとまり → タブのボタン
         self.index = min(max(recipes.last_index(), 0), len(self.recipes) - 1)
         self._run_recipe: Optional[recipes.Recipe] = None  # 今の (最後の) 量産のレシピ (それだけを量産中は直せなくする)
         self.thumbs = ThumbCache(160, self)
@@ -177,7 +180,15 @@ class LineView(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(8)
 
-        # レシピの札
+        # レシピのまとまり (タブ。まとまりを 1 つも作っていなければ出さない)
+        self.group_row = QHBoxLayout()
+        self.group_row.setContentsMargins(0, 0, 0, 0)
+        self.group_row.setSpacing(2)
+        self.group_host = QWidget()
+        self.group_host.setLayout(self.group_row)
+        root.addWidget(self.group_host)
+
+        # レシピの札 (選んでいるまとまりのものだけ)
         self.recipe_row = QHBoxLayout()
         self.recipe_row.setSpacing(6)
         self.recipe_group = QButtonGroup(self)
@@ -381,16 +392,60 @@ class LineView(QWidget):
     # ------------------------------------------------------------------
     # レシピの札
     # ------------------------------------------------------------------
+    def _index_of(self, recipe) -> int:
+        """レシピの番号 (同じ中身の複製と取り違えないよう、物そのもので探す)。"""
+        return next((i for i, r in enumerate(self.recipes) if r is recipe), -1)
+
+    def _regroup(self, keep=None, order=None) -> None:
+        """同じまとまりを隣どうしに寄せ直し、選んでいるレシピ (keep) の番号を付け直す。
+        order = まとまりの並び (渡さなければ今の並びで先に出た順)。"""
+        keep = keep if keep is not None else self.recipe
+        self.recipes = recipes.sort_by_group(self.recipes, order)
+        self.index = max(self._index_of(keep), 0)
+
+    def _group_label(self, group: str) -> str:
+        return f"{group or recipes.OTHER_GROUP}  {sum(1 for r in self.recipes if r.group == group)}"
+
     def _build_recipe_chips(self) -> None:
-        while self.recipe_row.count():
-            w = self.recipe_row.takeAt(0).widget()
-            if w is None:
-                continue
-            if isinstance(w, QPushButton):
-                self.recipe_group.removeButton(w)
-            w.hide()
-            w.deleteLater()
+        for row, buttons in ((self.group_row, None), (self.recipe_row, self.recipe_group)):
+            while row.count():
+                w = row.takeAt(0).widget()
+                if w is None:
+                    continue
+                if buttons is not None and isinstance(w, QPushButton):
+                    buttons.removeButton(w)
+                w.hide()
+                w.deleteLater()
+        current = self.recipe.group
+        self._group_pick[current] = self.recipe
+
+        # まとまりのタブ
+        self._group_tabs = {}
+        has_groups = any(r.group for r in self.recipes)
+        self.group_host.setVisible(has_groups)
+        if has_groups:
+            for g in recipes.group_order(self.recipes):
+                tab = QPushButton(self._group_label(g))
+                tab.setCheckable(True)
+                tab.setChecked(g == current)
+                tab.setStyleSheet(
+                    "QPushButton { border: none; border-bottom: 2px solid transparent; border-radius: 0;"
+                    f" padding: 3px 12px; background: transparent; color: {theme.TEXT_DIM}; }}"
+                    f"QPushButton:hover {{ color: {theme.TEXT}; }}"
+                    f"QPushButton:checked {{ border-bottom: 2px solid {theme.ACCENT}; color: {theme.TEXT}; font-weight: bold; }}")
+                tab.setToolTip("レシピのまとまり。札の右クリックの「まとまり ▸」で入れる・外す。タブの右クリックで名前・並び")
+                tab.clicked.connect(lambda _=False, name=g: self._select_group(name))
+                tab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                tab.customContextMenuRequested.connect(
+                    lambda pos, name=g, btn=tab: self._group_menu(name, btn.mapToGlobal(pos)))
+                self._group_tabs[g] = tab
+                self.group_row.addWidget(tab)
+            self.group_row.addStretch(1)
+
+        # 札 (選んでいるまとまりのものだけ)
         for i, r in enumerate(self.recipes):
+            if r.group != current:
+                continue
             b = QPushButton(r.name or "(名前なし)")
             b.setCheckable(True)
             b.setChecked(i == self.index)
@@ -402,50 +457,147 @@ class LineView(QWidget):
             self.recipe_row.addWidget(b)
         add = QPushButton("＋ レシピ")
         add.setStyleSheet("QPushButton { border-radius: 12px; padding: 4px 12px; border-style: dashed; }")
+        if has_groups:
+            add.setToolTip(f"このまとまり ({current or recipes.OTHER_GROUP}) にレシピを足します")
         add.clicked.connect(self._add_recipe)
         self.recipe_row.addWidget(add)
 
     def _select_recipe(self, index: int) -> None:
+        regroup = self.recipes[index].group != self.recipe.group
         self.index = index
+        self._group_pick[self.recipe.group] = self.recipe
         recipes.set_last_index(index)
+        if regroup:
+            self._build_recipe_chips()
+        self.refresh(rebuild=True)
+
+    def _select_group(self, group: str) -> None:
+        """タブを押した: そのまとまりで最後に見ていたレシピ (なければ先頭) に切り替える。"""
+        pick = self._group_pick.get(group)
+        index = self._index_of(pick) if pick is not None and pick.group == group else -1
+        if index < 0:
+            index = next((i for i, r in enumerate(self.recipes) if r.group == group), -1)
+        if index < 0 or index == self.index:
+            self._build_recipe_chips()  # 押したタブの印を戻す
+            return
+        self._select_recipe(index)
+
+    def _ask_group(self, title: str, current: str = "") -> Optional[str]:
+        """まとまりの名前を聞く (「その他」と書いたら、まとまりなし)。取り消し = None。"""
+        name = ask_text(self, title, "まとまりの名前 (PWC・IE・J-Rate など)", current)
+        if name is None:
+            return None
+        return "" if name == recipes.OTHER_GROUP else name
+
+    def _group_menu(self, group: str, pos) -> None:
+        menu = QMenu(self)
+        named = [g for g in recipes.group_order(self.recipes) if g]
+        rename = menu.addAction("名前を変える...")
+        rename.setEnabled(bool(group))
+        menu.addSeparator()
+        at = named.index(group) if group in named else -1
+        left = menu.addAction("◀ 左へ")
+        right = menu.addAction("右へ ▶")
+        left.setEnabled(at > 0)
+        right.setEnabled(0 <= at < len(named) - 1)  # 「その他」はいつも右端
+        menu.addSeparator()
+        ungroup = menu.addAction(f"まとまりを解く (レシピは「{recipes.OTHER_GROUP}」へ)")
+        ungroup.setEnabled(bool(group))
+        chosen = menu.exec(pos)
+        keep = self.recipe
+        if chosen is rename:
+            name = self._ask_group("まとまりの名前を変える", group)
+            if name is None or name == group:
+                return
+            for r in self.recipes:
+                if r.group == group:
+                    r.group = name  # ほかのまとまりと同じ名前なら 1 つにまとまる
+        elif chosen in (left, right):
+            j = at - 1 if chosen is left else at + 1
+            named[at], named[j] = named[j], named[at]
+            self.recipes = recipes.sort_by_group(self.recipes, named + [""])
+        elif chosen is ungroup:
+            for r in self.recipes:
+                if r.group == group:
+                    r.group = ""
+        else:
+            return
+        self._regroup(keep)
+        self._save_recipes()
+        self._build_recipe_chips()
         self.refresh(rebuild=True)
 
     def _recipe_menu(self, index: int, pos) -> None:
+        target = self.recipes[index]
         menu = QMenu(self)
         rename = menu.addAction("名前を変える...")
         dup = menu.addAction("複製する")
+        group_menu = menu.addMenu("まとまり")
+        group_actions = {}
+        for g in recipes.group_order(self.recipes):
+            if not g:
+                continue
+            a = group_menu.addAction(g)
+            a.setCheckable(True)
+            a.setChecked(g == target.group)
+            group_actions[a] = g
+        if group_actions:
+            group_menu.addSeparator()
+        new_group = group_menu.addAction("新しいまとまり...")
+        no_group = group_menu.addAction(f"まとまりから外す (「{recipes.OTHER_GROUP}」へ)")
+        no_group.setEnabled(bool(target.group))
         menu.addSeparator()
+        # 左右は同じまとまりの中で (まとまりはいつも隣どうしに寄せてある)
+        same = [k for k, r in enumerate(self.recipes) if r.group == target.group]
+        at = same.index(index)
         left = menu.addAction("◀ 左へ")
         right = menu.addAction("右へ ▶")
-        left.setEnabled(index > 0)
-        right.setEnabled(index < len(self.recipes) - 1)
+        left.setEnabled(at > 0)
+        right.setEnabled(at < len(same) - 1)
         menu.addSeparator()
         delete = menu.addAction("削除する...")
-        busy = self.running() and self.run_recipe() is self.recipes[index]
+        busy = self.running() and self.run_recipe() is target
         delete.setEnabled(len(self.recipes) > 1 and not busy)  # 動いている量産のレシピは消さない
         if busy:
             delete.setText("削除する... (量産中は消せません)")
         chosen = menu.exec(pos)
         if chosen is rename:
-            name = ask_text(self, "名前を変える", "レシピの名前", self.recipes[index].name)
+            name = ask_text(self, "名前を変える", "レシピの名前", target.name)
             if name:
-                self.recipes[index].name = name
+                target.name = name
         elif chosen is dup:
-            copy = self.recipes[index].copy()
+            copy = target.copy()  # まとまりも写る
             copy.name += " のコピー"
             self.recipes.insert(index + 1, copy)
             self.index = index + 1
+        elif chosen in group_actions or chosen in (new_group, no_group):
+            if chosen is new_group:
+                name = self._ask_group("新しいまとまり")
+                if name is None:
+                    return
+            else:
+                name = group_actions.get(chosen, "")
+            if name == target.group:
+                return
+            order = [g for g in recipes.group_order(self.recipes) if g]  # タブの並びは変えない (新しいものは「その他」の左)
+            target.group = name
+            self._regroup(order=order + ([name] if name and name not in order else []) + [""])  # 見ているレシピはそのまま (動かしたのが見ているものなら、タブもついていく)
+            self.status.emit(f"「{target.name}」を「{name or recipes.OTHER_GROUP}」に入れました。")
         elif chosen in (left, right):
-            j = index - 1 if chosen is left else index + 1
+            j = same[at - 1] if chosen is left else same[at + 1]
             self.recipes[index], self.recipes[j] = self.recipes[j], self.recipes[index]
             self.index = j
         elif chosen is delete:
-            if QMessageBox.question(self, "レシピの削除", f"レシピ「{self.recipes[index].name}」を削除しますか?",
+            if QMessageBox.question(self, "レシピの削除", f"レシピ「{target.name}」を削除しますか?",
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
+            keep = self.recipe
+            if keep is target:  # 見ていたものを消した: 同じまとまりの隣 (なければ先頭)
+                rest = [self.recipes[k] for k in same if k != index]
+                keep = rest[min(at, len(rest) - 1)] if rest else next(r for r in self.recipes if r is not target)
             del self.recipes[index]
-            self.index = min(self.index, len(self.recipes) - 1)
+            self.index = self._index_of(keep)
         else:
             return
         self._save_recipes()
@@ -456,8 +608,10 @@ class LineView(QWidget):
         name = ask_text(self, "レシピを足す", "レシピの名前")
         if not name:
             return
-        self.recipes.append(recipes.Recipe(name, folder=self.recipe.folder, stages=[recipes.Stage(recipes.GEN)]))
-        self.index = len(self.recipes) - 1
+        new = recipes.Recipe(name, folder=self.recipe.folder, stages=[recipes.Stage(recipes.GEN)],
+                             group=self.recipe.group)  # 見ているまとまりに足す
+        self.recipes.append(new)
+        self._regroup(new)
         self._save_recipes()
         self._build_recipe_chips()
         self.refresh(rebuild=True)
@@ -1256,6 +1410,9 @@ class LineView(QWidget):
         button = self.recipe_group.button(target)
         if button is not None:
             button.setChecked(True)
+            self._group_pick[r.group] = r
+        else:
+            self._build_recipe_chips()  # ほかのまとまりのレシピ: そのタブに切り替える
         self.refresh(rebuild=True)
         unit = "件" if texts else "枚"
         missing = len(paths) - len(found)
@@ -1838,6 +1995,8 @@ class LineView(QWidget):
             r = self.recipes[self.recipe_group.id(b)] if self.recipe_group.id(b) < len(self.recipes) else None
             b.setText(("▶ " if r is not None and r is busy_recipe else "") + ((r.name if r else "") or "(名前なし)"))
             b.setToolTip("量産中 (このレシピはステップの中身だけ直せます。ほかのレシピは全部直せます)" if r is not None and r is busy_recipe else "")
+        for g, tab in self._group_tabs.items():  # 動いている量産のレシピが入っているまとまりのタブにも ▶
+            tab.setText(("▶ " if busy_recipe is not None and busy_recipe.group == g else "") + self._group_label(g))
 
         # 入口
         source = str(run.recipe.get("source") or recipes.FOLDER) if showing else self.recipe.source
