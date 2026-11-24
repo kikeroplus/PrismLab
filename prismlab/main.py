@@ -110,7 +110,12 @@ def _start_server(window: MainWindow) -> QLocalServer:
         def finish():
             if not handled:
                 handled.append(True)
-                handle(window, bytes(buffer))
+                # 中身は、送る側に「受け取った」と返して (切って) から行う。送る側は切られるのを 3 秒しか待たないので、
+                # 何千件もの頼み (読み込み・件づくり・保存で数秒かかる) を先に行うと「受け取りませんでした」になり、
+                # 実際には始まっているのに、やり直しで同じ頼みが重なっていた (2026-11-25)。
+                # 返事は進み具合 (external_status.json) に書くので、送る側を待たせる必要はない
+                data = bytes(buffer)
+                QTimer.singleShot(0, lambda: handle(window, data))
 
         def read():
             buffer.extend(bytes(conn.readAll()))

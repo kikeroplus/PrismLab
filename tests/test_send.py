@@ -309,6 +309,32 @@ while time.time() < end and proc.poll() is None:
 pump(0.3)
 check(proc.returncode == 0 and len(sv.story.scenes) == 9, "2 重起動 (show) は前に出すだけ")
 
+# 7b. 受け付けに時間がかかっても (何千件もの頼み)、先に切って送る側を待たせない (2026-11-25)。
+# 送る側 (GenCommon の recipe_link・PWC・J-Rate) は切られるのを 3 秒しか待たない
+slow_done = []
+real_handle = main.handle
+
+
+def slow_handle(win, data):
+    time.sleep(5)  # 受け付けに 5 秒かかる
+    slow_done.append(data)
+
+
+main.handle = slow_handle
+sender = ("import sys, time; sys.path[:0] = [r'%s']; from PySide6.QtCore import QCoreApplication; "
+          "from PySide6.QtNetwork import QLocalSocket; app = QCoreApplication([]); s = QLocalSocket(); "
+          "s.connectToServer(%r); assert s.waitForConnected(2000); "
+          "s.write(b'{\"cmd\": \"run\"}\\n'); s.flush(); s.waitForBytesWritten(1000); "
+          "sys.exit(0 if s.waitForDisconnected(3000) else 4)" % (ROOT.parent / "GenCommon", main._SERVER_NAME))
+proc = subprocess.Popen([sys.executable, "-c", sender], env={**os.environ, "QT_QPA_PLATFORM": "offscreen"})
+end = time.time() + 20
+while time.time() < end and proc.poll() is None:
+    pump(0.05)
+check(proc.returncode == 0, f"受け付けに 5 秒かかっても、送る側は 3 秒以内に切られる ({proc.returncode})")
+pump(0.3)
+check(len(slow_done) == 1 and b'"run"' in slow_done[0], "切ったあとで中身を受け付ける")
+main.handle = real_handle
+
 # 6. 量産ラインの結果を右クリックで物語の最後に足す
 from PySide6.QtWidgets import QMenu  # noqa: E402
 
