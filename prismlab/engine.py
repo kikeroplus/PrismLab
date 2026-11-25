@@ -245,6 +245,12 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         snap["kind"] = kind
         snap["seconds"] = stage.seconds if comfy.get_duration(wf) is not None else None
         snap["base"] = comfy.base_prompt_for(kinds.is_video(kind)) if stage.base_prompt else ""
+        if stage.values:
+            bad = comfy.value_problems(wf, stage.values)
+            if bad:
+                raise ValueError(f"生成のステップ ({snap['workflow_name']}) の値を変える場所が、ワークフローにありません: "
+                                 + "、".join(bad) + "。ステップの設定で選び直してください。")
+            snap["values"] = [dict(v) for v in stage.values]
     return snap
 
 
@@ -1199,6 +1205,7 @@ class Engine(QObject):
             inserts=[dict(a) for a in it.adds] or None,
             reference=it.reference or None,
             last_frame=it.last_frame or None,
+            values=[dict(v) for v in stage.get("values") or []] or None,
             reader={"name": it.read_name} if it.read_name else None,
             output_dir=it.out_dir or run.output_dir,
         )

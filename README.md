@@ -67,6 +67,7 @@ python tests\test_thumbs.py      # サムネール (出来たばかりで読め�
 python tests\test_recipe_groups.py  # レシピのまとまり (タブ・寄せ方・保存)
 python tests\test_image_step.py     # 画像のステップ (流れている画像の差し替え・文はそのまま)
 python tests\test_save_throttle.py  # 続きのファイルをまとめて書く (すぐ書くとき・閉じるとき・書きかけの片付け)
+python tests\test_values.py         # 生成の「値を変える」(候補・差し替え・場所がないとき・画面)
 ```
 
 物語のコマを読むのに OpenCV (`opencv-python`) を使います (`pip install -r requirements.txt`)。

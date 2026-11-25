@@ -24,6 +24,7 @@ class FakeComfy:
         self.prompts: dict = {}  # id → {"wf": ..., "seen": n, "video": bool}
         self.received: list = []  # 受けたワークフロー (順に)
         self.uploads: dict = {}  # 受けた画像の名前 → 送られてきた中身 (multipart のまま)
+        self.object_info: dict = {}  # /object_info/(ノードの種類) に返すもの (種類 → {"input": ...})
         self.lock = threading.Lock()
         owner = self
 
@@ -43,6 +44,10 @@ class FakeComfy:
                 url = urlparse(self.path)
                 if url.path == "/system_stats":
                     return self._send({"system": {}})
+                if url.path.startswith("/object_info/"):
+                    from urllib.parse import unquote
+                    ct = unquote(url.path[len("/object_info/"):])
+                    return self._send({ct: owner.object_info[ct]} if ct in owner.object_info else {})
                 if url.path == "/queue":
                     with owner.lock:
                         running = [[0, pid] for pid, p in owner.prompts.items() if p["seen"] < owner.polls]

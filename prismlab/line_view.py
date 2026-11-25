@@ -33,6 +33,26 @@ RESULT_ICON = QSize(128, 128)
 STAR_ITEMS = ["★の絞り込みなし"] + [f"★{n} 以上" for n in range(1, 6)]
 
 
+def _values_line(values, bad) -> str:
+    """生成の札の「値を変える」の行 (変える入力の名前を並べる)。"""
+    if not values:
+        return ""
+    names = "・".join(dict.fromkeys(str(v.get("input") or "") for v in values))
+    if bad:
+        return f"\n⚠ 値を変える場所がワークフローにありません: {'、'.join(bad)}"
+    return f"\n値を変える: {names}"
+
+
+def _values_bad(workflow: str, values) -> list:
+    """値を変える場所のうち、ワークフローにないもの (読めないワークフローは、ほかのところで知らせるので空)。"""
+    if not values or not workflow:
+        return []
+    try:
+        return comfy.value_problems(comfy.load_workflow(workflow), values)
+    except comfy.ComfyError:
+        return []
+
+
 def _fmt_duration(seconds: float) -> str:
     seconds = int(seconds)
     h, m = seconds // 3600, seconds % 3600 // 60
@@ -666,6 +686,7 @@ class LineView(QWidget):
                     v["kind"] = s.get("kind", "")
                     v["detail"] = s.get("workflow_name", "")
                     v["seconds"] = s.get("seconds")
+                    v["values"] = list(s.get("values") or [])
                 views.append(v)
             return views
         views = []
@@ -711,6 +732,8 @@ class LineView(QWidget):
                 v["detail"] = (names[0] if names and names[0] else Path(s.workflow).stem) if s.workflow \
                     else "(ワークフローを選んでください)"
                 v["seconds"] = s.seconds
+                v["values"] = list(s.values)
+                v["values_bad"] = _values_bad(s.workflow, s.values)
             views.append(v)
         return views
 
@@ -824,7 +847,8 @@ class LineView(QWidget):
             card.title.setText(v.get("title") or recipes.STAGE_TITLES[v["type"]])
             if v.get("title"):
                 card.title.setToolTip(f"{recipes.STAGE_TITLES[v['type']]}: {v['title']}")
-            card.detail.setText(v["detail"] + (f"  ・ {v['seconds']:g} 秒" if v.get("seconds") else ""))
+            card.detail.setText(v["detail"] + (f"  ・ {v['seconds']:g} 秒" if v.get("seconds") else "")
+                                + _values_line(v.get("values"), v.get("values_bad")))
             if v["bypass"]:
                 # バイパス: 前のものをそのまま次に渡す (流れる中身は変えない)
                 card.chip.set("バイパス", "#777777")
@@ -955,6 +979,8 @@ class LineView(QWidget):
                 elif ("notext", i) in problems:
                     reason = ("英語にする" if v["type"] == recipes.TRANSLATE else "置き換える") + \
                         "文がありません (前に読み取り・盛る・追加テキストなどを置く)"
+                elif v.get("values_bad"):
+                    reason = "値を変える場所がワークフローにありません (ステップの設定で選び直す)"
                 if reason:
                     card.io.setText(f'<span style="color:#ef5350; font-weight:bold">⚠ {html.escape(reason)}</span>')
                     card.io.setWordWrap(True)
@@ -1946,6 +1972,12 @@ class LineView(QWidget):
                 rows.append(("盛った文", o.get("enhanced") or "(盛っていません)"))
                 rows += self._add_rows(o.get("adds"), before=False)
                 rows.append(("送った文 (ベースプロンプト込み)", o.get("sent") or "(ワークフローのプロンプトのまま)"))
+                # 値を変えたもの (件ごとには持たず、始めたときのステップの写しから出す)
+                st = o.get("stage")
+                values = run.stages[st].get("values") if run is not None and isinstance(st, int) \
+                    and 0 <= st < len(run.stages) else None
+                if values:
+                    rows.append(("値を変えた", "\n".join(f"{comfy.value_label(v)} = {v.get('value')}" for v in values)))
             else:
                 head = "失敗: " + Path(it.source).name
                 rows = [("理由", it.error), ("読み取った文", it.text or "(まだ)"), ("盛った文", it.enhanced or "(まだ)")]

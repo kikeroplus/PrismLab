@@ -15,6 +15,7 @@ from gencommon import comfy, enhancer, inserts, reader, settings
 from gencommon.comfy_dialogs import ComfySettingsDialog
 
 from . import kinds, recipes, theme
+from .value_dialog import ValuesBox
 from .widgets import KindChip, use_label
 
 
@@ -262,6 +263,10 @@ class StageDialog(QDialog):
             form.addRow("", self.base)
             self.base_text = _hint("")
             form.addRow("", self.base_text)
+            # 値を変える (2026-11-25 利用者の希望): モデル・LoRA・サイズなどを、送るときに差し替える
+            self.values_box = ValuesBox(stage.values, self)
+            form.addRow("値を変える", self.values_box)
+            self.resize(660, 0)
             self.workflow.currentIndexChanged.connect(self._workflow_changed)
             self._fill_workflows(stage.workflow)
             if running:
@@ -396,6 +401,7 @@ class StageDialog(QDialog):
         self.chip.set(kind, kinds.color_of(kind))
         duration = None
         note = ""
+        wf = None
         if not path:
             note = "ワークフローが登録されていません。「生成の設定...」で登録してください。"
         else:
@@ -405,7 +411,9 @@ class StageDialog(QDialog):
                 note = comfy.describe_workflow(wf)
             except comfy.ComfyError as exc:
                 note = str(exc)
+                wf = None
         self.wf_note.setText(note)
+        self.values_box.set_workflow(wf)
         has_duration = duration is not None
         self.use_seconds.setEnabled(has_duration)
         self.seconds.setEnabled(has_duration and self.use_seconds.isChecked())
@@ -474,8 +482,14 @@ class StageDialog(QDialog):
         else:
             if self.workflow.isEnabled():  # 量産中は変えない (一覧になくても元のまま)
                 s.workflow = str(self.workflow.currentData() or "")
+            bad = self.values_box.problems()
+            if bad:
+                QMessageBox.warning(self, "値を変える", "このワークフローに場所がない値があります: " + "、".join(bad) +
+                                    "\n外すか、追加... で選び直してください。")
+                return
             s.seconds = self.seconds.value() if self.use_seconds.isChecked() and self.use_seconds.isEnabled() else None
             s.base_prompt = self.base.isChecked()
+            s.values = [dict(v) for v in self.values_box.values]
         self.accept()
 
 

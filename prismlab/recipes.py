@@ -83,9 +83,14 @@ class Stage:
     rules: str = ""  # 置き換え: 1 行に「元 => 先」(先がなければ消す)
     image: str = ""  # リファレンス (1 枚)・画像 (1 枚) の画像 (フォルダのほうは folder を使う)
     shuffle: bool = False  # リファレンス (フォルダ)・画像 (フォルダ): ランダムな順に使う (既定は名前順)
+    # 生成: 値を変える (2026-11-25 利用者の希望)。送るときにワークフローの中の値を差し替える (ファイルは書き換えない)。
+    # 1 件は {node, input, value, class_type, title} (comfy.value_slots)。モデル・LoRA・サイズだけ違うワークフローを減らす
+    values: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return dict(self.__dict__)
+        data = dict(self.__dict__)
+        data["values"] = [dict(v) for v in self.values]
+        return data
 
     @staticmethod
     def from_dict(data: dict) -> "Stage":
@@ -114,7 +119,25 @@ class Stage:
         s.rules = str(data.get("rules") or "")
         s.image = str(data.get("image") or "")
         s.shuffle = bool(data.get("shuffle", False))
+        s.values = clean_values(data.get("values"))
         return s
+
+
+VALUE_KEYS = ("node", "input", "value", "class_type", "title")
+
+
+def clean_values(data) -> list:
+    """値を変えるもの (読めないものは捨てる。同じ場所は後のものを使う)。"""
+    out: dict = {}
+    for v in data if isinstance(data, list) else []:
+        if not isinstance(v, dict) or not v.get("node") or not v.get("input") or "value" not in v:
+            continue
+        if not isinstance(v["value"], (str, int, float, bool)):
+            continue
+        item = {k: v[k] for k in VALUE_KEYS if k in v}
+        item["node"], item["input"] = str(item["node"]), str(item["input"])
+        out[(item["node"], item["input"])] = item
+    return list(out.values())
 
 
 def stage_title(stage) -> str:
