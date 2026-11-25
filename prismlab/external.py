@@ -23,6 +23,7 @@ from gencommon import comfy, store
 from . import engine, recipes
 
 EXT_DIR = "external"
+STALE_TMP = 600.0  # これより古い書きかけ (*.tmp) は消す (書くのは一瞬なので、ほかで書いている途中のものではない)
 STATUS_FILE = "external_status.json"
 KEEP_FINISHED = 30 * 60  # 終わったものも、これだけのあいだは進み具合に残す (頼んだアプリが「完了」を見られるように)
 RESULTS_DIR = "生成結果"
@@ -187,7 +188,7 @@ class ExternalRuns(QObject):
                 if isinstance(ext, dict):
                     ext["machines"] = list(urls)  # 次に PrismLab が起動して続けるときも、この台で
             eng.set_machines(urls)
-            eng._save()  # noqa: SLF001 - 続きのファイルにも新しい台を書く
+            eng._save(now=True)  # noqa: SLF001 - 続きのファイルにも新しい台を書く
             count += 1
         self._schedule()
         return count
@@ -196,6 +197,13 @@ class ExternalRuns(QObject):
         """前に終わらなかった頼みを続ける (聞かない)。戻り値は続けた数。"""
         folder = store.app_file(EXT_DIR)
         count = 0
+        for path in folder.glob("*.tmp") if folder.is_dir() else []:
+            # 書いている途中で落ちた書きかけ (別名に書いてから置き換えるので、落ちると残る。*.json しか見ないので誰も消さない)
+            try:
+                if time.time() - path.stat().st_mtime > STALE_TMP:
+                    path.unlink()
+            except OSError:
+                pass
         for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
             run = engine.Run.from_dict(_read_json(path))
             ext = run.recipe.get("external") if run is not None else None

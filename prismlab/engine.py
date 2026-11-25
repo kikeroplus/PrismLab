@@ -27,6 +27,10 @@ SLOTS_PER_MACHINE = 2  # 1 台に同時に送る件数 (generation-standard 6 �
 FAIL_LIMIT = 3  # ある台でだけ、これだけ続けて失敗したら、その台を外す
 DOWN_RECHECK = 30.0  # 繋がらない台を確かめ直す間隔 (秒)
 SEEN_SECONDS = 3.0  # これより前に空きを求められていない台は、譲る先にしない (繋がらない・外した台)
+# 続きのファイルは、件が進むたびに全部を書き直す。何千件の頼みでは 1 回 10MB を超え、件数の 2 乗で書く量が増える
+# (3,400 件で合計 150GB ほど。2026-11-25)。なので、件が進んだだけのときは、これだけの間隔にまとめて書く。
+# 頼んだ番号・始める・止める・終わる・閉じるときはすぐ書く (落ちても、ComfyUI に頼んだものは番号から受け取り直せる)
+SAVE_EVERY = 30.0
 # 同じワークフローを同じ台に寄せる (2026-11-18 利用者の希望。画像と動画が混じるレシピで、ComfyUI がモデルを読み直す回数を
 # 減らす)。緩い重み付け: 台が空いたら、待っている生成の先頭から AFFINITY_LOOKAHEAD 件のうち、その台が最後に動かした
 # ワークフローと同じものを先に取る。先頭の件は AFFINITY_MAX_SKIPS 回まで後回しにしたら、次は必ず取る (待たせすぎない)
@@ -553,6 +557,12 @@ class Engine(QObject):
         self._stop = False
         self._cancels: dict[int, threading.Event] = {}  # id(Item) → キャンセル
         self._save_failed = False
+        self._dirty = False  # まとめて書くのを待っている変わったところがある
+        self._saved_at = 0.0  # 最後に書いた時刻 (time.monotonic)
+        self._save_timer: Optional[threading.Timer] = None
+        self._save_seq = 0  # 書いた順 (古い中身で新しいものを上書きしないように)
+        self._written_seq = 0
+        self._write_lock = threading.Lock()
         self._passed: Optional[Item] = None  # _pick が後回しにした先頭の件 (ロックを持って使う)
         self._english: dict = {}  # 英語に: 訳した文の覚え (元の文 → 訳。LLM のスレッドだけが使う)
         self._llm_down_until = 0.0  # 英語に: LLM に繋がらなかった。この時刻までは確かめずに訳さずに進める
@@ -597,7 +607,7 @@ class Engine(QObject):
             self._unpin_missing()
             self._ensure_threads()
             self._cond.notify_all()
-        self._save()
+        self._save(now=True)
         self.changed.emit()
 
     def show(self, run: Optional[Run]) -> None:
@@ -614,7 +624,7 @@ class Engine(QObject):
                 return
             self.run.paused = paused
             self._cond.notify_all()
-        self._save()
+        self._save(now=True)
         self.changed.emit()
 
     def cancel_all(self) -> None:
@@ -627,7 +637,7 @@ class Engine(QObject):
             for ev in self._cancels.values():
                 ev.set()
             self._cond.notify_all()
-        self._save()
+        self._save(now=True)
         self._check_finished()
         self.changed.emit()
 
@@ -646,15 +656,16 @@ class Engine(QObject):
                 self._ensure_threads()
             self._cond.notify_all()
         if count:
-            self._save()
+            self._save(now=True)
             self.changed.emit()
         return count
 
     def stop_threads(self) -> None:
-        """閉じるとき: スレッドに終わるよう伝える (ComfyUI 側の実行は止めない)。"""
+        """閉じるとき: スレッドに終わるよう伝える (ComfyUI 側の実行は止めない)。まとめて書くのを待っているものも書く。"""
         with self._cond:
             self._stop = True
             self._cond.notify_all()
+        self.flush()
 
     def discard(self) -> None:
         """捨てて閉じる / 中断する: 残りを取り消し、頼み済みのものは ComfyUI の待ち行列から外す。"""
@@ -675,7 +686,7 @@ class Engine(QObject):
                 comfy.cancel_prompt(url, pid)
             except Exception:  # noqa: BLE001 - 繋がらなければそのまま
                 pass
-        self._save()
+        self._save(now=True)
 
     def update_stage(self, index: int, snap: dict) -> None:
         """量産中にステップの中身を直す (2026-11-19 利用者の希望)。これからそのステップに来る件から効き、通った件はそのまま。
@@ -737,7 +748,7 @@ class Engine(QObject):
                 picker.discard()  # 試作では位置を進めない
             else:
                 picker.commit()
-        self._save()
+        self._save(now=True)
         self.changed.emit()
 
     def in_use(self, paths) -> set[str]:
@@ -1204,7 +1215,7 @@ class Engine(QObject):
         def submitted(pid: str):
             with self._cond:
                 it.prompt_id, it.machine = pid, m.url
-            self._save()
+            self._save(now=True)  # 頼んだ番号はすぐ書く (落ちたら、この番号から受け取り直す。二重に頼まない)
 
         try:
             outputs = comfy.generate(it.current, req, lambda t: self._set_status(it, t), cancel,
@@ -1219,7 +1230,7 @@ class Engine(QObject):
                 if not held.sent:
                     it.prompt_id, it.machine = "", ""
                 self._cond.notify_all()
-            self._save()
+            self._save(now=True)
             self.changed.emit()
             return
         except comfy.ComfyError as exc:
@@ -1234,7 +1245,7 @@ class Engine(QObject):
                             other.prompt_id, other.machine = "", ""
                     it.prompt_id, it.machine = "", ""
                     self._cond.notify_all()
-                self._save()
+                self._save(now=True)
                 self.changed.emit()
                 return
             with self._cond:
@@ -1312,6 +1323,7 @@ class Engine(QObject):
                 return
             self._stop = True
             self._cond.notify_all()
+        self.flush()  # 終わったところを書いてから知らせる (知らせを受けて消すこともある)
         self.pool.forget(self._key)  # 台の空きの置き場から外す (また始めれば、知らせたときに戻る)
         self.finished.emit()
 
@@ -1339,14 +1351,45 @@ class Engine(QObject):
         with self._cond:
             self._cond.notify_all()
 
-    def _save(self) -> None:
+    def _save(self, now: bool = False) -> None:
+        """状態が変わった: 台の空きの置き場に知らせ、続きのファイルを書く。now でなければ SAVE_EVERY にまとめる。"""
         with self._cond:
             self._publish()  # 状態が変わるたびに呼ばれるので、ここで知らせる
             if self.run is None or not self.run_file:
+                self._dirty = False
                 return
+            wait = SAVE_EVERY - (time.monotonic() - self._saved_at)
+            if not now and wait > 0:
+                self._dirty = True
+                if self._save_timer is None:
+                    timer = threading.Timer(wait, self._save_due)
+                    timer.daemon = True
+                    self._save_timer = timer
+                    timer.start()
+                return
+            self._dirty = False
+            self._saved_at = time.monotonic()
+            self._save_seq += 1
+            seq, path = self._save_seq, store.app_file(self.run_file)
             text = json.dumps(self.run.to_dict(), ensure_ascii=False)
-        try:
-            store.write_text(store.app_file(self.run_file), text)
-            self._save_failed = False
-        except OSError:
-            self._save_failed = True
+        with self._write_lock:
+            if seq < self._written_seq:
+                return  # あとから作った中身をもう書いた
+            try:
+                store.write_text(path, text)
+                self._written_seq = seq
+                self._save_failed = False
+            except OSError:
+                self._save_failed = True
+
+    def _save_due(self) -> None:
+        with self._cond:
+            self._save_timer = None
+        self.flush()
+
+    def flush(self) -> None:
+        """まとめて書くのを待っているものがあれば、いま書く。"""
+        with self._cond:
+            due = self._dirty
+        if due:
+            self._save(now=True)

@@ -66,6 +66,7 @@ python tests\test_hover_video.py  # 結果の「乗せると拡大」の動画�
 python tests\test_thumbs.py      # サムネール (出来たばかりで読めないものを読み直す)
 python tests\test_recipe_groups.py  # レシピのまとまり (タブ・寄せ方・保存)
 python tests\test_image_step.py     # 画像のステップ (流れている画像の差し替え・文はそのまま)
+python tests\test_save_throttle.py  # 続きのファイルをまとめて書く (すぐ書くとき・閉じるとき・書きかけの片付け)
 ```
 
 物語のコマを読むのに OpenCV (`opencv-python`) を使います (`pip install -r requirements.txt`)。
