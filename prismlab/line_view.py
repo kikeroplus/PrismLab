@@ -93,8 +93,10 @@ STAGE_HELP = {
     recipes.FRAME: "前の生成で出来た動画の最後のコマを画像にして、次へ渡します。",
     recipes.REF_IMAGE: "決めた 1 枚の画像を、このあとの生成のリファレンス (顔など) に使います。",
     recipes.REF_FOLDER: "フォルダの画像を 1 件ごとに 1 枚ずつ、このあとの生成のリファレンス (顔など) に使います。",
-    recipes.IMG_ONE: "流れている画像を、決めた 1 枚の画像に差し替えます (文はそのまま)。テキストからの I2I・I2V にも。",
-    recipes.IMG_FOLDER: "流れている画像を、フォルダの画像 (1 件ごとに 1 枚ずつ) に差し替えます (文はそのまま)。",
+    recipes.IMG_ONE: "決めた 1 枚の画像を、流れている画像の代わりか、あとの生成のリファレンス・ラストフレーム・"
+                     "ラベルを付けた入口に入れます。",
+    recipes.IMG_FOLDER: "フォルダの画像 (1 件ごとに 1 枚ずつ) を、流れている画像の代わりか、あとの生成のリファレンス・"
+                        "ラストフレーム・ラベルを付けた入口に入れます。",
     recipes.GEN: "ComfyUI のワークフローで画像・動画を作ります (T2I / I2I / I2V など)。",
 }
 
@@ -126,6 +128,16 @@ def _ref_detail(stage_type: str, image: str, folder: str, shuffle: bool) -> str:
     if not folder:
         return "(フォルダを選んでください)"
     return f"フォルダ: {Path(folder).name}" + ("  ・ ランダム" if shuffle else "  ・ 名前順")
+
+
+def _target_where(v: dict) -> str:
+    """入れる先の画像の入口の見分け方 (札の ⚠ に出す)。"""
+    target, label = recipes.image_target(v)
+    if target == recipes.TARGET_REF:
+        return "タイトルが reference / face / 顔 などの"
+    if target == recipes.TARGET_LAST:
+        return "タイトルが last / end / ラスト などの"
+    return f"タイトルが「{label}」の"
 
 
 def _ref_files(stage_type: str, image: str, folder: str) -> list[str]:
@@ -672,6 +684,7 @@ class LineView(QWidget):
                     image, folder = str(s.get("image") or ""), str(s.get("folder") or "")
                     v["detail"] = _ref_detail(s["type"], image, folder, bool(s.get("shuffle")))
                     v["refs"] = _ref_files(s["type"], image, folder)
+                    v["target"], v["target_label"] = recipes.image_target(s)
                 elif s["type"] in TOOL_TYPES:
                     rules = s.get("rules") or []
                     if s["type"] == recipes.SUB:
@@ -721,6 +734,7 @@ class LineView(QWidget):
             elif s.type in recipes.PICK_TYPES:
                 v["detail"] = _ref_detail(s.type, s.image, s.folder, s.shuffle)
                 v["refs"] = _ref_files(s.type, s.image, s.folder)
+                v["target"], v["target_label"] = recipes.image_target(s)
             elif s.type in TOOL_TYPES:
                 v["count"], v["stars"] = s.count, s.stars
                 v["detail"] = _tool_detail(s.type, s.count, s.stars, recipes.parse_rules(s.rules))
@@ -890,34 +904,36 @@ class LineView(QWidget):
                 card.io.setText(io_html([prev_out, "→", ("画像", kinds.IMAGE_COLOR)]))
                 prev_out = ("画像", kinds.IMAGE_COLOR)
                 card.thumbs.hide()
-            elif v["type"] in recipes.REF_TYPES:
-                # リファレンス: 流れている画像・文はそのままで、あとの生成に渡すリファレンスを決める
-                # 見出しは「リファレンス」だけ (「リファレンス (フォルダ)」は札の幅に入らない)。1 枚 / フォルダは印で見せる
-                card.title.setText("リファレンス")
-                card.title.setToolTip(recipes.STAGE_TITLES[v["type"]])
-                card.chip.set("1 枚" if v["type"] == recipes.REF_IMAGE else "フォルダ", kinds.REF_COLOR)
+            elif v["type"] in recipes.PICK_TYPES and recipes.is_side_image(v):
+                # リファレンス・ラストフレーム・ラベル: 流れている画像・文はそのままで、あとの生成のその入口に入れる画像を決める
+                # 見出しは入れる先の名前だけ (「(フォルダ)」は札の幅に入らない)。1 枚 / フォルダは印で見せる
+                name = recipes.target_name(v)
+                one = v["type"] in recipes.PICK_ONE
+                card.title.setText(name)
+                card.title.setToolTip(f"{recipes.STAGE_TITLES[recipes.base_type(v['type'])]} → "
+                                      f"{recipes.TARGET_NAMES[recipes.image_target(v)[0]]}: {name}")
+                card.chip.set("1 枚" if one else "フォルダ", kinds.REF_COLOR)
                 card.set_color(kinds.REF_COLOR)
-                ref = ("リファレンス", kinds.REF_COLOR)
-                card.io.setText(io_html([prev_out, "+", ref, "→", "あとの生成へ"]))
-                if v["type"] == recipes.REF_IMAGE and not running_now:
-                    # エクスプローラー・J-Rate から画像を落とすと、その画像にする
-                    card.accept_files(recipes.IMAGE_EXTS)
+                card.io.setText(io_html([prev_out, "+", (name, kinds.REF_COLOR), "→", "あとの生成へ"]))
+                if not running_now:
+                    # エクスプローラー・J-Rate から画像 (フォルダ) を落とすと、その画像 (フォルダ) にする
+                    card.accept_files(recipes.IMAGE_EXTS, folders=True)
                     card.file_dropped.connect(lambda path, n=i: self._set_ref_image(n, path))
-                if not running_now and not v["bypass"] and not self._ref_used_later(i):
-                    card.detail.setText(v["detail"] + "\n⚠ このリファレンスを使う生成がありません (あとの生成のワークフローに、"
-                                        "タイトルが reference / face / 顔 などの LoadImage がない)")
+                if not running_now and not v["bypass"] and ("noimage", i) not in problems and not self._ref_used_later(i):
+                    card.detail.setText(v["detail"] + f"\n⚠ この画像を使う生成がありません (あとの生成のワークフローに、"
+                                        f"{_target_where(v)}画像の入口がない)")
                 self._ref_thumbs[i] = v.get("refs") or []
-            elif v["type"] in recipes.IMG_TYPES:
+            elif v["type"] in recipes.PICK_TYPES:
                 # 画像: 流れている画像を差し替える (文はそのまま)
                 card.title.setText("画像")
-                card.title.setToolTip(recipes.STAGE_TITLES[v["type"]])
-                card.chip.set("1 枚" if v["type"] == recipes.IMG_ONE else "フォルダ", kinds.IMAGE_COLOR)
+                card.title.setToolTip(recipes.STAGE_TITLES[recipes.base_type(v["type"])])
+                card.chip.set("1 枚" if v["type"] in recipes.PICK_ONE else "フォルダ", kinds.IMAGE_COLOR)
                 card.set_color(kinds.IMAGE_COLOR)
                 image = ("画像", kinds.IMAGE_COLOR)
                 card.io.setText(io_html([image, "→", image]))
                 prev_out = image
-                if v["type"] == recipes.IMG_ONE and not running_now:
-                    card.accept_files(recipes.IMAGE_EXTS)  # 画像を落とすと、その画像にする
+                if not running_now:
+                    card.accept_files(recipes.IMAGE_EXTS, folders=True)  # 画像 (フォルダ) を落とすと、その画像 (フォルダ) にする
                     card.file_dropped.connect(lambda path, n=i: self._set_ref_image(n, path))
                 self._ref_thumbs[i] = v.get("refs") or []
             elif v["type"] == recipes.SPLIT:
@@ -966,7 +982,10 @@ class LineView(QWidget):
             if not running_now and not v["bypass"]:
                 # その位置では動かないステップに、理由を赤で出す (始める前に気付けるように)
                 reason = ""
-                if ("needimage", i) in problems:
+                if ("noimage", i) in problems:
+                    reason = ("画像が選ばれていません (画像かフォルダをここにドラッグ＆ドロップするか、"
+                              "クリックして選んでください)")
+                elif ("needimage", i) in problems:
                     reason = "画像がまだありません (テキストの入口では、先に T2I / T2V の生成を置く)"
                 elif ("enhance", i) in problems:
                     reason = "盛る元の文がありません (前に読み取り・追加テキスト・差し込みを置く)"
@@ -1305,33 +1324,49 @@ class LineView(QWidget):
         QTimer.singleShot(0, lambda: self.refresh(rebuild=True))
 
     def _ref_used_later(self, index: int) -> bool:
-        """index 番目のリファレンスのあとに、リファレンスの入口のある生成があるか (次のリファレンスまで。バイパスは数えない)。"""
+        """index 番目の画像 (リファレンス・ラストフレーム・ラベル) のあとに、その入口のある生成があるか
+        (同じ入れる先の次の画像のステップまで。バイパスは数えない)。"""
+        key = recipes.target_key(self.recipe.stages[index])
         for s in self.recipe.stages[index + 1:]:
             if s.bypass:
                 continue
-            if s.type in recipes.REF_TYPES:
+            if s.type in recipes.PICK_TYPES and recipes.is_side_image(s) and recipes.target_key(s) == key:
                 return False
-            if s.type == recipes.GEN and (not s.workflow or kinds.has_reference(s.workflow)):
+            if s.type == recipes.GEN and (not s.workflow or kinds.accepts(s.workflow, key)):
                 return True  # ワークフローが未選択なら、まだ言わない
         return False
 
     def _set_ref_image(self, index: int, path: str) -> None:
-        """リファレンス (1 枚)・画像 (1 枚) の札に落とした画像を、そのステップの画像にする。"""
+        """画像のステップの札に落とした画像 (フォルダ) を、そのステップの画像 (フォルダ) にする。
+        1 枚の札にフォルダを落とせばフォルダに、フォルダの札に画像を落とせば 1 枚に変わる (入れる先はそのまま)。"""
         if self.locked() or index >= len(self.recipe.stages):
             return
         stage = self.recipe.stages[index]
-        stage.image = str(Path(path))
+        if stage.type not in recipes.PICK_TYPES:
+            return
+        what = f"{recipes.target_name(stage)}の画像" if recipes.is_side_image(stage) else "画像のステップ"
+        p = Path(path)
+        if p.is_dir():
+            count = len(recipes.list_images(str(p)))
+            if not count:
+                self.status.emit(f"{p.name} には画像がありません。")
+                return
+            stage.type, stage.folder = recipes.IMG_FOLDER, str(p)
+            done = f"フォルダ {p.name} (画像 {count} 枚)"
+        else:
+            stage.type, stage.image = recipes.IMG_ONE, str(p)
+            done = p.name
         self._save_recipes()
-        what = "リファレンスの画像" if stage.type in recipes.REF_TYPES else "画像のステップ"
-        self.status.emit(f"{what}を {Path(path).name} にしました。")
+        self.status.emit(f"{what}を {done} にしました。")
         QTimer.singleShot(0, lambda: self.refresh(rebuild=True))  # 落とした札も作り直すので、信号から抜けてから
 
     def _add_stage(self, stage_type: str, index: Optional[int] = None) -> None:
-        """ステップを足す (index なしは末尾)。設定の窓で OK したときだけ入れる。"""
+        """ステップを足す (index なしは末尾)。設定の窓で OK したときだけ入れる (画像は窓を出さずにすぐ入れる)。"""
         if self.locked():
             return
         stage = recipes.Stage(stage_type)
-        if StageDialog(stage, self).exec():
+        # 画像は窓を出さずに足す (2026-11-26 利用者の希望)。画像・フォルダはあとで札に落とすか、札をクリックして選ぶ
+        if stage_type in recipes.PICK_TYPES or StageDialog(stage, self).exec():
             stages = self.recipe.stages
             stages.insert(len(stages) if index is None else min(index, len(stages)), stage)
             self._save_recipes()
@@ -1342,7 +1377,10 @@ class LineView(QWidget):
         if self.locked():
             return
         stage = recipes.Stage(stage_type)
-        if StageDialog(stage, self).exec():
+        old = self.recipe.stages[index]
+        if stage_type in recipes.PICK_TYPES and old.type in recipes.PICK_TYPES:
+            stage.target, stage.target_label = old.target, old.target_label  # 1 枚 ⇔ フォルダでは入れる先を残す
+        if stage_type in recipes.PICK_TYPES or StageDialog(stage, self).exec():  # 画像は窓を出さない (足すときと同じ)
             self.recipe.stages[index] = stage
             self._save_recipes()
             self.refresh(rebuild=True)
@@ -1967,6 +2005,10 @@ class LineView(QWidget):
                 rows = [("元", Path(o.get("from") or it.source).name)]
                 if o.get("reference"):
                     rows.append(("リファレンス", str(o["reference"])))
+                if o.get("last_frame"):
+                    rows.append(("ラストフレーム", str(o["last_frame"])))
+                for label, path in (o.get("images") or {}).items():
+                    rows.append((f"画像「{label}」", str(path)))
                 rows.append(("読み取った文", o.get("prompt") or "(なし)"))
                 rows += self._add_rows(o.get("adds"), before=True)
                 rows.append(("盛った文", o.get("enhanced") or "(盛っていません)"))

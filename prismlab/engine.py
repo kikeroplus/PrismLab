@@ -79,6 +79,8 @@ class Item:
     adds: list = field(default_factory=list)
     reference: str = ""  # リファレンス画像 (主に顔)。ワークフローにリファレンス用の LoadImage があるときだけ使う
     last_frame: str = ""  # ラストフレーム。ワークフローにラストフレーム用の LoadImage があるときだけ使う
+    # ラベルを決めて入れる画像 (ラベル → パス)。タイトルがラベルと同じ画像の入口があるときだけ使う。生成を通っても残す
+    images: dict = field(default_factory=dict)
     memos: dict = field(default_factory=dict)  # 覚えたプロンプト (メモの名前 → {"text", "enhanced", "adds"})。生成を通っても残す
     plan: dict = field(default_factory=dict)  # 差し込みの割り当て (ステップの番号の文字 → 枠の形)。始めたときに決める
     error: str = ""
@@ -127,6 +129,8 @@ class Item:
             it.state = WAITING  # 閉じたとき実行中だったもの (頼み済みなら prompt_id で続きを待つ)
         adds = data.get("adds")
         it.adds = [d for d in adds if isinstance(d, dict)] if isinstance(adds, list) else []
+        images = data.get("images")
+        it.images = {str(k): str(v) for k, v in images.items() if k and v} if isinstance(images, dict) else {}
         memos = data.get("memos")
         it.memos = {str(k): v for k, v in memos.items() if isinstance(v, dict)} if isinstance(memos, dict) else {}
         plan = data.get("plan")
@@ -178,6 +182,7 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
             snap["count"], snap["stars"], snap["rules"] = stage.count, stage.stars, stage.rules
         elif stage.type in recipes.PICK_TYPES:
             snap["image"], snap["folder"], snap["shuffle"] = stage.image, stage.folder, stage.shuffle
+            snap["target"], snap["target_label"] = recipes.image_target(stage)
         else:
             snap["workflow"] = stage.workflow
             names = [w.name for w in comfy.workflows() if stage.workflow and w.value.lower() == stage.workflow.lower()]
@@ -218,17 +223,21 @@ def stage_snapshot(stage: recipes.Stage) -> dict:
         snap["count"] = max(2, min(recipes.MAX_SPLIT, int(stage.count)))
     elif stage.type == recipes.GATE:
         snap["stars"] = max(1, min(5, int(stage.stars)))
+    elif stage.type in recipes.PICK_TYPES and stage.target == recipes.TARGET_LABEL and not stage.target_label.strip():
+        raise ValueError(f"{recipes.stage_title(stage)} のステップに、入れる先のラベルが決まっていません。")
     elif stage.type in recipes.PICK_ONE:
-        title = recipes.STAGE_TITLES[stage.type]
+        title = recipes.stage_title(stage)
         if not stage.image:
             raise ValueError(f"{title} のステップに画像が選ばれていません。")
         if not Path(stage.image).is_file():
             raise ValueError(f"{title} のステップの画像が見つかりません: {stage.image}")
         snap["image"] = stage.image
+        snap["target"], snap["target_label"] = recipes.image_target(stage)
     elif stage.type in recipes.PICK_TYPES:
         if not recipes.list_images(stage.folder):
-            raise ValueError(f"{recipes.STAGE_TITLES[stage.type]} のフォルダに画像がありません: {stage.folder or '(未選択)'}")
+            raise ValueError(f"{recipes.stage_title(stage)} のフォルダに画像がありません: {stage.folder or '(未選択)'}")
         snap["folder"], snap["shuffle"] = stage.folder, stage.shuffle
+        snap["target"], snap["target_label"] = recipes.image_target(stage)
     elif stage.type == recipes.SUB:
         rules = recipes.parse_rules(stage.rules)
         if not rules:
@@ -703,7 +712,8 @@ class Engine(QObject):
         if run is None or not 0 <= index < len(run.stages):
             raise ValueError("量産が動いていません。")
         old = run.stages[index]
-        if old["type"] != snap.get("type") or bool(old.get("bypass")) != bool(snap.get("bypass")):
+        if recipes.base_type(old["type"]) != recipes.base_type(str(snap.get("type"))) \
+                or bool(old.get("bypass")) != bool(snap.get("bypass")):
             raise ValueError("量産中は、ステップの種類とバイパスは変えられません。")
         if old["type"] == recipes.GEN and str(old.get("workflow", "")).lower() != str(snap.get("workflow", "")).lower():
             raise ValueError("量産中は、ワークフローは変えられません。")
@@ -965,9 +975,7 @@ class Engine(QObject):
                 self._last_frame(it)
             elif stage["type"] == recipes.SPLIT:
                 self._split(it, stage)
-            elif stage["type"] in recipes.REF_TYPES:
-                self._reference(it, stage)
-            elif stage["type"] in recipes.IMG_TYPES:
+            elif stage["type"] in recipes.PICK_TYPES:
                 self._load_image(it, stage)
             elif stage["type"] == recipes.SUB:
                 self._substitute(it, stage)
@@ -1044,34 +1052,31 @@ class Engine(QObject):
             else:
                 it.text, it.enhanced, it.adds = text, enhanced, adds
 
-    def _reference(self, it: Item, stage: dict) -> None:
-        """リファレンス: このあとの生成に渡すリファレンス画像を決める (生成を通っても残る。次のリファレンスで置き換え)。
-        ワークフローにリファレンス用の LoadImage がなければ、渡しても使われない。"""
-        if stage["type"] == recipes.REF_IMAGE:
-            path = str(stage.get("image") or "")
-        else:
-            planned = it.plan.get(plan_key(it.stage, it.branch)) or it.plan.get(str(it.stage))
-            if not planned:
-                raise ValueError("リファレンスの画像が割り当てられていません (始め直してください)。")
-            path = str(planned.get("file") or "")
-        if not path or not Path(path).is_file():
-            raise ValueError(f"リファレンスの画像が見つかりません: {path or '(なし)'}")
-        with self._cond:
-            it.reference = path
-
     def _load_image(self, it: Item, stage: dict) -> None:
-        """画像: 流れている画像を、決めた 1 枚 (フォルダなら割り当てた 1 枚) に差し替える。文はそのまま。"""
-        if stage["type"] == recipes.IMG_ONE:
+        """画像: 決めた 1 枚 (フォルダなら割り当てた 1 枚) を、入れる先に入れる。
+        流れている画像なら差し替える (文はそのまま)。リファレンス・ラストフレーム・ラベルなら、このあとの生成の
+        その入口に渡す (生成を通っても残る。同じ入れる先の次のステップで置き換え)。ワークフローに入口がなければ使われない。"""
+        target, label = recipes.image_target(stage)
+        name = recipes.target_name(stage)
+        if stage["type"] in recipes.PICK_ONE:
             path = str(stage.get("image") or "")
         else:
             planned = it.plan.get(plan_key(it.stage, it.branch)) or it.plan.get(str(it.stage))
             if not planned:
-                raise ValueError("画像が割り当てられていません (始め直してください)。")
+                raise ValueError(f"{name}の画像が割り当てられていません (始め直してください)。")
             path = str(planned.get("file") or "")
         if not path or not Path(path).is_file():
-            raise ValueError(f"画像が見つかりません: {path or '(なし)'}")
+            raise ValueError(f"{name}の画像が見つかりません: {path or '(なし)'}")
         with self._cond:
-            it.current = path
+            if target == recipes.TARGET_REF:
+                it.reference = path
+            elif target == recipes.TARGET_LAST:
+                it.last_frame = path
+            elif target == recipes.TARGET_LABEL:
+                it.images = {k: v for k, v in it.images.items() if k.lower() != label.lower()}
+                it.images[label] = path
+            else:
+                it.current = path
 
     def _last_frame(self, it: Item) -> None:
         """最後のコマ: 動画の最後のコマを (出力フォルダ)\\コマ に PNG で書き、次のステップにはその画像を渡す。"""
@@ -1098,6 +1103,7 @@ class Engine(QObject):
                              state=DONE if nxt >= len(run.stages) else WAITING,
                              text=it.text, origin_text=it.origin_text, enhanced=it.enhanced, read_name=it.read_name,
                              adds=[dict(a) for a in it.adds], reference=it.reference, last_frame=it.last_frame,
+                             images=dict(it.images),
                              memos=json.loads(json.dumps(it.memos)), plan=dict(it.plan), branch=it.branch * count + c,
                              out_dir=it.out_dir)
                 clones.append(clone)
@@ -1205,6 +1211,7 @@ class Engine(QObject):
             inserts=[dict(a) for a in it.adds] or None,
             reference=it.reference or None,
             last_frame=it.last_frame or None,
+            images=dict(it.images) or None,
             values=[dict(v) for v in stage.get("values") or []] or None,
             reader={"name": it.read_name} if it.read_name else None,
             output_dir=it.out_dir or run.output_dir,
@@ -1270,7 +1277,10 @@ class Engine(QObject):
         for out in outputs:
             comfy.add_history(out, it.current, req)
         # 使ったリファレンス (ワークフローにリファレンスの入口があるときだけ。結果の欄に出す)
-        used_ref = it.reference if it.reference and kinds.has_reference(str(stage.get("workflow", ""))) else ""
+        wf_path = str(stage.get("workflow", ""))
+        used_ref = it.reference if it.reference and kinds.has_reference(wf_path) else ""
+        used_last = it.last_frame if it.last_frame and kinds.has_last_frame(wf_path) else ""
+        used_images = {k: v for k, v in it.images.items() if kinds.has_label(wf_path, k)}
         with self._cond:
             now = time.time()
             for out in outputs:
@@ -1278,7 +1288,9 @@ class Engine(QObject):
                 it.outputs.append({"stage": it.stage, "path": out, "time": now, "from": it.current,
                                    "prompt": it.text or "", "enhanced": it.enhanced or "",
                                    "adds": [dict(a) for a in it.adds], "sent": req.full_prompt or "",
-                                   **({"reference": used_ref} if used_ref else {})})
+                                   **({"reference": used_ref} if used_ref else {}),
+                                   **({"last_frame": used_last} if used_last else {}),
+                                   **({"images": used_images} if used_images else {})})
             it.current = outputs[0]
             it.text, it.enhanced, it.read_name = None, None, ""  # 新しいファイルには新しい説明が要る
             it.adds = []

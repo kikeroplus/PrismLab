@@ -1,5 +1,6 @@
 """量産ラインの画面の部品: 種類の札・ステップ・台の札。色は kinds (今の色分け) から取る。"""
 
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
@@ -203,9 +204,10 @@ class Card(QFrame):
         self._color, self._active = color, active
         self._restyle()
 
-    def accept_files(self, exts: tuple) -> None:
-        """エクスプローラーから画像を 1 枚落とせるようにする。"""
+    def accept_files(self, exts: tuple, folders: bool = False) -> None:
+        """エクスプローラー・J-Rate から画像を 1 枚 (folders なら、フォルダ 1 つも) 落とせるようにする。"""
         self._exts = tuple(e.lower() for e in exts)
+        self._folders = folders
         self.setAcceptDrops(True)
 
     def _dropped_path(self, event) -> str:
@@ -213,7 +215,13 @@ class Card(QFrame):
         if len(urls) != 1 or not urls[0].isLocalFile():
             return ""
         path = urls[0].toLocalFile()
+        if getattr(self, "_folders", False) and Path(path).is_dir():
+            return path
         return path if path.lower().endswith(getattr(self, "_exts", ())) else ""
+
+    def dragMoveEvent(self, event):
+        if self._dropped_path(event):
+            event.acceptProposedAction()
 
     def dragEnterEvent(self, event):
         if self._dropped_path(event):

@@ -106,10 +106,12 @@ face = marked(TMP / "face", ["alice"])[0]
 faces = marked(TMP / "faces", ["f1", "f2", "f3"])
 
 # 1. 種類と保存
-check(recipes.REF_IMAGE in recipes.STAGE_ORDER and recipes.REF_FOLDER in recipes.STAGE_ORDER,
-      "＋ステップのメニューに 2 種類")
+# 2026-11-26: リファレンスは「画像」のステップの入れる先になった (メニューには画像の 2 種類だけ)
+check(recipes.REF_IMAGE not in recipes.STAGE_ORDER and recipes.IMG_ONE in recipes.STAGE_ORDER
+      and recipes.IMG_FOLDER in recipes.STAGE_ORDER, "＋ステップのメニューは画像の 2 種類 (リファレンスは入れる先)")
 s = recipes.Stage.from_dict(recipes.Stage(recipes.REF_FOLDER, folder="x", shuffle=True).to_dict())
-check(s.type == recipes.REF_FOLDER and s.folder == "x" and s.shuffle, "フォルダ・ランダムを覚える")
+check(s.type == recipes.IMG_FOLDER and s.target == recipes.TARGET_REF and s.folder == "x" and s.shuffle,
+      "前のリファレンス (フォルダ) は、入れる先がリファレンスの画像 (フォルダ) として読む (フォルダ・ランダムも)")
 s = recipes.Stage.from_dict(recipes.Stage(recipes.REF_IMAGE, image=str(face)).to_dict())
 check(s.image == str(face), "1 枚の画像を覚える")
 

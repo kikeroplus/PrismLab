@@ -17,7 +17,7 @@ from . import kinds, recipes
 
 MEDIA, TEXT, MEMO, REF = "media", "text", "memo", "ref"
 LANES = (MEDIA, TEXT, MEMO, REF)  # 描く段の順 (上から)
-LANE_NAMES = {MEDIA: "画像・動画", TEXT: "文字", MEMO: "メモ", REF: "リファレンス"}
+LANE_NAMES = {MEDIA: "画像・動画", TEXT: "文字", MEMO: "メモ", REF: "入れる画像"}
 
 
 @dataclass
@@ -71,7 +71,7 @@ def gaps(views: list, text_entry: bool = False) -> list:
     media = first.lines.get(MEDIA)
     text = TEXT in first.lines
     memos: dict = {}  # 覚えたメモの名前 → まだ使うか
-    ref = False
+    ref: dict = {}  # 決めた入れる先 (target_key → 名前)。生成を通っても残る
     copies = 1
     for i, v in enumerate(on):
         before = out[-1]
@@ -96,6 +96,10 @@ def gaps(views: list, text_entry: bool = False) -> list:
             elif t == recipes.FRAME:
                 media = Line("画像", kinds.IMAGE_COLOR)
                 made[MEDIA] = "動画の最後のコマの画像"
+            elif t in recipes.PICK_TYPES and recipes.is_side_image(v):
+                name = recipes.target_name(v)
+                ref[recipes.target_key(v)] = name
+                made[REF] = f"このあとの生成の「{name}」の入口に入れる画像"
             elif t in recipes.IMG_TYPES:
                 if MEDIA in before.lines:
                     # 流れてきた画像・動画は使わない: このステップの前で捨てる
@@ -130,9 +134,6 @@ def gaps(views: list, text_entry: bool = False) -> list:
                     made[TEXT] = f"「{name}」から戻した文" + ("" if not text else
                                                           (" (今の文に足した)" if v.get("append") else " (今の文と入れ替え)"))
                     text = True
-            elif t in recipes.REF_TYPES:
-                ref = True
-                made[REF] = "このあとの生成に渡すリファレンス"
             elif t == recipes.SPLIT:
                 copies *= max(2, int(v.get("count") or 2))
         # 使い終わったメモ・リファレンスは、ここで終わり
@@ -140,9 +141,9 @@ def gaps(views: list, text_entry: bool = False) -> list:
             if last_load.get(name, -1) <= i:
                 memos.pop(name)
         if ref and last_gen <= i:
-            ref = False
+            ref = {}
             if REF in had:
-                gone[REF] = "このあとに生成がないので、リファレンスはここで終わり"
+                gone[REF] = "このあとに生成がないので、入れる画像 (リファレンスなど) はここで終わり"
         if MEMO in had and not memos:
             gone[MEMO] = "このあとに思い出すがないので、メモはここで終わり"
 
@@ -161,7 +162,7 @@ def gaps(views: list, text_entry: bool = False) -> list:
             label = "メモ: " + "・".join(memos)
             gap.lines[MEMO] = Line(label, kinds.TEXT_COLOR, "double", MEMO in made, why=made.get(MEMO, ""))
         if ref:
-            gap.lines[REF] = Line("リファレンス", kinds.REF_COLOR, "solid", REF in made, why=made.get(REF, ""))
+            gap.lines[REF] = Line("・".join(ref.values()), kinds.REF_COLOR, "solid", REF in made, why=made.get(REF, ""))
         gap.gone = gone
         out.append(gap)
 

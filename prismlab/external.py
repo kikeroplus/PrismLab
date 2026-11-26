@@ -144,8 +144,9 @@ class ExternalRuns(QObject):
             files = [f for f in files if f.suffix.lower() in recipes.IMAGE_EXTS]
         if not files:
             raise ValueError("テキスト (.txt) がありません。" if text else "画像がありません。")
-        if recipes.line_problems(recipe.stages, text_entry=text):
-            raise ValueError(f"レシピ「{recipe.name}」は" + ("テキストからは始められません。" if text else "画像からは始められません。"))
+        problems = recipes.line_problems(recipe.stages, text_entry=text)
+        if problems:
+            raise ValueError(f"レシピ「{recipe.name}」: " + recipes.problems_text(problems, text) + "。")
         urls = [str(u).rstrip("/") for u in message.get("machines") or [] if isinstance(u, str) and u.strip()]
         if not urls:
             raise ValueError("台が選ばれていません。")

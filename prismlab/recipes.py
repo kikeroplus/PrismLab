@@ -44,11 +44,20 @@ IMG_ONE, IMG_FOLDER = "image_one", "image_folder"
 IMG_TYPES = (IMG_ONE, IMG_FOLDER)
 PICK_TYPES = REF_TYPES + IMG_TYPES  # 画像を選ぶステップ (1 枚は image、フォルダは folder・shuffle を使う)
 PICK_ONE = (REF_IMAGE, IMG_ONE)  # そのうち 1 枚のもの
+# 画像の入れる先 (2026-11-26 利用者の希望: 画像のステップを 1 つにまとめ、リファレンス・ラストフレーム・ラベルを決めた入口にも
+# 入れられるようにした)。流れている画像 (差し替え) / リファレンス (タイトルに reference / face / 顔 など) /
+# ラストフレーム (タイトルに last / end / ラスト など) / ラベル (タイトルがラベルと同じ画像の入口)。
+# 流れている画像のほかは、生成を通っても残り、同じ入れる先の次のステップまで、あとの生成すべてに使う。
+# 前のリファレンスのステップ (REF_IMAGE・REF_FOLDER) は、読むときに入れる先がリファレンスの画像のステップにする
+TARGET_FLOW, TARGET_REF, TARGET_LAST, TARGET_LABEL = "", "reference", "last_frame", "label"
+TARGETS = (TARGET_FLOW, TARGET_REF, TARGET_LAST, TARGET_LABEL)
+TARGET_NAMES = {TARGET_FLOW: "流れている画像", TARGET_REF: "リファレンス", TARGET_LAST: "ラストフレーム",
+                TARGET_LABEL: "ラベル"}
 STAGE_TITLES = {READ: "読み取り", ENHANCE: "盛る", TEXT: "追加テキスト", INSERT: "差し込み", GEN: "生成",
                 SAVE: "覚える", LOAD: "思い出す", FRAME: "最後のコマ", SPLIT: "増やす", GATE: "★を待つ", SUB: "置き換え",
                 TRANSLATE: "英語に", REF_IMAGE: "リファレンス (1 枚)", REF_FOLDER: "リファレンス (フォルダ)",
                 IMG_ONE: "画像 (1 枚)", IMG_FOLDER: "画像 (フォルダ)"}
-STAGE_ORDER = (READ, ENHANCE, TRANSLATE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, GATE, FRAME, IMG_ONE, IMG_FOLDER, REF_IMAGE, REF_FOLDER, GEN)  # メニューに並べる順
+STAGE_ORDER = (READ, ENHANCE, TRANSLATE, TEXT, INSERT, SUB, SAVE, LOAD, SPLIT, GATE, FRAME, IMG_ONE, IMG_FOLDER, GEN)  # メニューに並べる順
 MAX_SPLIT = 20  # 増やすの数の上限
 MEMO_TYPES = (SAVE, LOAD)
 DEFAULT_MEMO = "メモ 1"
@@ -83,6 +92,8 @@ class Stage:
     rules: str = ""  # 置き換え: 1 行に「元 => 先」(先がなければ消す)
     image: str = ""  # リファレンス (1 枚)・画像 (1 枚) の画像 (フォルダのほうは folder を使う)
     shuffle: bool = False  # リファレンス (フォルダ)・画像 (フォルダ): ランダムな順に使う (既定は名前順)
+    target: str = TARGET_FLOW  # 画像: 入れる先 (TARGETS)
+    target_label: str = ""  # 画像: 入れる先がラベルのときのラベル (ワークフローのノードのタイトル)
     # 生成: 値を変える (2026-11-25 利用者の希望)。送るときにワークフローの中の値を差し替える (ファイルは書き換えない)。
     # 1 件は {node, input, value, class_type, title} (comfy.value_slots)。モデル・LoRA・サイズだけ違うワークフローを減らす
     values: list = field(default_factory=list)
@@ -119,6 +130,13 @@ class Stage:
         s.rules = str(data.get("rules") or "")
         s.image = str(data.get("image") or "")
         s.shuffle = bool(data.get("shuffle", False))
+        s.target = data.get("target") if data.get("target") in TARGETS else TARGET_FLOW
+        s.target_label = str(data.get("target_label") or "").strip()
+        if s.type in REF_TYPES:  # 前のリファレンスのステップ → 入れる先がリファレンスの画像のステップ
+            s.type = IMG_ONE if s.type == REF_IMAGE else IMG_FOLDER
+            s.target = TARGET_REF
+        if s.target == TARGET_LABEL and not s.target_label:
+            s.target = TARGET_FLOW
         s.values = clean_values(data.get("values"))
         return s
 
@@ -140,6 +158,43 @@ def clean_values(data) -> list:
     return list(out.values())
 
 
+def base_type(t: str) -> str:
+    """前のリファレンスのステップの種類を、画像のステップの種類にそろえる (量産中に直すときの比べ合わせ)。"""
+    return IMG_ONE if t == REF_IMAGE else IMG_FOLDER if t == REF_FOLDER else t
+
+
+def image_target(stage) -> tuple:
+    """画像のステップの入れる先 (TARGETS のどれか, ラベル)。stage は Stage か、量産の写し (dict)。
+    前のリファレンスのステップ (写しに残っているもの) はリファレンス。"""
+    if isinstance(stage, dict):
+        t, target, label = stage.get("type"), stage.get("target") or TARGET_FLOW, str(stage.get("target_label") or "")
+    else:
+        t, target, label = stage.type, stage.target, stage.target_label
+    if t in REF_TYPES:
+        return TARGET_REF, ""
+    if target not in TARGETS or (target == TARGET_LABEL and not label.strip()):
+        return TARGET_FLOW, ""
+    return target, label.strip() if target == TARGET_LABEL else ""
+
+
+def is_side_image(stage) -> bool:
+    """流れている画像を差し替えず、あとの生成の別の入口 (リファレンス・ラストフレーム・ラベル) に入れる画像のステップか。"""
+    t = stage.get("type") if isinstance(stage, dict) else stage.type
+    return t in PICK_TYPES and image_target(stage)[0] != TARGET_FLOW
+
+
+def target_name(stage) -> str:
+    """入れる先の名前 (札の見出しなど): 画像 / リファレンス / ラストフレーム / ラベルそのもの。"""
+    target, label = image_target(stage)
+    return label if target == TARGET_LABEL else "画像" if target == TARGET_FLOW else TARGET_NAMES[target]
+
+
+def target_key(stage) -> str:
+    """同じ入れる先かを比べる鍵 (ラベルは大文字・小文字を見ない)。"""
+    target, label = image_target(stage)
+    return f"{TARGET_LABEL}:{label.lower()}" if target == TARGET_LABEL else target
+
+
 def stage_title(stage) -> str:
     """札などに出すステップの名前: 名前を付けた追加テキスト・差し込みはその名前、ほかは種類の名前。
     stage は Stage か、量産の写し (dict)。"""
@@ -147,6 +202,8 @@ def stage_title(stage) -> str:
         t, label = stage.get("type"), str(stage.get("label") or "")
     else:
         t, label = stage.type, stage.label
+    if t in PICK_TYPES and is_side_image(stage):
+        return f"{target_name(stage)} ({'1 枚' if t in PICK_ONE else 'フォルダ'})"
     return label if label and t in ADD_TYPES else STAGE_TITLES.get(t, "")
 
 
@@ -268,7 +325,8 @@ def line_problems(stages: list, skip=(), text_entry: bool = False) -> set:
     ("needimage", i) = テキストの入口で、まだ画像がないのに i 番目が画像を要る (読み取り・I2I・I2V)。
     ("memoempty", i) = i 番目の覚えるの時点で、覚える文がない。("norecall", i) = i 番目の思い出すより前に、
     その名前のメモを覚えるステップがない。("needvideo", i) = i 番目の最後のコマの前に、動画の生成がない。
-    ("notext", i) = i 番目の置き換えの時点で、置き換える文がない。"""
+    ("notext", i) = i 番目の置き換えの時点で、置き換える文がない。
+    ("noimage", i) = i 番目の画像のステップに、画像 (フォルダ) がまだ選ばれていない (＋ステップで足したばかりなど)。"""
     from . import kinds
     problems = set()
     has_gen = False
@@ -276,15 +334,17 @@ def line_problems(stages: list, skip=(), text_entry: bool = False) -> set:
     has_image = not text_entry
     video = False  # いま流れているのが動画か (ワークフローの種類が分からなければ None = 確かめない)
     memos = set()  # ここまでに覚えたメモの名前 (生成を通っても残る)
-    has_ref = False  # ここまでにリファレンスを決めたか (生成を通っても残る)
+    given: set = set()  # ここまでに決めた入れる先 (target_key。生成を通っても残る)
     skip = {skip} if isinstance(skip, int) else set(skip)
     for i, s in enumerate(stages):
         if s.bypass or i in skip:
             continue
+        if s.type in PICK_TYPES and not (s.image if s.type in PICK_ONE else s.folder):
+            problems.add(("noimage", i))
         if s.type == GEN:
             kind = kinds.kind_of(s.workflow)
-            # LoadImage がリファレンス用だけのワークフロー (T2I + 顔) は、リファレンスを決めてあれば元画像は要らない
-            if not has_image and kind.startswith("I") and not (has_ref and not kinds.needs_source(s.workflow)):
+            # 画像の入口がリファレンス用だけのワークフロー (T2I + 顔) などは、その画像を決めてあれば元画像は要らない
+            if not has_image and kind.startswith("I") and not (given and not kinds.needs_source(s.workflow, given)):
                 problems.add(("needimage", i))
             has_gen, has_text, has_image = True, False, True
             video = kinds.is_video(kind) if kind else None
@@ -297,8 +357,8 @@ def line_problems(stages: list, skip=(), text_entry: bool = False) -> set:
                 problems.add(("needimage", i))  # テキストには★がない
         elif s.type == SPLIT:
             pass
-        elif s.type in REF_TYPES:
-            has_ref = True
+        elif s.type in PICK_TYPES and is_side_image(s):
+            given.add(target_key(s))
         elif s.type in IMG_TYPES:
             has_image, video = True, False  # 文はそのまま
         elif s.type in (SUB, TRANSLATE):
@@ -531,9 +591,9 @@ def published_entries(recipes: list[Recipe]) -> list[dict]:
                 "repeat": r.repeat, "problems": {}}
         for app in r.apps:
             text = app in TEXT_APPS
-            if line_problems(r.stages, text_entry=text):
-                item["problems"][app] = ("このレシピはテキストからは始められません (画像の要るステップがあります)" if text
-                                         else "このレシピは画像からは始められません")
+            problems = line_problems(r.stages, text_entry=text)
+            if problems:
+                item["problems"][app] = problems_text(problems, text)
         items.append(item)
     return items
 
@@ -612,9 +672,21 @@ def natural_key(text: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
 
 
+def problems_text(problems: set, text_entry: bool) -> str:
+    """ほかのアプリに出すレシピが始められない理由 (line_problems の結果から)。"""
+    if any(isinstance(p, tuple) and p[0] == "noimage" for p in problems):
+        return "画像のステップに画像が選ばれていません (PrismLab で選んでください)"
+    return ("このレシピはテキストからは始められません (画像の要るステップがあります)" if text_entry
+            else "このレシピは画像からは始められません")
+
+
 def entry_problem(stages: list, text_entry: bool) -> str:
     """始める前に知らせる、ラインの問題 (なければ "")。"""
     problems = line_problems(stages, text_entry=text_entry)
+    empty = [p[1] for p in problems if isinstance(p, tuple) and p[0] == "noimage"]
+    if empty:
+        return (f"{empty[0] + 1} 番目の「{stage_title(stages[empty[0]])}」に画像が選ばれていません "
+                "(画像・フォルダをステップに落とすか、クリックして選んでください)。")
     if any(isinstance(p, tuple) and p[0] == "needimage" for p in problems):
         return ("テキストの入口には画像がないので、最初の生成は T2I か T2V にしてください "
                 "(読み取り・I2I・I2V は、画像が出来たあとに置けます)。")

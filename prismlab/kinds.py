@@ -11,7 +11,7 @@ from gencommon.diagram_dialog import LLM_LINE
 from gencommon.set_cards import KIND_COLORS
 
 __all__ = ["KIND_COLORS", "LLM_LINE", "TEXT_COLOR", "IMAGE_COLOR", "kind_of", "color_of", "is_video",
-           "has_reference", "has_last_frame", "needs_source", "REF_COLOR"]
+           "has_reference", "has_last_frame", "has_label", "image_labels", "accepts", "needs_source", "REF_COLOR"]
 
 TEXT_COLOR = "#9aa3b3"  # 文字 (プロンプト) の札
 IMAGE_COLOR = KIND_COLORS["I2I"]  # 入口の画像の札 (画像は I2I と同じ緑)
@@ -78,16 +78,46 @@ def has_last_frame(workflow_path: str) -> bool:
     return _has("last", comfy.has_last_frame, workflow_path)
 
 
-def _has_source_node(wf: dict) -> bool:
-    return any(not comfy.is_reference_node(n) and not comfy.is_last_frame_node(n) for n in comfy._load_image_nodes(wf))
+def has_label(workflow_path: str, label: str) -> bool:
+    """タイトルがラベルと同じ画像の入口があるか (大文字・小文字は見ない。comfy.has_label)。"""
+    return _has("label:" + label.strip().lower(), lambda wf: comfy.has_label(wf, label), workflow_path)
 
 
-def needs_source(workflow_path: str) -> bool:
-    """元画像を入れる LoadImage (リファレンス用・ラストフレーム用でないもの) があるか。
-    ないもの (T2I にリファレンスの顔だけ入れる など) は、リファレンスを渡せば元画像なしで動く。読めなければ True。"""
+def image_labels(workflow_path: str) -> list:
+    """画像の入口に付いたラベル (タイトル) の並び。読めなければ空。"""
+    return list(_has("labels", lambda wf: tuple(comfy.image_labels(wf)), workflow_path) or ())
+
+
+def accepts(workflow_path: str, key: str) -> bool:
+    """ワークフローに、その入れる先 (recipes.target_key) の画像の入口があるか。"""
+    if key == "reference":
+        return has_reference(workflow_path)
+    if key == "last_frame":
+        return has_last_frame(workflow_path)
+    if key.startswith("label:"):
+        return has_label(workflow_path, key[len("label:"):])
+    return False
+
+
+def _is_given(node: dict, given) -> bool:
+    """その画像の入口に、決めた画像 (given: recipes.target_key の集まり) が入るか (comfy.generate と同じ順に見る)。"""
+    title = comfy.node_label(node).lower()
+    if title and "label:" + title in given:
+        return True
+    if "reference" in given and comfy.is_reference_node(node):
+        return True
+    return "last_frame" in given and comfy.is_last_frame_node(node)
+
+
+def needs_source(workflow_path: str, given=("reference",)) -> bool:
+    """元画像を入れる画像の入口 (決めた画像が入らないもの) があるか。given は決めた入れる先 (recipes.target_key)。
+    ないもの (T2I にリファレンスの顔だけ入れる など) は、その画像を決めれば元画像なしで動く。読めなければ True。"""
     if not workflow_path:
         return True
-    return _has("source", _has_source_node, workflow_path) or not Path(workflow_path).is_file()
+    given = frozenset(given)
+    found = _has("source:" + ",".join(sorted(given)),
+                 lambda wf: any(not _is_given(n, given) for n in comfy._load_image_nodes(wf)), workflow_path)
+    return found or not Path(workflow_path).is_file()
 
 
 def color_of(kind: str) -> str:

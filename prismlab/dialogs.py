@@ -170,10 +170,26 @@ class StageDialog(QDialog):
                                 "盛ったあとに置けば、LLM が入れがちな語を消せます。"))
         elif stage.type in recipes.PICK_TYPES:
             single = stage.type in recipes.PICK_ONE
-            is_ref = stage.type in recipes.REF_TYPES
+            # 入れる先 (2026-11-26 利用者の希望): 流れている画像 / リファレンス / ラストフレーム / ラベル
+            target, label = recipes.image_target(stage)
+            self.target = QComboBox()
+            for t in recipes.TARGETS:
+                self.target.addItem(("流れている画像を差し替える" if t == recipes.TARGET_FLOW else
+                                     "ラベルを指定 (ノードのタイトル)" if t == recipes.TARGET_LABEL else
+                                     recipes.TARGET_NAMES[t]), t)
+            self.target.setCurrentIndex(recipes.TARGETS.index(target))
+            form.addRow("入れる先", self.target)
+            self.target_label = QComboBox()
+            self.target_label.setEditable(True)
+            self.target_label.lineEdit().setPlaceholderText("例: Face / Start Frame / Style")
+            for name in self._label_candidates(parent):
+                self.target_label.addItem(name)
+            self.target_label.setCurrentText(label)
+            self.target_label.setToolTip("ComfyUI でノードに付けたタイトルと同じもの (大文字・小文字は区別しません)。"
+                                         "候補はこのレシピの生成のワークフローにある、画像の入口のタイトルです。")
+            self.target_label_row = QLabel("ラベル")
+            form.addRow(self.target_label_row, self.target_label)
             self.ref_path = QLineEdit(stage.image if single else stage.folder)
-            self.ref_path.setPlaceholderText(("顔などのリファレンス画像" if single else "リファレンス画像を入れたフォルダ") if is_ref
-                                             else ("次へ渡す画像" if single else "次へ渡す画像を入れたフォルダ"))
             browse = QPushButton("参照...")
             browse.clicked.connect(self._browse_ref)
             row = QHBoxLayout()
@@ -189,22 +205,10 @@ class StageDialog(QDialog):
             if not single:
                 row, self.place = _choice_row(self, ["名前順", "ランダム"], 1 if stage.shuffle else 0)
                 form.addRow("使う順", row)
-            box.addWidget(_hint(
-                ("この画像を、" if single else
-                 "フォルダの画像を 1 件ごとに 1 枚ずつ (名前順か、ランダムな順で一巡ずつ。最後まで使ったら最初から)、") +
-                "流れている画像の代わりに次のステップへ渡します (このあとの I2I・I2V・読み取りの元になります)。"
-                "ここまでの文 (プロンプト) はそのまま残ります。流れてきた画像・動画はここで捨てます。\n"
-                "テキストの入口 (PromptWordCrafter などから) でも、文 + この画像で I2I・I2V ができます。"
-                + ("" if single else "\n増やすのあとに置くと、分かれた 1 本ごとに別の画像になります。"
-                                     "量産ごとに最初 (ランダムなら新しい順) から使います。")) if not is_ref else _hint(
-                ("この画像を、" if single else
-                 "フォルダの画像を 1 件ごとに 1 枚ずつ (名前順か、ランダムな順で一巡ずつ。最後まで使ったら最初から)、") +
-                "このあとの生成のリファレンスに使います。入れる先は、ワークフローの LoadImage のうち、"
-                "タイトルに reference / ref / face / 参照 / リファレンス / 顔 を含むものです"
-                " (ないワークフローには使われません)。\n"
-                "生成を通っても残り、次のリファレンスのステップまで、あとの生成すべてに使います。"
-                + ("" if single else "\n増やすのあとに置くと、分かれた 1 本ごとに別の画像になります。"
-                                     "量産ごとに最初 (ランダムなら新しい順) から使います。")))
+            self.target_hint = _hint("")
+            box.addWidget(self.target_hint)
+            self.target.currentIndexChanged.connect(self._target_changed)
+            self._target_changed()
             self.ref_path.textChanged.connect(self._ref_changed)
             self._ref_changed()
         elif stage.type == recipes.INSERT:
@@ -282,13 +286,58 @@ class StageDialog(QDialog):
         buttons.rejected.connect(self.reject)
         box.addWidget(buttons)
 
-    # リファレンス ---------------------------------------------------------
+    # 画像 -------------------------------------------------------------
+    @staticmethod
+    def _label_candidates(parent) -> list:
+        """ラベルの候補: このレシピの生成のワークフローにある、画像の入口のタイトル。"""
+        owner = getattr(parent, "recipe", None)
+        names: list = []
+        for s in getattr(owner, "stages", []):
+            if s.type == recipes.GEN and s.workflow:
+                names += kinds.image_labels(s.workflow)
+        return list(dict.fromkeys(names))
+
+    def _target_value(self) -> str:
+        return str(self.target.currentData() or recipes.TARGET_FLOW)
+
+    def _target_changed(self) -> None:
+        target = self._target_value()
+        single = self.stage.type in recipes.PICK_ONE
+        self.target_label.setVisible(target == recipes.TARGET_LABEL)
+        self.target_label_row.setVisible(target == recipes.TARGET_LABEL)
+        name = recipes.TARGET_NAMES[target]
+        if target == recipes.TARGET_FLOW:
+            self.ref_path.setPlaceholderText("次へ渡す画像" if single else "次へ渡す画像を入れたフォルダ")
+        else:
+            self.ref_path.setPlaceholderText(f"{name}に入れる画像" if single else f"{name}に入れる画像のフォルダ")
+        how = ("この画像を、" if single else
+               "フォルダの画像を 1 件ごとに 1 枚ずつ (名前順か、ランダムな順で一巡ずつ。最後まで使ったら最初から)、")
+        tail = "" if single else ("\n増やすのあとに置くと、分かれた 1 本ごとに別の画像になります。"
+                                  "量産ごとに最初 (ランダムなら新しい順) から使います。")
+        if target == recipes.TARGET_FLOW:
+            text = (how + "流れている画像の代わりに次のステップへ渡します (このあとの I2I・I2V・読み取りの元になります)。"
+                    "ここまでの文 (プロンプト) はそのまま残ります。流れてきた画像・動画はここで捨てます。\n"
+                    "テキストの入口 (PromptWordCrafter などから) でも、文 + この画像で I2I・I2V ができます。")
+        else:
+            where = {recipes.TARGET_REF: "タイトルに reference / ref / face / 参照 / リファレンス / 顔 を含むもの",
+                     recipes.TARGET_LAST: "タイトルに last / end / final / ラスト / 最後 / 終わり を含むもの"
+                                          " (ファーストフレーム・ラストフレームを指定する動画のワークフロー)",
+                     recipes.TARGET_LABEL: "タイトルがラベルと同じもの (大文字・小文字は区別しません)"}[target]
+            text = (how + f"このあとの生成の「{name}」に使います。流れている画像と文はそのままです。\n"
+                    f"入れる先は、ワークフローの画像の入口 (LoadImage など、画像の名前を持つノード) のうち、{where}です"
+                    " (ないワークフローには使われません)。ほかの画像の入口には、今までどおり流れている画像が入ります。\n"
+                    "生成を通っても残り、入れる先が同じ次の画像のステップまで、あとの生成すべてに使います。")
+        self.target_hint.setText(text + tail)
+
     def _browse_ref(self) -> None:
         now = self.ref_path.text().strip()
-        what = "リファレンス" if self.stage.type in recipes.REF_TYPES else "次へ渡す"
+        target = self._target_value()
+        what = "次へ渡す" if target == recipes.TARGET_FLOW else (
+            self.target_label.currentText().strip() or "ラベル" if target == recipes.TARGET_LABEL
+            else recipes.TARGET_NAMES[target]) + "に入れる"
         if self.stage.type in recipes.PICK_ONE:
             exts = " ".join("*" + e for e in sorted(recipes.IMAGE_EXTS))
-            path, _ = QFileDialog.getOpenFileName(self, f"{what}の画像を選ぶ", str(Path(now).parent) if now else "",
+            path, _ = QFileDialog.getOpenFileName(self, f"{what}画像を選ぶ", str(Path(now).parent) if now else "",
                                                   f"画像 ({exts})")
         else:
             path = QFileDialog.getExistingDirectory(self, f"{what}画像のフォルダを選ぶ", now)
@@ -461,9 +510,16 @@ class StageDialog(QDialog):
                 return
             s.rules = text
         elif s.type in recipes.PICK_TYPES:
+            target = self._target_value()
+            label = self.target_label.currentText().strip()
+            if target == recipes.TARGET_LABEL and not label:
+                QMessageBox.warning(self, recipes.STAGE_TITLES[s.type],
+                                    "入れる先のラベル (ComfyUI でノードに付けたタイトル) を入れてください。")
+                return
             if not self._ref_files():
                 QMessageBox.warning(self, recipes.STAGE_TITLES[s.type], self.ref_note.text() or "画像を選んでください。")
                 return
+            s.target, s.target_label = target, label if target == recipes.TARGET_LABEL else ""
             path = str(Path(self.ref_path.text().strip()))
             if s.type in recipes.PICK_ONE:
                 s.image = path
