@@ -150,15 +150,21 @@ records = [x for x in comfy.read_history() if x.request.origin]
 check(len(records) == 3 and {x.request.origin for x in records} == set(files), "記録に入口のファイル (origin)")
 check(all(x.request.recipe == "★から動画" and x.request.step == 1 for x in records), "記録にレシピ名とステップ")
 
-# 2. 量産が動いているあいだは入れない
+# 2. 量産中に送っても入れる (2026-11-27: 量産は入れたときの写しで動くので、動いている量産は変わらない)
 lv._start()
 pump(0.3)
 check(lv.running(), "(量産を動かしている)")
+check(lv.locked() and not lv.stage_cards[0].bypass.isVisible(), "量産の写しを見せているあいだは並びを直せない")
+moving = lv.job
 warnings.clear()
 send({"cmd": "send", "from": "J-Rate", "target": "recipe", "recipe": "★から動画", "index": 0,
       "files": [str(pics / "pick_4.png")]})
-check(warnings and "動いている" in warnings[-1] and lv.recipe.picked == files, "量産中は入れずに知らせる")
-check(lv.locked() and not lv.stage_cards[0].bypass.isVisible(), "動いている量産のレシピは直せない")
+check(not warnings and lv.recipe.picked == [str(pics / "pick_4.png")] and not lv.locked(),
+      "量産中でも同じレシピに送れて、レシピを見せる")
+check(len(moving.run.items) == 3 and moving.run.recipe.get("picked") == files, "動いている量産の写しは変わらない")
+lv._view_job(moving)
+check(lv.locked(), "量産の札で、また進み具合を見せる")
+lv._select_recipe(0)
 # ほかのレシピは量産中も直せる (送る・切り替える・ステップを足す)
 running_chip = lv.recipe_group.button(0)
 warnings.clear()
@@ -175,11 +181,12 @@ line_view_module.StageDialog = lambda _stage, _parent: type("OK", (), {"exec": l
 lv._add_stage(recipes.TEXT)
 line_view_module.StageDialog = real_dialog
 check(len(lv.recipe.stages) == before + 1 and lv.stage_cards[0].count.text() == "", "ほかのレシピのステップを足せる (量産の進み具合は出さない)")
-check(not lv.start_button.isEnabled() and "動いています" in lv.start_button.toolTip(), "始めるのは量産が終わってから")
+check(lv.start_button.isEnabled() and lv.start_button.text() == "＋ 待ち行列に入れる",
+      "量産中も開始は押せる (待ち行列に入れる)")
 lv.recipe.stages.pop()
 lv._save_recipes()
-lv._select_recipe(0)
-check(lv.locked(), "量産のレシピに戻ると、また直せない (進み具合を出す)")
+lv._view_job(moving)
+check(lv.locked() and lv.index == 0, "量産の札を押すと、そのレシピの進み具合を出す")
 wait_run()
 
 # 3. PWC からテキスト 2 件をレシピ「テキストから」へ (並べ替えたあと: index が違っても名前で探す)

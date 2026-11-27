@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from prismlab import engine, profile, recipes  # noqa: E402
+from prismlab import engine, line_queue, profile, recipes  # noqa: E402
 
 app = QApplication.instance() or QApplication(sys.argv)
 profile.setup()
@@ -52,7 +52,7 @@ class GroupViewTest(unittest.TestCase):
         from prismlab.line_view import LineView
         recipes.save([make("x"), make("p1", "PWC"), make("i1", "IE"), make("p2", "PWC")])
         recipes.set_last_index(0)
-        self.view = LineView(engine.Engine())
+        self.view = LineView(line_queue.LineQueue())
 
     def chips(self):
         return [b.text() for b in self.view.recipe_group.buttons()]
@@ -83,7 +83,7 @@ class GroupViewTest(unittest.TestCase):
     def test_no_groups_hides_tabs(self):
         from prismlab.line_view import LineView
         recipes.save([make("a"), make("b")])
-        v = LineView(engine.Engine())
+        v = LineView(line_queue.LineQueue())
         self.assertTrue(v.group_host.isHidden())
         self.assertEqual([b.text() for b in v.recipe_group.buttons()], ["a", "b"])
 

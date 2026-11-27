@@ -1,7 +1,9 @@
 """量産ラインの画面。
 
 上から: レシピの札 / ステップの並び (入口 → ステップ → …) / 出力フォルダ / 台の札 / 開始・一時停止・中止 / 結果。
-量産が動いているあいだは、始めたときのステップの写しを見せ、レシピは直せない。
+「開始」は量産を待ち行列に入れる (line_queue。入れた時点のレシピの写しで動くので、入れたあともレシピは直せる)。
+開始ボタンの下の「量産」の札で 1 本を選ぶと、その量産の写し (ステップごとの進み具合) を見せる。そのあいだはレシピは直せず、
+ステップの中身だけ直せる。レシピの札を押すとレシピに戻る。結果・一時停止・中止は、選んでいる量産のもの。
 """
 
 import html
@@ -21,7 +23,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 from gencommon import comfy, inserts, settings
 
-from . import engine, flow, kinds, rating, recipes, recycle, theme
+from . import engine, flow, kinds, line_queue, rating, recipes, recycle, theme
 from .dialogs import MachinesDialog, StageDialog, ask_text
 from .hover_preview import HoverPreview
 from .text_popup import TextPopup
@@ -185,9 +187,14 @@ class LineView(QWidget):
     machines_changed = Signal()  # 台の設定を変えた (物語のタブの札と、物語のエンジンの台を直す)
     _scanned = Signal(int, str, list)
 
-    def __init__(self, eng: engine.Engine, parent=None):
+    def __init__(self, queue: line_queue.LineQueue, parent=None):
         super().__init__(parent)
-        self.engine = eng
+        self.queue = queue
+        self._idle = engine.Engine(self, run_file=None)  # 量産を選んでいないときに見せる (空。台の札はこの台で描く)
+        self._idle.set_machines(recipes.machines())
+        self.job: Optional[line_queue.Job] = None  # 選んでいる量産 (結果・一時停止・中止はこれのもの)
+        self.job_view = False  # ステップの並びに、選んでいる量産の写しを見せている (False = レシピを見せて直せる)
+        self._jobs_key = None
         self.recipes = recipes.load()
         if not self.recipes:
             self.recipes = recipes.default_recipes()
@@ -195,7 +202,7 @@ class LineView(QWidget):
         self._group_pick: dict = {}  # まとまり → そのタブで最後に見ていたレシピ (タブを押したときに出す)
         self._group_tabs: dict = {}  # まとまり → タブのボタン
         self.index = min(max(recipes.last_index(), 0), len(self.recipes) - 1)
-        self._run_recipe: Optional[recipes.Recipe] = None  # 今の (最後の) 量産のレシピ (それだけを量産中は直せなくする)
+        self._run_recipe: Optional[recipes.Recipe] = None  # 量産を選んでいないときの、エンジンの量産のレシピ (テスト用)
         self.thumbs = ThumbCache(160, self)
         self.thumbs.changed.connect(lambda _p: self._schedule())
         self._scanned_files: list = []  # 入口のフォルダの (パス, ★の数)
@@ -299,6 +306,30 @@ class LineView(QWidget):
         mrow.addWidget(self.machines_button)
         root.addLayout(mrow)
 
+        # 量産の一覧 (待ち行列。動いているもの → 待っているもの → 終わったもの)
+        jrow = QHBoxLayout()
+        jrow.setSpacing(6)
+        self.jobs_title = QLabel("量産")
+        self.jobs_title.setStyleSheet("font-weight: bold;")
+        self.jobs_title.setToolTip("「開始」で入れた量産。1 本ずつ順に動きます (試作はすぐ動く)。\n"
+                                   "札を押すとその量産の進み具合を見せ、右クリックで順番・取り消し・一覧から外す。")
+        jrow.addWidget(self.jobs_title)
+        self.jobs_row = QHBoxLayout()
+        self.jobs_row.setContentsMargins(0, 0, 0, 0)
+        self.jobs_row.setSpacing(4)
+        jobs_host = QWidget()
+        jobs_host.setLayout(self.jobs_row)
+        self.jobs_scroll = HScrollArea()
+        self.jobs_scroll.setWidget(jobs_host)
+        self.jobs_scroll.setWidgetResizable(True)
+        self.jobs_scroll.setFixedHeight(40)
+        self.jobs_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.jobs_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        jrow.addWidget(self.jobs_scroll, 1)
+        self.jobs_host = QWidget()
+        self.jobs_host.setLayout(jrow)
+        root.addWidget(self.jobs_host)
+
         # 開始・一時停止・中止
         crow = QHBoxLayout()
         self.start_button = QPushButton("▶ 開始")
@@ -381,8 +412,12 @@ class LineView(QWidget):
         self._timer.setSingleShot(True)
         self._timer.setInterval(300)
         self._timer.timeout.connect(self.refresh)
-        self.engine.changed.connect(self._schedule)
-        self.engine.finished.connect(self._on_finished)
+        self._idle.changed.connect(self._schedule)
+        self._idle.finished.connect(self._on_finished)
+        self.queue.changed.connect(self._schedule)
+        self.queue.job_finished.connect(self._on_job_finished)
+        self.queue.job_started.connect(self._on_job_started)
+        self._pick_initial_job()
 
         self._build_recipe_chips()
         self.refresh(rebuild=True)
@@ -394,12 +429,36 @@ class LineView(QWidget):
     def recipe(self) -> recipes.Recipe:
         return self.recipes[self.index]
 
+    def _job(self) -> Optional[line_queue.Job]:
+        """選んでいる量産 (一覧から外れていれば None)。"""
+        if self.job is not None and self.job not in self.queue.jobs:
+            self.job = None
+            self.job_view = False
+        return self.job
+
+    @property
+    def engine(self) -> engine.Engine:
+        """選んでいる量産のエンジン (選んでいなければ空のエンジン)。"""
+        job = self._job()
+        return job.engine if job is not None else self._idle
+
     def running(self) -> bool:
+        """選んでいる量産が動いているか。"""
         run = self.engine.run
         return self.engine.active and run is not None and run.unfinished > 0
 
+    def _recipe_of(self, job: line_queue.Job) -> Optional[recipes.Recipe]:
+        """その量産のレシピ。入れたときのものを覚えておき、なければ (続きから始めたときなど) 名前で探す。"""
+        ref = job.recipe_ref
+        if ref is None or not any(r is ref for r in self.recipes):
+            ref = job.recipe_ref = next((r for r in self.recipes if r.name == job.name), None)
+        return ref
+
     def run_recipe(self) -> Optional[recipes.Recipe]:
-        """今の (最後の) 量産のレシピ。始めたときのものを覚えておき、なければ (続きから始めたときなど) 名前で探す。"""
+        """選んでいる量産のレシピ。"""
+        job = self._job()
+        if job is not None:
+            return self._recipe_of(job)
         run = self.engine.run
         if run is None:
             return None
@@ -409,8 +468,16 @@ class LineView(QWidget):
         return self._run_recipe
 
     def locked(self) -> bool:
-        """見ているレシピが、動いている量産のものか (それだけは直せない。ほかのレシピは量産中も直せる)。"""
+        """ステップの並びに量産の写しを見せているか (そのあいだはレシピを直さない。ステップの中身だけ直せる)。"""
+        if self._job() is not None:
+            return self.job_view
         return self.running() and self.run_recipe() is self.recipe
+
+    def _same_shape(self, run) -> bool:
+        """量産の写しと見ているレシピのステップの並び (種類・バイパス) が同じか (同じなら札に進み具合を出せる)。"""
+        stages = self.recipe.stages
+        return run is not None and len(run.stages) == len(stages) and all(
+            snap["type"] == st.type and bool(snap.get("bypass")) == st.bypass for snap, st in zip(run.stages, stages))
 
     def _schedule(self) -> None:
         if not self._timer.isActive():
@@ -497,6 +564,7 @@ class LineView(QWidget):
         self.recipe_row.addWidget(add)
 
     def _select_recipe(self, index: int) -> None:
+        self.job_view = False  # レシピを見る (直せる)
         regroup = self.recipes[index].group != self.recipe.group
         self.index = index
         self._group_pick[self.recipe.group] = self.recipe
@@ -513,6 +581,9 @@ class LineView(QWidget):
             index = next((i for i, r in enumerate(self.recipes) if r.group == group), -1)
         if index < 0 or index == self.index:
             self._build_recipe_chips()  # 押したタブの印を戻す
+            if self.job_view:
+                self.job_view = False
+                self.refresh(rebuild=True)
             return
         self._select_recipe(index)
 
@@ -590,10 +661,7 @@ class LineView(QWidget):
         right.setEnabled(at < len(same) - 1)
         menu.addSeparator()
         delete = menu.addAction("削除する...")
-        busy = self.running() and self.run_recipe() is target
-        delete.setEnabled(len(self.recipes) > 1 and not busy)  # 動いている量産のレシピは消さない
-        if busy:
-            delete.setText("削除する... (量産中は消せません)")
+        delete.setEnabled(len(self.recipes) > 1)  # 動いている・待っている量産は写しで動くので、消しても続く
         chosen = menu.exec(pos)
         if chosen is rename:
             name = ask_text(self, "名前を変える", "レシピの名前", target.name)
@@ -1115,13 +1183,18 @@ class LineView(QWidget):
         """動いている量産のステップの中身を直す (2026-11-19 利用者の希望)。レシピと量産の写しの両方を直し、
         これからそのステップに来る件から効く。並び・種類・バイパス・ワークフローは量産が終わってから。"""
         run = self.engine.run
+        job = self._job()
+        if job is not None and job.finished:
+            self.status.emit("終わった量産のステップは直せません (レシピの札を押すと、レシピを直せます)。")
+            return
         stages = self.recipe.stages
         same = run is not None and len(run.stages) == len(stages) and all(
             snap["type"] == st.type and bool(snap.get("bypass")) == st.bypass
             and (st.type != recipes.GEN or str(snap.get("workflow", "")).lower() == st.workflow.lower())
             for snap, st in zip(run.stages, stages))
         if not same or index >= len(stages):
-            self.status.emit("このレシピは量産を始めたときと並びが違うので、量産が終わるまで直せません。")
+            self.status.emit("このレシピは量産を入れたときと並びが違うので、ここでは直せません"
+                             " (レシピの札を押すと、レシピを直せます。直したものは次に入れる量産から効きます)。")
             return
         if stages[index].bypass:
             self.status.emit("バイパスしているステップは、量産が終わってから直してください。")
@@ -1469,9 +1542,6 @@ class LineView(QWidget):
             target = next((i for i, r in enumerate(self.recipes) if r.name == name), -1)
         if target < 0:
             return f"レシピ「{name}」が見つかりません (名前を変えたか、消したかもしれません)。"
-        if self.running() and self.run_recipe() is self.recipes[target]:
-            return (f"レシピ「{name}」で量産が動いているので、入口に入れられません。"
-                    "終わるか中止してから送るか、ほかのレシピに送ってください。")
         paths = [str(Path(f)) for f in files if f]
         found = [f for f in paths if Path(f).is_file()]
         if not found:
@@ -1486,6 +1556,7 @@ class LineView(QWidget):
             r.picked_back = r.source
         r.source = recipes.PICKED
         self.index = target
+        self.job_view = False  # 入れた入口を見せる
         self.trial_source = None
         self._save_recipes()
         button = self.recipe_group.button(target)
@@ -1596,7 +1667,7 @@ class LineView(QWidget):
     def rescan(self) -> None:
         """入口の★を読み直す (J-Rate から戻ったときなど)。動いている量産の入口は変えない。
         ★待ちの件があれば、その★も読み直す。"""
-        if self.engine.gated():
+        if self._gated_engines():
             self._recheck_gates()
         if self.locked():
             return
@@ -1655,8 +1726,9 @@ class LineView(QWidget):
         self.status.emit(("台を使います: " if on else "台を休みにしました (新しい件は送りません): ") + name)
 
     def _apply_machines(self) -> None:
-        """保存した台を、量産と物語 (候補づくり・バッチ) に知らせる。"""
-        self.engine.set_machines(recipes.machines())
+        """保存した台を、量産 (待ち行列の全部) と物語 (候補づくり・バッチ) に知らせる。"""
+        self.queue.set_machines(recipes.machines())
+        self._idle.set_machines(recipes.machines())
         self.machines_changed.emit()
         self.refresh()
 
@@ -1684,15 +1756,14 @@ class LineView(QWidget):
         if problem:
             QMessageBox.warning(self, title, problem)
             return False
-        if any(s.type == recipes.GEN and not s.bypass for s in r.stages) and not self.engine.machines:
+        if any(s.type == recipes.GEN and not s.bypass for s in r.stages) and not recipes.machines():
             QMessageBox.warning(self, title, recipes.no_machines_reason())
             return False
         return True
 
     def _trial(self) -> None:
-        """1 枚だけ通す (試作)。出力は (出力フォルダ)\\試作。量産の進み具合には数えない。"""
-        if self.running():
-            return
+        """1 枚だけ通す (試作)。出力は (出力フォルダ)\\試作。待ち行列に並ばず、量産中でもすぐ動く。
+        レシピは見せたまま (続けて直せる)。結果・プロンプトの欄は試作のものにする。"""
         r = self.recipe
         source = self._trial_path()
         if source is None:
@@ -1709,8 +1780,8 @@ class LineView(QWidget):
         except (ValueError, comfy.ComfyError) as exc:
             QMessageBox.warning(self, "1 枚で試す", str(exc))
             return
-        self.engine.start(run)
-        self._run_recipe = self.recipe
+        self.job = self.queue.add(run, self.recipe)
+        self.job_view = False
         self.results.setCurrentItem(None)
         self.status.emit(f"「{r.name}」を 1 枚で試しています: {source.name}")
         self.refresh(rebuild=True)
@@ -1743,16 +1814,22 @@ class LineView(QWidget):
         except (ValueError, comfy.ComfyError) as exc:
             QMessageBox.warning(self, "開始", str(exc))
             return
+        queued = self.queue.line_busy()  # 量産が動いている (待っている): 待ち行列に並べる
         if len(files) > CONFIRM_COUNT:
             what = (f"{Path(r.image).name} を {len(files)} 回" if r.single else
                     f"{len(base)} 件 × {r.repeat} 回 = {len(files)} 件" if r.repeat > 1 else f"{len(files)} 件")
-            if QMessageBox.question(self, "開始", f"{what}「{r.name}」で量産します。始めますか?",
-                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            ask = f"{what}「{r.name}」を待ち行列に入れますか?\n(今の量産が終わったら始めます)" if queued \
+                else f"{what}「{r.name}」で量産します。始めますか?"
+            if QMessageBox.question(self, "開始", ask, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                     QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
                 return
-        self.engine.start(run)
-        self._run_recipe = self.recipe
-        self.status.emit(f"「{r.name}」を始めました ({len(files)} 件)。")
+        job = self.queue.add(run, self.recipe)
+        if job.waiting:
+            self.status.emit(f"「{r.name}」を待ち行列に入れました ({self.queue.place(job)} 本目・{len(files)} 件)。"
+                             "今の量産が終わったら始めます。レシピはこのまま直せます。")
+        else:
+            self.job, self.job_view = job, True
+            self.status.emit(f"「{r.name}」を始めました ({len(files)} 件)。")
         self.refresh(rebuild=True)
 
     def _toggle_pause(self) -> None:
@@ -1764,6 +1841,10 @@ class LineView(QWidget):
             self.status.emit("一時停止しました。実行中のものが終わったら止まります。")
 
     def _cancel(self) -> None:
+        job = self._job()
+        if job is not None and job.waiting:
+            self._remove_job(job)
+            return
         run = self.engine.run
         if run is None or run.unfinished == 0:
             return
@@ -1775,16 +1856,20 @@ class LineView(QWidget):
                                 QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             self.engine.cancel_all()
 
+    def _gated_engines(self) -> list:
+        """★待ちの件がある量産のエンジン (選んでいないものも)。"""
+        return [e for e in self.queue.engines() + [self._idle] if e.run is not None and e.gated()]
+
     def _recheck_gates(self) -> None:
-        """★待ちの★を裏で読み直す (★を読むのに時間がかかるので)。"""
-        if self._gate_checking or not self.engine.gated():
+        """★待ちの★を裏で読み直す (★を読むのに時間がかかるので)。待ち行列の量産全部。"""
+        engines = self._gated_engines()
+        if self._gate_checking or not engines:
             return
         self._gate_checking = True
-        eng = self.engine
 
         def work():
             try:
-                moved = eng.recheck_gates()
+                moved = sum(e.recheck_gates() for e in engines)
             finally:
                 self._gate_checking = False
             if moved:
@@ -1810,8 +1895,28 @@ class LineView(QWidget):
             self.status.emit(f"失敗した {n} 件をやり直します。")
             self.refresh(rebuild=True)
 
-    def _on_finished(self) -> None:
-        run = self.engine.run
+    def _on_job_finished(self, job: line_queue.Job) -> None:
+        if job is self._job() and self.job_view:
+            self.job_view = False  # 見ていた量産が終わった: レシピに戻す (前と同じ。並びが同じなら札に数が残る)
+        self._on_finished(job.run)
+
+    def _on_job_started(self, job: line_queue.Job) -> None:
+        """待ち行列の次が始まった。見ていた量産が送り終わっていれば、始まったほうを見せる。"""
+        current = self._job()
+        if current is None or (current is not job and not current.trial and not current.sendable()):
+            self.job = job
+        self.status.emit(f"待ち行列の「{job.name}」を始めました ({len(job.run.items)} 件)。")
+        self.refresh(rebuild=True)
+
+    def _pick_initial_job(self) -> None:
+        """起動したとき: 最後に始めた量産を選ぶ (終わっていなければ進み具合を見せる)。"""
+        started = [j for j in self.queue.jobs if not j.waiting]
+        if started:
+            job = max(started, key=lambda j: j.run.started)
+            self.job, self.job_view = job, job.unfinished
+
+    def _on_finished(self, run=None) -> None:
+        run = run if run is not None else self._idle.run
         if run is None:
             return
         done = sum(1 for i in run.items if i.state == engine.DONE)
@@ -1977,7 +2082,8 @@ class LineView(QWidget):
                     item.setIcon(QIcon(self._framed(pix, bool(item.data(Qt.ItemDataRole.UserRole + 1)))))
         done = sum(len(i.outputs) for i in items)
         run = self.engine.run
-        self.results_title.setText(f"結果 ({done})" + ("  ・ 試作" if run is not None and run.trial else ""))
+        name = f"「{run.name}」" if run is not None and self._job() is not None else ""
+        self.results_title.setText(f"結果{name} ({done})" + ("  ・ 試作" if run is not None and run.trial else ""))
         self._refresh_prompt()
 
     @staticmethod
@@ -2068,26 +2174,154 @@ class LineView(QWidget):
         return canvas
 
     # ------------------------------------------------------------------
+    # 量産の一覧 (待ち行列)
+    # ------------------------------------------------------------------
+    def _job_label(self, job: line_queue.Job) -> tuple[str, str]:
+        """札の文字と色 (動いている・待っている・終わった)。"""
+        run = job.run
+        total = len(run.items)
+        done = sum(1 for i in run.items if i.finished)
+        failed = sum(1 for i in run.items if i.state == engine.FAILED)
+        head = "試作 " if job.trial else ""
+        if job.waiting:
+            return f"⏳{self.queue.place(job)} {head}{job.name} ({total})", theme.TEXT_DIM
+        if job.unfinished:
+            if self.queue.held and not job.engine.active:
+                return f"■ {head}{job.name} 残り {run.unfinished}", "#ff9800"
+            if run.paused:
+                return f"⏸ {head}{job.name} {done}/{total}", "#ff9800"
+            if not job.sendable():
+                return f"★待ち {head}{job.name} {done}/{total}", GATE_COLOR
+            return f"▶ {head}{job.name} {done}/{total}", theme.ACCENT
+        return f"✓ {head}{job.name}" + (f" (失敗 {failed})" if failed else ""), "#9e9e9e"
+
+    def _ordered_jobs(self) -> list:
+        """札の並び: 動いているもの → 待っているもの (順番) → 終わったもの (新しい順)。"""
+        q = self.queue
+        return (sorted(q.running_jobs(), key=lambda j: j.run.started) + q.waiting_jobs()
+                + sorted(q.finished_jobs(), key=lambda j: j.run.started, reverse=True))
+
+    def _refresh_jobs(self) -> None:
+        jobs = self._ordered_jobs()
+        self.jobs_host.setVisible(bool(jobs))
+        current = self._job()
+        labels = [(j.id, *self._job_label(j), j is current and self.job_view, j is current) for j in jobs]
+        key = tuple(labels)
+        if key == self._jobs_key:
+            return
+        self._jobs_key = key
+        while self.jobs_row.count():
+            w = self.jobs_row.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        for job, (_id, text, color, viewing, selected) in zip(jobs, labels):
+            b = QPushButton(text)
+            border = theme.ACCENT if selected else "#555"
+            b.setStyleSheet(f"QPushButton {{ border: {'2' if selected else '1'}px solid {border}; border-radius: 10px;"
+                            f" padding: 3px 10px; color: {color}; {'font-weight: bold;' if selected else ''}"
+                            f" {'background: #2e3b2e;' if viewing else ''} }}")
+            tip = [f"{'試作' if job.trial else '量産'}「{job.name}」 {len(job.run.items)} 件",
+                   f"入れた時刻: {time.strftime('%m/%d %H:%M', time.localtime(job.run.started))}",
+                   f"出力: {job.run.output_dir}", "押すと進み具合を見せます。右クリックで順番・取り消し・一覧から外す。"]
+            b.setToolTip("\n".join(tip))
+            b.clicked.connect(lambda _c=False, j=job: self._view_job(j))
+            b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            b.customContextMenuRequested.connect(lambda pos, j=job, btn=b: self._job_menu(j, btn.mapToGlobal(pos)))
+            self.jobs_row.addWidget(b)
+        self.jobs_row.addStretch(1)
+
+    def _view_job(self, job: line_queue.Job) -> None:
+        """量産の札を押した: その量産の写し (進み具合) を見せる。レシピの札も、そのレシピにする。"""
+        if job not in self.queue.jobs:
+            return
+        if job is not self.job:
+            self.results.setCurrentItem(None)
+        self.job, self.job_view = job, True
+        ref = self._recipe_of(job)
+        if ref is not None and ref is not self.recipe:
+            self.index = self._index_of(ref)
+            self._group_pick[ref.group] = ref
+            recipes.set_last_index(self.index)
+            self._build_recipe_chips()
+        self.refresh(rebuild=True)
+
+    def _job_menu(self, job: line_queue.Job, pos) -> None:
+        menu = QMenu(self)
+        view = menu.addAction("進み具合を見る")
+        earlier = later = cancel = remove = None
+        if job.waiting:
+            place, count = self.queue.place(job), len(self.queue.waiting_jobs())
+            earlier = menu.addAction("◀ 先にする")
+            earlier.setEnabled(place > 1)
+            later = menu.addAction("後にする ▶")
+            later.setEnabled(place < count)
+            menu.addSeparator()
+            remove = menu.addAction("待ち行列から外す...")
+        elif job.unfinished:
+            menu.addSeparator()
+            cancel = menu.addAction("中止...")
+        else:
+            menu.addSeparator()
+            remove = menu.addAction("一覧から外す (出来たファイルは残す)")
+        chosen = menu.exec(pos)
+        if chosen is None:
+            return
+        if chosen is view:
+            self._view_job(job)
+        elif chosen in (earlier, later):
+            self.queue.move(job, -1 if chosen is earlier else 1)
+        elif chosen is cancel:
+            self._view_job(job)
+            self._cancel()
+        elif chosen is remove:
+            self._remove_job(job)
+
+    def _remove_job(self, job: line_queue.Job) -> None:
+        if job.waiting:
+            if QMessageBox.question(self, "待ち行列から外す",
+                                    f"待ち行列の「{job.name}」({len(job.run.items)} 件) を外しますか?",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        if not self.queue.remove(job):
+            return
+        if self.job is job:
+            self.job, self.job_view = None, False
+            rest = self.queue.running_jobs()
+            if rest:
+                self.job = rest[0]
+        self.status.emit(f"「{job.name}」を一覧から外しました。")
+        self.refresh(rebuild=True)
+
+    # ------------------------------------------------------------------
     # 描き直し
     # ------------------------------------------------------------------
     def refresh(self, rebuild: bool = False) -> None:
+        job = self._job()
         run, items, machines = self.engine.snapshot()
         running = self.running()
-        showing = self.locked()  # 見ているレシピが動いている量産のもの (入口・ステップは量産の写しを見せる)
-        mode = (showing, id(run), self.index)
+        showing = self.locked()  # ステップの並びに量産の写しを見せる (入口・ステップは量産の写し)
+        mode = (showing, id(run), self.index, id(job))
         if rebuild or mode != getattr(self, "_flow_mode", None):
             self._flow_mode = mode
             self._rebuild_flow()
-        # ステップに数を出すのは、動いている量産か、見ているレシピで最後に回した量産のとき
-        show_stats = showing or (not running and run is not None and self.run_recipe() is self.recipe
+        # ステップに数を出すのは、量産の写しを見せているときか、選んでいる量産のレシピを見ていて、並びが同じとき
+        show_stats = showing or (run is not None and self.run_recipe() is self.recipe and self._same_shape(run)
                                  and len(run.stages) == len(self.stage_cards))
-        busy_recipe = self.run_recipe() if running else None
+        busy = {id(r) for r in (self._recipe_of(j) for j in self.queue.running_jobs()) if r is not None}
+        if job is None and running and self.run_recipe() is not None:
+            busy.add(id(self.run_recipe()))
+        waiting = {id(r) for r in (self._recipe_of(j) for j in self.queue.waiting_jobs()) if r is not None}
         for b in self.recipe_group.buttons():
             r = self.recipes[self.recipe_group.id(b)] if self.recipe_group.id(b) < len(self.recipes) else None
-            b.setText(("▶ " if r is not None and r is busy_recipe else "") + ((r.name if r else "") or "(名前なし)"))
-            b.setToolTip("量産中 (このレシピはステップの中身だけ直せます。ほかのレシピは全部直せます)" if r is not None and r is busy_recipe else "")
+            mark = "▶ " if r is not None and id(r) in busy else "⏳ " if r is not None and id(r) in waiting else ""
+            b.setText(mark + ((r.name if r else "") or "(名前なし)"))
+            b.setToolTip("量産中 (入れたときの写しで動いているので、このレシピは直せます)" if mark == "▶ " else
+                         "待ち行列に入っています (入れたときの写しで動くので、このレシピは直せます)" if mark else "")
         for g, tab in self._group_tabs.items():  # 動いている量産のレシピが入っているまとまりのタブにも ▶
-            tab.setText(("▶ " if busy_recipe is not None and busy_recipe.group == g else "") + self._group_label(g))
+            mark = any(r.group == g and id(r) in busy for r in self.recipes)
+            tab.setText(("▶ " if mark else "") + self._group_label(g))
 
         # 入口
         source = str(run.recipe.get("source") or recipes.FOLDER) if showing else self.recipe.source
@@ -2260,27 +2494,37 @@ class LineView(QWidget):
             card.status.setText(text)
             card.set_down(m.state != engine.UP)
 
-        # 開始・一時停止・中止
-        self.start_button.setEnabled(not running)
-        self.trial_button.setEnabled(not running)
-        why = f"量産「{run.name}」が動いています。始めるのは終わってからです (このレシピは今も直せます)。" \
-            if running and not showing and run is not None else ""
-        self.start_button.setToolTip(why)
-        self.trial_button.setToolTip(why or "今のレシピで 1 枚だけ通します。")
+        # 開始・一時停止・中止 (開始・試すはいつでも押せる。量産が動いていれば待ち行列に並ぶ)
+        legacy = job is None and running  # 量産を選ばずにエンジンを直に動かした (テスト)
+        self.start_button.setEnabled(not legacy)
+        self.trial_button.setEnabled(not legacy)
+        if self.queue.line_busy():
+            self.start_button.setText("＋ 待ち行列に入れる")
+            self.start_button.setToolTip("量産が動いています。このレシピの今の中身を写して待ち行列に入れ、"
+                                         "前の量産が終わったら始めます。入れたあともレシピは直せます。")
+        else:
+            self.start_button.setText("▶ 開始")
+            self.start_button.setToolTip("このレシピの今の中身を写して量産します。始めたあともレシピは直せます"
+                                         " (直したものは次に入れる量産から効きます)。")
+        self.trial_button.setToolTip("今のレシピで 1 枚だけ通します。量産中でも待たずにすぐ動きます。")
         self.pause_button.setEnabled(running)
         self.pause_button.setText("再開" if run is not None and run.paused else "一時停止")
-        self.cancel_button.setEnabled(running)
+        waiting_job = job is not None and job.waiting
+        self.cancel_button.setEnabled(running or waiting_job)
+        self.cancel_button.setText("待ち行列から外す" if waiting_job else "中止")
         failed_total = sum(1 for it in items if it.state == engine.FAILED)
         self.retry_button.setEnabled(failed_total > 0 and not (run is not None and run.paused))
         self.retry_button.setVisible(failed_total > 0)
         gated_total = sum(1 for it in items if it.state == engine.GATED)
         self.gate_recheck_button.setVisible(gated_total > 0)
         self.gate_end_button.setVisible(gated_total > 0)
-        if gated_total and not self._gate_timer.isActive():
+        gated_any = gated_total > 0 or bool(self._gated_engines())  # 選んでいない量産の★待ちも読み直す
+        if gated_any and not self._gate_timer.isActive():
             self._gate_timer.start()
-        elif not gated_total:
+        elif not gated_any:
             self._gate_timer.stop()
         self.summary.setText(self._summary(run, items, running))
+        self._refresh_jobs()
         self._refresh_results(items)
         self._fit_flow()
 
@@ -2316,6 +2560,9 @@ class LineView(QWidget):
         gated = sum(1 for i in items if i.state == engine.GATED)
         skipped = sum(1 for i in items if i.state == engine.SKIPPED)
         text = ("試作 " if run.trial else "") + f"「{run.name}」 完了 {done} / {total}"
+        job = self._job()
+        if job is not None and job.waiting:
+            return f"待ち行列の {self.queue.place(job)} 本目「{run.name}」 {total} 件 (前の量産が終わったら始めます)"
         if gated:
             text += (f' ・ <span style="color:{GATE_COLOR}; font-weight:bold">★待ち {gated}</span>'
                      " (J-Rate で★を付けると先へ)")
